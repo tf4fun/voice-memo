@@ -230,12 +230,17 @@ esp_err_t memo_recorder_start(const char *id)
         return err;
     }
 
+    /* 没连过网、也没 SNTP，time() 会是 1970 年起步的值。这种时间写进容器只会
+       让列表显示一个假日期，所以按协议约定记 0（"从未对时"），由服务端兜底。 */
+    const time_t wall = time(NULL);
+    const uint64_t recorded_at = (wall > 1577836800) ? (uint64_t)wall : 0; /* 2020-01-01 */
+
     memo_container_header_t header = {
         .sample_rate = REC_SAMPLE_RATE,
         .channels = REC_CHANNELS,
         .frame_ms = REC_FRAME_MS,
         .duration_ms = 0,
-        .recorded_at = (uint64_t)time(NULL),
+        .recorded_at = recorded_at,
         .frame_count = 0,
     };
     strncpy(header.memo_id, id, sizeof(header.memo_id) - 1);

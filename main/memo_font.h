@@ -22,3 +22,7 @@ const lv_font_t *memo_font_label(void);
 
 /* 该字体是否覆盖某个码点（用于覆盖率自检，缺字要能被发现而不是画成空白）。 */
 bool memo_font_covers(uint32_t codepoint);
+
+/* 逐码点检查并在日志里报告缺字，例如 "missing glyph U+25B6"。
+   缺字在屏幕上会变成方框，光看界面很难定位是哪个字符，所以在这里报出来。 */
+void memo_font_check_text(const char *what, const char *text);

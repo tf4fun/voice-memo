@@ -31,6 +31,8 @@
 #include "memo_ui_common.h"
 #include "memo_ui_detail.h"
 #include "memo_player.h"
+#include "memo_settings.h"
+#include "memo_ui_settings.h"
 #include "memo_state.h"
 #include "memo_time.h"
 
@@ -71,6 +73,7 @@ static lv_obj_t *s_sheet_shadow;
 static lv_obj_t *s_opt_save;
 static lv_obj_t *s_opt_cancel;
 static char s_last_id[37];
+static uint32_t s_detail_duration_ms; /* 详情页当前条目的时长，播放器未启动时用它 */
 
 /* ---------- 小工具 ---------- */
 static lv_obj_t *card_create(lv_obj_t *parent, int x, int y, int w, int h)
@@ -122,9 +125,11 @@ static void tick_timer_cb(void *arg)
     /* 详情页：刷新播放条，并在播放自然结束时回到"已展开"。 */
     if (!memo_state_is_recording(s_sm.state) && s_sm.state != MEMO_STATE_ARMING) {
         const bool playing = memo_player_is_active();
+        /* 没在播放时播放器报告的时长是 0；此时必须沿用条目自己的时长，
+           否则播放条会被刷成 "0:00 / 0:00"。 */
+        const uint32_t duration = playing ? memo_player_duration_ms() : s_detail_duration_ms;
         if (bsp_lvgl_lock(50)) {
-            memo_ui_detail_set_playback(playing, memo_player_position_ms(),
-                                        memo_player_duration_ms());
+            memo_ui_detail_set_playback(playing, memo_player_position_ms(), duration);
             bsp_lvgl_unlock();
         }
         if (!playing && s_sm.state == MEMO_STATE_PLAYING) {
@@ -320,7 +325,7 @@ static void refresh_list(void)
     if (s_selected >= s_entry_count) s_selected = s_entry_count > 0 ? s_entry_count - 1 : 0;
     if (s_selected < 0) s_selected = 0;
 
-    const int32_t tz = 480; /* 时区设置到 M5 才进 NVS，先按东八区显示 */
+    const int32_t tz = memo_settings_get()->tz_offset_min;
 
     for (int i = 0; i < LIST_ROWS; i++) {
         const bool used = i < s_entry_count;
@@ -519,10 +524,27 @@ static void execute(memo_action_t action)
             break;
         }
         const memo_spool_entry_t *entry = &s_entries[s_selected];
+        if (memo_ui_detail_screen() == NULL) {
+            ESP_LOGE(TAG, "detail page was never built");
+            break;
+        }
         if (bsp_lvgl_lock(200)) {
             memo_ui_detail_show((int64_t)entry->recorded_at, entry->duration_ms, NULL);
+            /* 没有转写文本时"展开"在屏幕上看不出变化，会让第一次点击像没反应。
+               此时直接按"已展开"进入，第一下 OK 就开始播放。 */
+            memo_ui_detail_set_expanded(true);
             lv_screen_load(memo_ui_detail_screen());
             bsp_lvgl_unlock();
+        }
+        s_detail_duration_ms = entry->duration_ms;
+        s_sm.state = MEMO_STATE_DETAIL_EXPANDED;
+
+        if (memo_settings_get()->autoplay) {
+            if (memo_player_is_active()) memo_player_stop();
+            if (memo_player_play(entry->id) == ESP_OK) {
+                s_sm.state = MEMO_STATE_PLAYING;
+                ESP_LOGI(TAG, "autoplay %s", entry->id);
+            }
         }
         esp_timer_start_periodic(s_tick_timer, 200 * 1000);
         ESP_LOGI(TAG, "detail: %s (%u ms)", entry->id, (unsigned)entry->duration_ms);
@@ -564,6 +586,7 @@ static void execute(memo_action_t action)
         if (action == MEMO_ACT_NEXT_MEMO && s_selected + 1 < s_entry_count) s_selected++;
         if (action == MEMO_ACT_PREV_MEMO && s_selected > 0) s_selected--;
         const memo_spool_entry_t *entry = &s_entries[s_selected];
+        s_detail_duration_ms = entry->duration_ms;
         if (bsp_lvgl_lock(200)) {
             memo_ui_detail_show((int64_t)entry->recorded_at, entry->duration_ms, NULL);
             bsp_lvgl_unlock();
@@ -572,8 +595,51 @@ static void execute(memo_action_t action)
     }
 
     case MEMO_ACT_OPEN_SETTINGS:
-        ESP_LOGI(TAG, "action %s arrives in M3", memo_action_name(action));
-        s_sm.state = MEMO_STATE_LIST;
+        if (memo_ui_settings_screen() == NULL) {
+            ESP_LOGE(TAG, "settings page was never built");
+            break;
+        }
+        if (bsp_lvgl_lock(200)) {
+            memo_ui_settings_refresh();
+            lv_screen_load(memo_ui_settings_screen());
+            bsp_lvgl_unlock();
+        }
+        break;
+
+    case MEMO_ACT_SETTINGS_PREV:
+    case MEMO_ACT_SETTINGS_NEXT:
+        if (bsp_lvgl_lock(150)) {
+            memo_ui_settings_move(action == MEMO_ACT_SETTINGS_NEXT ? 1 : -1);
+            bsp_lvgl_unlock();
+        }
+        break;
+
+    case MEMO_ACT_SUB_PAGE_ENTER:
+        if (bsp_lvgl_lock(150)) {
+            memo_ui_settings_enter();
+            const bool in_sheet = memo_ui_settings_in_sheet();
+            bsp_lvgl_unlock();
+            /* 自动播放是就地切换、只读行什么也不做——两者都不该停在子页状态，
+               否则后续上下键会被当成"调值"。 */
+            if (!in_sheet) s_sm.state = MEMO_STATE_SETTINGS;
+        }
+        break;
+
+    case MEMO_ACT_SUB_PAGE_PREV:
+    case MEMO_ACT_SUB_PAGE_NEXT:
+        if (bsp_lvgl_lock(150)) {
+            memo_ui_settings_adjust(action == MEMO_ACT_SUB_PAGE_NEXT ? 1 : -1);
+            bsp_lvgl_unlock();
+        }
+        break;
+
+    case MEMO_ACT_SUB_PAGE_SAVE:
+    case MEMO_ACT_SUB_PAGE_CANCEL:
+        /* 值在调整时就已经生效并落盘，这里只需要退出子页。 */
+        if (bsp_lvgl_lock(150)) {
+            memo_ui_settings_refresh();
+            bsp_lvgl_unlock();
+        }
         break;
 
     default:
@@ -646,6 +712,10 @@ void app_main(void)
 
     memo_sm_init(&s_sm);
 
+    if (memo_settings_init() != ESP_OK) {
+        ESP_LOGW(TAG, "settings unavailable; using defaults");
+    }
+
     const uint32_t wake_causes = esp_sleep_get_wakeup_causes();
     if (wake_causes & (1u << ESP_SLEEP_WAKEUP_GPIO)) {
         key_guard_arm(&s_guard, esp_timer_get_time(), 10LL * 1000 * 1000);
@@ -700,6 +770,8 @@ void app_main(void)
         memo_fonts_init();
         build_list_page();
         build_record_page();
+        memo_ui_detail_build();
+        memo_ui_settings_build();
         refresh_list();
         show_screen(s_list_screen);
         bsp_lvgl_unlock();
@@ -709,6 +781,9 @@ void app_main(void)
        ESP_ERR_INVALID_STATE，表现就是"按了没反应"。 */
     if (bsp_audio_init() != ESP_OK) {
         ESP_LOGE(TAG, "audio codec unavailable; recording will not work");
+    } else {
+        /* BSP 的上电音量是 0。不给一个默认值，录音能存、播放"成功"但全程无声。 */
+        bsp_audio_set_volume(memo_settings_get()->volume);
     }
     if (memo_recorder_init() != ESP_OK) {
         ESP_LOGE(TAG, "recorder unavailable; recording will not work");

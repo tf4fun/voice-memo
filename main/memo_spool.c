@@ -187,7 +187,11 @@ int memo_spool_scan(memo_spool_entry_t *out, size_t max_entries)
                 if (fread(raw, 1, sizeof(raw), file) == sizeof(raw)) {
                     memo_container_header_t header;
                     if (memo_container_decode(raw, &header)) {
-                        entry.recorded_at = header.recorded_at;
+                        /* 2020 年之前的时间只能是"没对时"，显示成未知，
+                           别把 1970 年当成真实录音时刻。 */
+                        entry.recorded_at = (header.recorded_at > 1577836800ULL)
+                                                ? header.recorded_at
+                                                : 0;
                         entry.duration_ms = header.duration_ms;
                     }
                 }

@@ -1,6 +1,10 @@
 // main/memo_font.c —— 字体描述符与覆盖率检查。
 #include "memo_font.h"
 
+#include "esp_log.h"
+
+static const char *TAG = "memo_font";
+
 static lv_font_t s_body;
 static lv_font_t s_label;
 static bool s_ready;
@@ -35,4 +39,43 @@ bool memo_font_covers(uint32_t codepoint)
     const lv_font_t *font = memo_font_label();
     if (!lv_font_get_glyph_dsc(font, &glyph, codepoint, 0)) return false;
     return !glyph.is_placeholder;
+}
+
+void memo_font_check_text(const char *what, const char *text)
+{
+    if (text == NULL) return;
+
+    const unsigned char *p = (const unsigned char *)text;
+    while (*p != '\0') {
+        uint32_t cp;
+        int extra;
+        if (*p < 0x80) {
+            cp = *p;
+            extra = 0;
+        } else if ((*p & 0xE0) == 0xC0) {
+            cp = *p & 0x1F;
+            extra = 1;
+        } else if ((*p & 0xF0) == 0xE0) {
+            cp = *p & 0x0F;
+            extra = 2;
+        } else if ((*p & 0xF8) == 0xF0) {
+            cp = *p & 0x07;
+            extra = 3;
+        } else {
+            p++;
+            continue;
+        }
+        for (int i = 1; i <= extra; i++) {
+            if ((p[i] & 0xC0) != 0x80) {
+                extra = i - 1;
+                break;
+            }
+            cp = (cp << 6) | (p[i] & 0x3F);
+        }
+        p += extra + 1;
+
+        if (cp >= 0x20 && !memo_font_covers(cp)) {
+            ESP_LOGW(TAG, "%s: missing glyph U+%04X", what, (unsigned)cp);
+        }
+    }
 }

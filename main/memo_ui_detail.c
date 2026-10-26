@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "memo_font.h"
+#include "memo_settings.h"
 #include "memo_time.h"
 #include "memo_ui_common.h"
 
@@ -46,7 +47,7 @@ void memo_ui_detail_build(void)
     lv_obj_set_style_radius(s_screen, 0, 0);
 
     s_header = memo_ui_label(s_screen, memo_font_label(), VM_INK);
-    lv_label_set_text(s_header, "‹ --:--");
+    lv_label_set_text(s_header, LV_SYMBOL_LEFT " --:--");
     lv_obj_set_pos(s_header, VM_INSET + 4, VM_INSET + 8);
 
     /* 正文面板：圆角 14，内部可滚动。 */
@@ -73,7 +74,7 @@ void memo_ui_detail_build(void)
                  -VM_INSET - DETAIL_HINT_H + 2 + VM_SHADOW);
 
     s_bar_label = memo_ui_label(s_bar, memo_font_label(), VM_INK);
-    lv_label_set_text(s_bar_label, "▶  0:00 / 0:00");
+    lv_label_set_text(s_bar_label, LV_SYMBOL_PLAY "  0:00 / 0:00");
     lv_obj_align(s_bar_label, LV_ALIGN_LEFT_MID, 14, 0);
 
     s_bar_track = lv_obj_create(s_bar);
@@ -90,7 +91,7 @@ void memo_ui_detail_build(void)
 
 void memo_ui_detail_show(int64_t recorded_at, uint32_t duration_ms, const char *transcript)
 {
-    const int32_t tz = 480;
+    const int32_t tz = memo_settings_get()->tz_offset_min;
     char clock[8] = "--:--";
     char duration[16] = "0:00";
     if (recorded_at > 0) {
@@ -99,15 +100,18 @@ void memo_ui_detail_show(int64_t recorded_at, uint32_t duration_ms, const char *
     }
 
     char header[40];
-    snprintf(header, sizeof(header), "‹ %s · %s", clock, duration);
+    snprintf(header, sizeof(header), "%s %s · %s", LV_SYMBOL_LEFT, clock, duration);
     lv_label_set_text(s_header, header);
 
     if (transcript != NULL && transcript[0] != '\0') {
+            memo_font_check_text("detail transcript", transcript);
         lv_label_set_text(s_text, transcript);
     } else {
         /* 还没连服务端时也要如实说明，而不是留一片空白。 */
-        lv_label_set_text(s_text, "这条录音已保存在设备上。\n"
-                                  "连上服务器后会显示转写文字，原始录音现在就能播放。");
+        static const char kNoText[] = "这条录音已保存在设备上。\n"
+                                      "连上服务器后会显示转写文字，原始录音现在就能播放。";
+        memo_font_check_text("detail placeholder", kNoText);
+        lv_label_set_text(s_text, kNoText);
     }
 
     s_expanded = false;
@@ -130,7 +134,8 @@ void memo_ui_detail_set_playback(bool playing, uint32_t position_ms, uint32_t du
     memo_time_duration((int64_t)duration_ms, dur, sizeof(dur));
 
     char text[48];
-    snprintf(text, sizeof(text), "%s  %s / %s", playing ? "❚❚" : "▶", pos, dur);
+    snprintf(text, sizeof(text), "%s  %s / %s",
+             playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY, pos, dur);
     lv_label_set_text(s_bar_label, text);
 
     /* 进度用一根短轨道表示，避免为 4px 的细进度条再造一种控件。 */
