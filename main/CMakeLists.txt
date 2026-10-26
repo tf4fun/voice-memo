@@ -4,6 +4,14 @@
 # tools/validate.sh compiles directly.
 idf_component_register(
     SRCS "memo_app.c"
+         "memo_state.c"
+         "memo_text.c"
+         "memo_time.c"
+         "memo_container.c"
+         "memo_spool.c"
+         "memo_recorder.c"
     INCLUDE_DIRS "."
-    REQUIRES bsp
+    REQUIRES bsp esp_audio_codec esp_timer nvs_flash spiffs
 )
+
+# The CJK font subsets land here in M3.
