@@ -11,45 +11,50 @@ covered here.
 
 The server receives finished recordings from the Passport, keeps them, turns
 each one into text with a hosted speech-to-text API, and serves the resulting
-list back to the device.
+list back to the device. It also exposes a complete management surface so other
+tools can curate the diary.
 
-In scope: device enrolment, upload validation, audio decoding, transcription,
-metadata queries, audio streaming, discovery advertisement, deployment.
+In scope: upload validation, audio decoding, transcription, metadata queries,
+audio streaming, full CRUD over memos, discovery advertisement, deployment.
 
-Out of scope: any recording, playback or UI logic on the device; user accounts;
-multi-tenant access; web UI; editing transcripts.
+Out of scope: recording, playback or UI logic on the device; user accounts;
+multi-tenant access; a web UI.
 
 Non-goals that shape the design: no message broker, no reverse proxy, no
-external database, no `ffmpeg`, no cgo. One process, one directory, one binary.
+external database, no `ffmpeg`, no cgo, no device provisioning protocol. One
+process, one directory, one binary.
+
+This is a trusted-LAN service. It has no authentication; section 13 states the
+consequence plainly rather than pretending otherwise.
 
 ## 2. Technology choices
 
 | Concern | Choice | Why |
 | --- | --- | --- |
-| Language | Go 1.22 or newer | stdlib routing patterns, `log/slog`, `database/sql`, static binary |
-| HTTP | `net/http` + `http.ServeMux` | enough for a dozen routes, no framework |
-| Storage of records | SQLite via `modernc.org/sqlite` | pure Go, no cgo, single file, WAL |
+| Language | Go 1.27.3 | current toolchain on the development host; stdlib routing, `log/slog`, `database/sql` |
+| HTTP | `net/http` + `http.ServeMux` | method-and-wildcard patterns cover every route, no framework |
+| Records | SQLite via `modernc.org/sqlite` | pure Go, no cgo, single file, WAL |
 | Audio decode | `github.com/pion/opus` | pure Go; bit-exact for 16 kHz mono SILK, which is exactly the device's encoder setting |
 | Discovery | `github.com/grandcat/zeroconf` | pure Go mDNS publisher |
 | Speech-to-text | SiliconFlow transcription API | see section 4 |
-| Build | `CGO_ENABLED=0 go build -trimpath -ldflags="-s -w"` | one static binary, no runtime library |
+| Build | `CGO_ENABLED=0 go build -trimpath -ldflags="-s -w"` | one static binary, no runtime libraries |
 
-`pion/opus` is chosen over the cgo wrappers because it removes the whole native
+`pion/opus` is chosen over the cgo wrappers because it removes the entire native
 toolchain from deployment. If the device ever moves to CELT or higher bitrates,
 `github.com/skrashevich/go-opus` exposes the same API and can be swapped with a
-single `replace` line in `go.mod`; that escape hatch is why the decoder is
-wrapped behind our own function rather than called from handlers directly.
+single `replace` line in `go.mod`; that escape hatch is why decoding sits behind
+our own function rather than being called from handlers.
 
 ## 3. Process and package layout
 
 ```text
 server/
-├── cmd/memo-server/main.go     flags, config, wiring, CLI subcommands
+├── cmd/memo-server/main.go     flags, config, wiring, small CLI
 ├── internal/config/            environment parsing and validation
 ├── internal/domain/            Memo, Device, Status, container header
 ├── internal/audio/             opus frame decode, WAV writer
 ├── internal/store/             SQLite queries and file layout
-├── internal/httpapi/           routes, auth middleware, JSON errors
+├── internal/httpapi/           routes, JSON errors, Range handling
 ├── internal/asr/               Transcriber interface, siliconflow, fake
 ├── internal/jobs/              single-writer work loop
 └── internal/discovery/         mDNS advertisement
@@ -73,8 +78,7 @@ the mDNS advertiser. Everything else is request-scoped.
 | Formats | WAV, MP3, OGG, M4A, FLAC |
 
 Our own limits are stricter than the provider's: 5 minutes and 32 MB per memo,
-enforced at upload. A decoded 5-minute 16 kHz mono WAV is 9.6 MB, well inside
-both.
+enforced at upload. A decoded 5-minute 16 kHz mono WAV is 9.6 MB, inside both.
 
 The API key comes from the environment only. It is never written to the
 database, logs, or responses. The adapter sends one file and receives one
@@ -83,9 +87,9 @@ string; nothing about the provider leaks past the `asr` package.
 ### 4.2 Discovery
 
 mDNS service `_voicememo._tcp`, instance name configurable (default: hostname),
-TXT records `ver=1`, `path=/api/v1`, `caps=opus`. Advertised port is the HTTP
+TXT records `ver=1`, `path=/api/v1`, `caps=opus`. The advertised port is the HTTP
 port. The device resolves this record and then calls `GET /api/v1/ping` to
-confirm reachability, so a stale record cannot be mistaken for a working server.
+confirm reachability, so a stale record is never mistaken for a working server.
 
 mDNS uses multicast, which does not cross Docker's default bridge network.
 Deployment is either a native binary under systemd or a container with
@@ -127,9 +131,9 @@ var ErrPermanent = errors.New("permanent transcription failure") // do not retry
 // wrapped: fmt.Errorf("%w: %v", ErrPermanent, cause)
 ```
 
-Implementations: `siliconflow.go`, `fake.go` (returns fixed text, used by tests
-and offline development), and optionally `exec.go` (shells out to a local
-command) to prove the seam is real. Selection: `MEMO_ASR_PROVIDER`.
+Implementations: `siliconflow.go`, `fake.go` (fixed text, used by tests and
+offline development), and optionally `exec.go` (shells out to a local command)
+to prove the seam is real. Selection: `MEMO_ASR_PROVIDER`.
 
 ### 5.2 Audio decoding
 
@@ -142,9 +146,8 @@ package audio
 func DecodeOpusToWAV(r io.Reader, w io.Writer) (Stats, error)
 ```
 
-Keeping this a function rather than an interface is deliberate: there is
-exactly one on-disk format, and a hypothetical second codec changes the
-container version anyway.
+A function rather than an interface is deliberate: there is exactly one on-disk
+format, and a second codec would change the container version anyway.
 
 ### 5.3 Store
 
@@ -156,16 +159,14 @@ a real temporary SQLite file, which is faster and more honest than a mock.
 ```sql
 CREATE TABLE devices (
     id          TEXT PRIMARY KEY,          -- 12 hex chars derived from the MAC
-    name        TEXT NOT NULL,
-    token_hash  BLOB NOT NULL,             -- SHA-256 of the bearer token
-    state       TEXT NOT NULL,             -- pending | approved | revoked
+    name        TEXT,
     first_seen  INTEGER NOT NULL,
     last_seen   INTEGER NOT NULL
 );
 
 CREATE TABLE memos (
     id           TEXT PRIMARY KEY,         -- UUIDv4, chosen by the device
-    device_id    TEXT NOT NULL REFERENCES devices(id),
+    device_id    TEXT NOT NULL,
     recorded_at  INTEGER NOT NULL,         -- device clock, Unix seconds
     uploaded_at  INTEGER NOT NULL,
     duration_ms  INTEGER NOT NULL,
@@ -178,88 +179,91 @@ CREATE TABLE memos (
     asr_provider TEXT,
     asr_model    TEXT,
     asr_trace_id TEXT,
+    edited_at    INTEGER,                  -- set when a human corrected the text
     error        TEXT,
     audio_path   TEXT NOT NULL,
-    clock_skew   INTEGER NOT NULL DEFAULT 0
+    clock_skew   INTEGER NOT NULL DEFAULT 0,
+    deleted_at   INTEGER                   -- soft delete, audio removed
 );
 
-CREATE INDEX memos_order ON memos(device_id, recorded_at DESC, id DESC);
+CREATE INDEX memos_order ON memos(recorded_at DESC, id DESC)
+    WHERE deleted_at IS NULL;
 
 CREATE TABLE jobs (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    memo_id   TEXT NOT NULL UNIQUE REFERENCES memos(id),
+    memo_id   TEXT NOT NULL UNIQUE,
     attempts  INTEGER NOT NULL DEFAULT 0,
     next_at   INTEGER NOT NULL
 );
 ```
 
+`devices` has no token and no state: it exists only to name the source of a memo,
+and is created on first sight of an unknown `X-Device-Id`.
+
 Files: `data/audio/<device_id>/<YYYYMM>/<memo_id>.wav`. The decoded WAV is the
 only canonical copy; the uploaded Opus container is deleted after a successful
-decode. If decoding fails, the container is kept for diagnosis under
-`data/rejected/`.
+decode. If decoding fails, the container is kept under `data/rejected/` for
+diagnosis.
 
 ## 7. HTTP API
 
 All paths are prefixed `/api/v1`. JSON in, JSON out, except the upload body and
-audio stream. `Authorization: Bearer <token>` is required everywhere except
-`/ping` and `/devices/enroll`.
+the audio stream. There is no authentication and no per-device scoping: every
+caller sees every memo.
 
-| Method | Path | Auth | Purpose |
-| --- | --- | --- | --- |
-| GET | `/ping` | none | Reachability probe used after discovery |
-| POST | `/devices/enroll` | none | First contact; returns a token in `pending` state |
-| GET | `/devices/me` | token | Device polls for approval; also returns server limits and time |
-| POST | `/memos` | token | Upload one finished recording |
-| GET | `/memos` | token | Keyset-paginated list, newest first |
-| GET | `/memos/{id}` | token | One record with transcript |
-| GET | `/memos/{id}/audio` | token | WAV stream, `Range` supported |
-| GET | `/health` | none | Version, provider, queue depth |
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/ping` | Reachability probe used after discovery |
+| GET | `/server` | Version, advertised limits, server time, provider |
+| POST | `/memos` | Upload one finished recording |
+| GET | `/memos` | Keyset-paginated list, newest first |
+| GET | `/memos/{id}` | One record with transcript |
+| PATCH | `/memos/{id}` | Correct the transcript or language by hand |
+| DELETE | `/memos/{id}` | Delete the record and its audio |
+| GET | `/memos/{id}/audio` | WAV stream, `Range` supported |
+| POST | `/memos/{id}/transcribe` | Re-run transcription |
+| GET | `/health` | Ops view: queue depth, provider, disk use |
 
-There is no delete endpoint and no admin HTTP surface. Approving devices,
-re-running transcription and deleting a memo are CLI subcommands, so a stolen
-device token cannot destroy anything and the attack surface stays small.
+The management surface is REST-complete on purpose: anything a future web page,
+a shell script or a phone shortcut needs can be done over HTTP, and the CLI is a
+convenience rather than the only way in.
 
-### 7.1 Enrolment
+### 7.1 Device identification
 
-```http
-POST /api/v1/devices/enroll
-Content-Type: application/json
-
-{"device_id":"A1B2C3D4E5F6","name":"Passport 4F2A","fw":"0.1.0","proto":1}
-```
-
-```json
-201 Created
-{"token":"<32 bytes, base64url>","state":"pending"}
-```
-
-The device stores the token immediately and keeps polling:
+No registration, no token, no approval step. The device sends its own id:
 
 ```http
-GET /api/v1/devices/me
-Authorization: Bearer <token>
+X-Device-Id: A1B2C3D4E5F6
+```
+
+The first request mentioning an unknown id creates the device row. The id is
+recorded on every memo and echoed in responses, which is enough to tell two
+devices apart. A missing id is accepted for reads; uploads require one, because a
+memo without a source cannot be attributed later.
+
+### 7.2 Server information
+
+```http
+GET /api/v1/server
 ```
 
 ```json
 200 OK
-{"device_id":"A1B2C3D4E5F6","state":"approved","server_time":1761468200,
+{"service":"memo-server","version":"0.1.0","api":1,
+ "server_time":1761468200,
+ "asr":{"provider":"siliconflow","model":"FunAudioLLM/SenseVoiceSmall"},
  "limits":{"max_memo_ms":300000,"max_bytes":33554432}}
 ```
 
-`limits` lives on the server so the 5-minute cap is enforced in one place. While
-`state` is `pending`, every other endpoint answers `403 device_pending`.
+`limits` lives on the server so the five-minute cap is defined in one place
+instead of drifting between firmware and service.
 
-Unknown devices are refused rather than auto-created on business endpoints: a
-request with a token the server never issued gets `401`. This keeps a leaked
-binary from enrolling silently, at the cost of requiring the CLI approval step
-described in section 11.
-
-### 7.2 Upload
+### 7.3 Upload
 
 ```http
 POST /api/v1/memos
-Authorization: Bearer <token>
 Content-Type: application/octet-stream
+X-Device-Id: A1B2C3D4E5F6
 X-Memo-Id: 9f1e5c7a-...
 X-Recorded-At: 1761468120
 Content-Length: 192044          (optional; chunked bodies are accepted)
@@ -273,67 +277,83 @@ Content-Length: 192044          (optional; chunked bodies are accepted)
 ```
 
 Repeating the same `X-Memo-Id` returns `200` with the existing record and does
-not create a second job. Idempotency is what lets the device retry bluntly after
-a timeout.
+not create a second job. That idempotency is what lets the device retry bluntly
+after a timeout.
 
-The body is streamed to `data/incoming/<memo_id>.part` with a byte cap, then
-validated (section 8), decoded, and moved into place. Nothing is written to the
+The body streams to `data/incoming/<memo_id>.part` with a byte cap, is then
+validated (section 8), decoded, and moved into place. Nothing touches the
 database until validation passes, so a truncated upload leaves only a temp file
-that the next startup removes.
+that startup cleanup removes.
 
-### 7.3 Listing
+### 7.4 Listing
 
 ```http
-GET /api/v1/memos?limit=20&cursor=MTc2MTQ2MzAyMDpkMWYy
+GET /api/v1/memos?limit=20&cursor=MTc2MTQ2MzAyMDpkMWYy&device=A1B2C3D4E5F6
 ```
 
 ```json
 200 OK
 {"items":[
-   {"id":"9f1e...","recorded_at":1761468120,"duration_ms":84000,
-    "status":"ready","lang":"zh","snippet":"Reviewed the test plan with Zhang…"},
-   {"id":"a37b...","recorded_at":1761463020,"duration_ms":46000,
-    "status":"transcribing"}
+   {"id":"9f1e...","device_id":"A1B2...","recorded_at":1761468120,
+    "duration_ms":84000,"status":"ready","lang":"zh",
+    "snippet":"Reviewed the test plan with Zhang…"},
+   {"id":"a37b...","device_id":"A1B2...","recorded_at":1761463020,
+    "duration_ms":46000,"status":"transcribing"}
  ],
  "next_cursor":"MTc2MTQ2MzAyMDphMzdi"}
 ```
 
-`limit` defaults to 20, is capped at 100. The cursor is an opaque base64 of
-`recorded_at:id`, so pagination is a keyset seek and does not drift when new
-memos arrive during browsing. `snippet` is the first 40 characters of the
-transcript, cut at a rune boundary, and is absent while transcription is
-pending.
+`limit` defaults to 20 and is capped at 100. `device` is an optional filter. The
+cursor is an opaque base64 of `recorded_at:id`, so pagination is a keyset seek
+that does not drift when new memos arrive mid-browse. `snippet` is the first 40
+characters of the transcript, cut on a rune boundary, and is absent while
+transcription is pending.
 
-### 7.4 Detail and audio
+### 7.5 Detail, correction and deletion
 
 ```json
 200 OK
-{"id":"9f1e...","recorded_at":1761468120,"uploaded_at":1761468200,
- "duration_ms":84000,"size_bytes":192044,"codec":"opus","status":"ready",
+{"id":"9f1e...","device_id":"A1B2...","recorded_at":1761468120,
+ "uploaded_at":1761468200,"duration_ms":84000,"size_bytes":192044,
+ "codec":"opus","status":"ready","lang":"zh","edited_at":null,"error":null,
  "transcript":"Reviewed the test plan with Zhang at three. He will have the test environment ready before next Wednesday.",
- "lang":"zh","error":null,
- "asr":{"provider":"siliconflow","model":"FunAudioLLM/SenseVoiceSmall",
-        "trace_id":"3f0a…"},
+ "asr":{"provider":"siliconflow","model":"FunAudioLLM/SenseVoiceSmall","trace_id":"3f0a…"},
  "audio":{"path":"/api/v1/memos/9f1e.../audio","bytes":2688044}}
 ```
 
-`GET /memos/{id}/audio` returns `audio/wav` with `Accept-Ranges: bytes` and
-honours a single `Range` header. The device plays from the start, but Range
-keeps the endpoint honest and lets us re-listen while debugging.
+```http
+PATCH /api/v1/memos/9f1e...
+Content-Type: application/json
 
-### 7.5 Errors
+{"transcript":"Reviewed the test plan with Zhang at 3pm.","lang":"en"}
+```
+
+`PATCH` accepts `transcript` and/or `lang`, stamps `edited_at`, and leaves the
+status `ready`. It never triggers transcription. An unknown field is rejected
+rather than silently ignored, so a typo in a management script fails loudly.
+
+`DELETE` returns `204` and is not reversible: the row is soft-deleted and the
+audio file is removed immediately. Deleting an unknown id returns `404`.
+
+`POST /memos/{id}/transcribe` returns `202`, clears `error`, sets the status back
+to `uploaded`, and re-arms the job. It is the escape hatch after a provider
+outage.
+
+`GET /memos/{id}/audio` returns `audio/wav` with `Accept-Ranges: bytes` and
+honours a single `Range` header. The device plays from the start; Range keeps the
+endpoint honest and makes re-listening during debugging cheap.
+
+### 7.6 Errors
 
 ```json
-{"error":{"code":"device_pending","message":"device is not approved yet"}}
+{"error":{"code":"bad_container","message":"unexpected magic"}}
 ```
 
 | Code | Status | Meaning |
 | --- | --- | --- |
-| `unauthorized` | 401 | Missing or unknown token |
-| `device_pending` | 403 | Enrolled but not approved |
-| `device_revoked` | 403 | Approval withdrawn |
 | `not_found` | 404 | Unknown memo id |
-| `invalid_json` | 400 | Malformed request |
+| `invalid_json` | 400 | Malformed request or unknown field |
+| `missing_device` | 400 | Upload without `X-Device-Id` |
 | `bad_container` | 400 | Magic, version or field mismatch |
 | `frame_mismatch` | 400 | Declared frame count or duration disagrees |
 | `payload_too_large` | 413 | Over `MEMO_MAX_BYTES` |
@@ -361,10 +381,10 @@ Defined once here and implemented on both sides. All integers little-endian.
 | 80 | … | frames: `uint16` length then payload, repeated |
 
 Validation rejects the upload when the magic, version, codec, sample rate or
-channel count differ from the above; when the declared frame count does not
-match the frames actually present; when duration disagrees with
-`frame_count × frame_ms` by more than 5 percent; or when the body exceeds the
-byte cap. Rejections are permanent — the device must not retry them.
+channel count differ; when the declared frame count does not match the frames
+present; when duration disagrees with `frame_count × frame_ms` by more than
+5 percent; or when the body exceeds the byte cap. Rejections are permanent — the
+device must not retry them.
 
 ## 9. Processing
 
@@ -379,16 +399,16 @@ upload ──► validate container ──► decode frames ──► write WAV 
                                               └── error ──► retry with backoff, else failed
 ```
 
-Decoding happens inside the upload request, because a 5-minute file decodes in
-tens of milliseconds and it keeps the state machine small: a memo row exists
-only once the audio is known to be usable.
+Decoding runs inside the upload request: a five-minute file decodes in tens of
+milliseconds, and doing it eagerly keeps the state machine small — a memo row
+exists only once its audio is known to be usable.
 
-Transcription is asynchronous. The device never waits for it; it shows a
-transcribing dot until the next list refresh.
+Transcription is asynchronous. The device never waits; it shows a transcribing
+dot until the next list refresh.
 
 ### 9.1 Job loop
 
-A single goroutine claims work; `MEMO_ASR_CONCURRENCY` raises it if a provider
+One goroutine claims work; `MEMO_ASR_CONCURRENCY` raises it when the provider
 allows parallel calls.
 
 ```sql
@@ -399,36 +419,30 @@ RETURNING memo_id, attempts;
 
 Backoff: 30 s, 2 min, 10 min, then `failed` with the provider's reason stored in
 `memos.error`. `ErrPermanent` skips the remaining attempts. On startup, rows
-left in `transcribing` are reset to `uploaded` and their jobs are re-armed —
-this is the crash recovery story, and it needs no external state.
+left in `transcribing` are reset to `uploaded` and their jobs re-armed — that is
+the whole crash-recovery story, and it needs no external state.
 
 ### 9.2 Clock handling
 
 `recorded_at` is the device's clock, and a device that never reached NTP sends
 `0`. When it is zero, or differs from server time by more than ten minutes, the
-server stores its own receipt time in `recorded_at` and records the delta in
-`clock_skew`. Ordering always uses `recorded_at`, so a device with a bad clock
-falls back to upload order instead of scrambling the diary.
+server stores its own receipt time and records the delta in `clock_skew`.
+Ordering always uses `recorded_at`, so a device with a bad clock falls back to
+upload order instead of scrambling the diary.
 
 ## 10. Sequence diagrams
 
-### 10.1 First contact
+### 10.1 Startup and discovery
 
 ```mermaid
 sequenceDiagram
     participant D as Device
     participant S as memo-server
-    participant A as Admin (CLI)
-    D->>S: POST /devices/enroll {device_id, name}
-    S-->>D: 201 {token, state: pending}
-    S->>A: log "pending device A1B2 (4F2A)"
-    A->>S: memo-server approve A1B2
-    loop every 10 s while pending
-        D->>S: GET /devices/me (Bearer token)
-        S-->>D: 200 {state: pending}
-    end
-    D->>S: GET /devices/me
-    S-->>D: 200 {state: approved, limits}
+    Note over S: publishes _voicememo._tcp
+    D->>S: GET /ping
+    S-->>D: 200 {service: memo, api: 1}
+    D->>S: GET /server
+    S-->>D: 200 {limits, server_time, provider}
 ```
 
 ### 10.2 Record, upload, transcribe
@@ -440,7 +454,7 @@ sequenceDiagram
     participant W as Job worker
     participant P as SiliconFlow
     Note over D: records locally to spool
-    D->>S: POST /memos (container, X-Memo-Id)
+    D->>S: POST /memos (container, X-Memo-Id, X-Device-Id)
     S->>S: validate + decode to WAV
     S->>S: insert memo(uploaded) + job
     S-->>D: 201 {id, status: uploaded}
@@ -489,20 +503,32 @@ sequenceDiagram
     W->>S: status = ready
 ```
 
+### 10.5 Management from another tool
+
+```mermaid
+sequenceDiagram
+    participant C as curl or future web page
+    participant S as memo-server
+    C->>S: GET /memos?limit=50
+    S-->>C: 200 {items, next_cursor}
+    C->>S: PATCH /memos/9f1e {"transcript": "..."}
+    S-->>C: 200 {id, edited_at}
+    C->>S: POST /memos/9f1e/transcribe
+    S-->>C: 202 {status: uploaded}
+    C->>S: DELETE /memos/a37b
+    S-->>C: 204
+```
+
 ## 11. CLI
 
 ```text
-memo-server serve                     run HTTP, jobs and discovery
-memo-server devices pending           list devices waiting for approval
-memo-server approve <device-id>       approve a device
-memo-server revoke <device-id>        revoke a device token
-memo-server retranscribe <memo-id>    re-arm one job, clears failed state
-memo-server rm <memo-id>              delete a memo and its audio file
-memo-server gc                        remove orphaned files and old temp files
+memo-server serve     run HTTP, jobs and discovery
+memo-server gc        remove orphaned files, stale temp files, expired rows
 ```
 
-Subcommands open the same SQLite file and exit. They never touch the running
-server's memory, so no admin socket and no extra port.
+Management lives in the HTTP API, not the CLI, so a second machine, a script or
+a future web page has exactly the same reach as an operator on the host. The CLI
+keeps only what cannot be done over HTTP (garbage collection).
 
 ## 12. Configuration
 
@@ -524,20 +550,26 @@ server's memory, so no admin socket and no extra port.
 Startup fails loudly when the provider needs a key that is missing, rather than
 accepting uploads that can never be transcribed.
 
-## 13. Security
+## 13. Security posture
 
-- Tokens are 32 random bytes, returned once, stored only as SHA-256, compared in
-  constant time.
+There is no authentication. Anyone who can reach the port can read every memo,
+download every recording, rewrite transcripts and delete entries. That is an
+accepted trade for a single-user server on a home LAN, and it belongs in the
+document rather than in a surprise later.
+
+What is still enforced, because it costs nothing:
+
 - Uploads are capped while streaming, not after buffering the whole body.
 - Memo ids are validated as UUIDs before touching the filesystem, so path
   traversal is impossible by construction.
-- The provider key is read from the environment at startup and never rendered in
-  logs, errors or HTTP responses.
-- Default listen address is all interfaces; the intended deployment is a
-  trusted home network. Exposing it to the internet requires TLS in front of it,
-  which this design does not provide.
-- Failed authentication is logged with the device id and remote address, rate
-  limited to one line per address per minute to avoid log flooding.
+- The provider key is read from the environment and never rendered in logs,
+  errors or responses.
+- HTTP methods other than those listed are rejected, so a stray `PUT` cannot
+  half-update a row.
+
+The upgrade path, if this ever leaves the LAN: put it behind a TLS-terminating
+reverse proxy with a shared secret or mTLS, and require a per-device token on
+`POST /memos` and the read endpoints. Nothing in the schema blocks that.
 
 ## 14. Deployment
 
@@ -554,10 +586,10 @@ ExecStart=/usr/local/bin/memo-server serve
 Restart=always
 ```
 
-Backup is `data/` (SQLite plus audio) — use `sqlite3 memo.db ".backup"` while
-running, then copy the audio tree. Restore is the reverse; nothing else is
-stateful. Upgrades are a binary swap and a restart; schema migrations run at
-startup and are idempotent.
+Backup is `data/` (SQLite plus audio): `sqlite3 memo.db ".backup"` while running,
+then copy the audio tree. Restore is the reverse; nothing else is stateful.
+Upgrades are a binary swap and a restart; schema migrations run at startup and
+are idempotent.
 
 A container image is optional; if used, it needs `--network host` for mDNS.
 
@@ -567,21 +599,23 @@ A container image is optional; if used, it needs `--network host` for mDNS.
 | --- | --- |
 | `internal/audio` | container parse, declared/actual frame mismatch, WAV header fields, decode of a small SILK fixture, duration arithmetic |
 | `internal/domain` | container header round-trip, clock-skew rule, status transitions |
-| `internal/httpapi` | auth matrix, 403 while pending, idempotent upload, cursor pagination, Range requests, error codes — all through `httptest` |
+| `internal/httpapi` | upload idempotency, cursor pagination, `PATCH` field validation, `DELETE` idempotency, `Range` requests, error codes — all through `httptest` |
 | `internal/asr` | `fake` end-to-end; provider adapter against an `httptest` server checking multipart shape, retry classes and trace-id capture |
 | `internal/jobs` | backoff schedule, permanent-error short-circuit, crash recovery of `transcribing` rows |
-| `internal/store` | real temporary SQLite, concurrent reads during a write |
+| `internal/store` | real temporary SQLite, concurrent reads during a write, soft-delete filtering |
 
-`go test ./...` runs everything without network access. One fixture file
+`go test ./...` runs without network access. One fixture
 (`internal/audio/testdata/one-second.opus`) is generated once with `ffmpeg` at
 16 kHz mono SILK and committed, so the decoder path is covered without a live
 provider.
 
 ## 16. Open questions
 
-1. **Retention.** `MEMO_RETENTION_DAYS` exists but nothing deletes automatically
-   yet. Deleting a diary entry is a product decision, so the default is "never".
+1. **Retention.** `MEMO_RETENTION_DAYS` exists but nothing deletes automatically.
+   Deleting a diary entry is a product decision, so the default is "never" and
+   deletion stays explicit.
 2. **Provider fallback.** Whether a failed SiliconFlow call should fall back to a
-   second provider, or simply stay failed until a human re-arms it.
-3. **Snippet language.** The list snippet is raw transcript text; if a memo is
-   mixed-language, no summarisation is attempted.
+   second provider, or stay failed until someone calls
+   `POST /memos/{id}/transcribe`.
+3. **Search.** `GET /memos` filters by device and time only. Transcript search
+   would need SQLite FTS5; not needed yet, and it changes the index layout.
