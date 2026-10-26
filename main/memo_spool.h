@@ -23,6 +23,8 @@ typedef struct {
     char id[37];
     memo_spool_state_t state;
     uint32_t size;
+    uint64_t recorded_at; /* 取自容器头；读不到时为 0 */
+    uint32_t duration_ms;
 } memo_spool_entry_t;
 
 /* 挂载分区（首次挂载自动格式化）。幂等。 */

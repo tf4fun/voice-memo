@@ -10,8 +10,15 @@ idf_component_register(
          "memo_container.c"
          "memo_spool.c"
          "memo_recorder.c"
+         "memo_player.c"
+         "memo_font.c"
     INCLUDE_DIRS "."
     REQUIRES bsp esp_audio_codec esp_timer nvs_flash spiffs
 )
 
-# The CJK font subsets land here in M3.
+# Generated CJK subsets live outside main/ so they stay next to the fonts they
+# were produced from; see assets/fonts/README.md for the exact command.
+target_sources(${COMPONENT_LIB} PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/../assets/fonts/memo_font_16.c"
+    "${CMAKE_CURRENT_LIST_DIR}/../assets/fonts/memo_font_20.c"
+)

@@ -4,6 +4,7 @@
 // 页面渲染全部在 LVGL 锁内。录音与编码在 recorder 任务里，不占用输入任务。
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -26,6 +27,8 @@
 #include "memo_container.h"
 #include "memo_recorder.h"
 #include "memo_spool.h"
+#include "memo_font.h"
+#include "memo_player.h"
 #include "memo_state.h"
 #include "memo_time.h"
 
@@ -62,6 +65,7 @@ static lv_obj_t *s_timer_label;
 static lv_obj_t *s_arm_arc;
 static lv_obj_t *s_level_bars[VM_LEVEL_BARS];
 static lv_obj_t *s_sheet;
+static lv_obj_t *s_sheet_shadow;
 static lv_obj_t *s_opt_save;
 static lv_obj_t *s_opt_cancel;
 static char s_last_id[37];
@@ -76,12 +80,14 @@ static void flat_rect(lv_obj_t *obj, uint32_t color, int radius)
     lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
 }
 
-static lv_obj_t *card_create(lv_obj_t *parent, int x, int y, int w, int h)
+static lv_obj_t *card_create_ex(lv_obj_t *parent, int x, int y, int w, int h,
+                                lv_obj_t **shadow_out)
 {
     lv_obj_t *shadow = lv_obj_create(parent);
     flat_rect(shadow, VM_INK, VM_RADIUS_CARD);
     lv_obj_set_pos(shadow, x + VM_SHADOW, y + VM_SHADOW);
     lv_obj_set_size(shadow, w, h);
+    if (shadow_out != NULL) *shadow_out = shadow;
 
     lv_obj_t *face = lv_obj_create(parent);
     flat_rect(face, VM_CARD, VM_RADIUS_CARD);
@@ -90,6 +96,11 @@ static lv_obj_t *card_create(lv_obj_t *parent, int x, int y, int w, int h)
     lv_obj_set_pos(face, x, y);
     lv_obj_set_size(face, w, h);
     return face;
+}
+
+static lv_obj_t *card_create(lv_obj_t *parent, int x, int y, int w, int h)
+{
+    return card_create_ex(parent, x, y, w, h, NULL);
 }
 
 static lv_obj_t *label_create(lv_obj_t *parent, const lv_font_t *font, uint32_t color)
@@ -171,46 +182,62 @@ static void tick_timer_cb(void *arg)
 }
 
 /* ---------- 页面构建 ---------- */
+#define LIST_ROWS 5
+
+static lv_obj_t *s_rows[LIST_ROWS];
+static lv_obj_t *s_row_shadows[LIST_ROWS];
+static lv_obj_t *s_row_time[LIST_ROWS];
+static lv_obj_t *s_row_text[LIST_ROWS];
+static lv_obj_t *s_row_dur[LIST_ROWS];
+static lv_obj_t *s_battery;
+static memo_spool_entry_t s_entries[MEMO_SPOOL_MAX_ENTRIES];
+static int s_entry_count;
+static int s_selected;
+
 static void build_list_page(void)
 {
     s_list_screen = lv_obj_create(NULL);
     flat_rect(s_list_screen, VM_PAPER, 0);
     lv_obj_set_style_radius(s_list_screen, 0, 0);
 
-    lv_obj_t *title = label_create(s_list_screen, &lv_font_montserrat_20, VM_INK);
-    lv_label_set_text(title, "MEMO");
-    lv_obj_set_pos(title, VM_INSET + 4, VM_INSET + 6);
-
     const int width = lv_display_get_horizontal_resolution(NULL);
-    lv_obj_t *panel = card_create(s_list_screen, VM_INSET, 96,
-                                  width - 2 * VM_INSET - VM_SHADOW, 104);
 
-    s_list_status = label_create(panel, &lv_font_montserrat_14, VM_INK);
-    lv_label_set_text(s_list_status, "-");
-    lv_obj_align(s_list_status, LV_ALIGN_TOP_LEFT, 14, 14);
+    lv_obj_t *title = label_create(s_list_screen, memo_font_label(), VM_INK);
+    lv_label_set_text(title, "备忘");
+    lv_obj_set_pos(title, VM_INSET + 4, VM_INSET + 4);
 
-    lv_obj_t *sub = label_create(panel, &lv_font_montserrat_14, VM_MUTED);
-    lv_label_set_text(sub, "hold OK to record");
-    lv_obj_align(sub, LV_ALIGN_TOP_LEFT, 14, 44);
+    s_battery = label_create(s_list_screen, &lv_font_montserrat_14, VM_MUTED);
+    lv_label_set_text(s_battery, "--");
+    lv_obj_align(s_battery, LV_ALIGN_TOP_RIGHT, -VM_INSET - 4, VM_INSET + 6);
 
-    s_list_hint = label_create(s_list_screen, &lv_font_montserrat_14, VM_MUTED);
-    lv_label_set_text(s_list_hint, "M2 skeleton");
-    lv_obj_align(s_list_hint, LV_ALIGN_BOTTOM_LEFT, VM_INSET + 4, -VM_INSET);
+    lv_obj_t *divider = lv_obj_create(s_list_screen);
+    flat_rect(divider, VM_INK, 0);
+    lv_obj_set_size(divider, width - 2 * VM_INSET, 2);
+    lv_obj_set_pos(divider, VM_INSET, 34);
 
-    /* 待录音圆环：平时隐藏，ARMING 时显示并逐步填满。 */
-    s_arm_arc = lv_arc_create(s_list_screen);
-    lv_obj_set_size(s_arm_arc, 76, 76);
-    lv_obj_center(s_arm_arc);
-    lv_arc_set_rotation(s_arm_arc, 270);
-    lv_arc_set_bg_angles(s_arm_arc, 0, 360);
-    lv_arc_set_range(s_arm_arc, 0, MEMO_ARMING_MS);
-    lv_arc_set_value(s_arm_arc, 0);
-    lv_obj_remove_style(s_arm_arc, NULL, LV_PART_KNOB);
-    lv_obj_set_style_arc_color(s_arm_arc, lv_color_hex(VM_PAPER), LV_PART_MAIN);
-    lv_obj_set_style_arc_width(s_arm_arc, 8, LV_PART_MAIN);
-    lv_obj_set_style_arc_color(s_arm_arc, lv_color_hex(VM_CORAL), LV_PART_INDICATOR);
-    lv_obj_set_style_arc_width(s_arm_arc, 8, LV_PART_INDICATOR);
-    lv_obj_add_flag(s_arm_arc, LV_OBJ_FLAG_HIDDEN);
+    for (int i = 0; i < LIST_ROWS; i++) {
+        lv_obj_t *row = card_create_ex(s_list_screen, VM_INSET, 44 + i * 46,
+                                       width - 2 * VM_INSET - VM_SHADOW, 40,
+                                       &s_row_shadows[i]);
+        s_rows[i] = row;
+
+        s_row_time[i] = label_create(row, &lv_font_montserrat_14, VM_MUTED);
+        lv_obj_align(s_row_time[i], LV_ALIGN_LEFT_MID, 8, 0);
+
+        s_row_text[i] = label_create(row, memo_font_label(), VM_INK);
+        lv_obj_align(s_row_text[i], LV_ALIGN_LEFT_MID, 52, 0);
+
+        s_row_dur[i] = label_create(row, &lv_font_montserrat_14, VM_MUTED);
+        lv_obj_align(s_row_dur[i], LV_ALIGN_RIGHT_MID, -8, 0);
+    }
+
+    s_list_hint = label_create(s_list_screen, memo_font_label(), VM_MUTED);
+    lv_label_set_text(s_list_hint, "长按 OK 录音");
+    lv_obj_align(s_list_hint, LV_ALIGN_BOTTOM_LEFT, VM_INSET + 4, -VM_INSET - 2);
+
+    s_list_status = label_create(s_list_screen, memo_font_label(), VM_MUTED);
+    lv_label_set_text(s_list_status, "");
+    lv_obj_align(s_list_status, LV_ALIGN_BOTTOM_RIGHT, -VM_INSET - 4, -VM_INSET - 2);
 }
 
 static void build_record_page(void)
@@ -252,9 +279,9 @@ static void build_record_page(void)
 
     /* 松手后弹出的选择条：保存 / 取消 */
     const int width = lv_display_get_horizontal_resolution(NULL);
-    s_sheet = card_create(s_record_screen, VM_INSET + 12, 210,
-                          width - 2 * VM_INSET - 24 - VM_SHADOW, 84);
-    lv_obj_add_flag(s_sheet, LV_OBJ_FLAG_HIDDEN);
+    s_sheet = card_create_ex(s_record_screen, VM_INSET + 12, 210,
+                             width - 2 * VM_INSET - 24 - VM_SHADOW, 84,
+                             &s_sheet_shadow);
 
     s_opt_save = label_create(s_sheet, &lv_font_montserrat_20, VM_INK);
     lv_label_set_text(s_opt_save, "save");
@@ -263,6 +290,20 @@ static void build_record_page(void)
     s_opt_cancel = label_create(s_sheet, &lv_font_montserrat_20, VM_MUTED);
     lv_label_set_text(s_opt_cancel, "cancel");
     lv_obj_align(s_opt_cancel, LV_ALIGN_TOP_MID, 0, 44);
+}
+
+/* 卡片和它的投影是两个对象，必须一起藏，否则页面上会留下一个黑方块。 */
+static void sheet_visible(bool visible)
+{
+    lv_obj_t *objects[] = {s_sheet, s_sheet_shadow};
+    for (size_t i = 0; i < sizeof(objects) / sizeof(objects[0]); i++) {
+        if (objects[i] == NULL) continue;
+        if (visible) {
+            lv_obj_clear_flag(objects[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(objects[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
 }
 
 static void refresh_confirm_sheet(void)
@@ -275,24 +316,75 @@ static void refresh_confirm_sheet(void)
     lv_obj_set_style_text_decor(s_opt_cancel, save ? LV_TEXT_DECOR_NONE : LV_TEXT_DECOR_UNDERLINE, 0);
 }
 
-static void refresh_list_labels(void)
+static void row_highlight(int index, bool selected)
 {
-    memo_spool_entry_t entries[MEMO_SPOOL_MAX_ENTRIES];
-    int total = memo_spool_scan(entries, MEMO_SPOOL_MAX_ENTRIES);
-    int pending = 0;
-    for (int i = 0; i < total && i < MEMO_SPOOL_MAX_ENTRIES; i++) {
-        if (entries[i].state == MEMO_SPOOL_PENDING) pending++;
+    if (index < 0 || index >= LIST_ROWS) return;
+    lv_obj_t *row = s_rows[index];
+    lv_obj_t *shadow = s_row_shadows[index];
+    if (row == NULL) return;
+
+    lv_obj_set_style_bg_color(row, lv_color_hex(selected ? VM_SUN : VM_CARD), 0);
+    lv_obj_set_style_translate_y(row, selected ? -2 : 0, 0);
+    if (shadow != NULL) {
+        lv_obj_set_style_translate_y(shadow, selected ? -1 : 0, 0);
+    }
+}
+
+/* 扫描 spool 并重画列表。没有服务端之前，列表里只有本地待上传的录音。 */
+static void refresh_list(void)
+{
+    s_entry_count = memo_spool_scan(s_entries, MEMO_SPOOL_MAX_ENTRIES);
+    if (s_entry_count > MEMO_SPOOL_MAX_ENTRIES) s_entry_count = MEMO_SPOOL_MAX_ENTRIES;
+    if (s_selected >= s_entry_count) s_selected = s_entry_count > 0 ? s_entry_count - 1 : 0;
+    if (s_selected < 0) s_selected = 0;
+
+    const int32_t tz = 480; /* 时区设置到 M5 才进 NVS，先按东八区显示 */
+
+    for (int i = 0; i < LIST_ROWS; i++) {
+        const bool used = i < s_entry_count;
+        lv_obj_t *objects[] = {s_rows[i], s_row_shadows[i]};
+        for (size_t k = 0; k < 2; k++) {
+            if (objects[k] == NULL) continue;
+            if (used) {
+                lv_obj_clear_flag(objects[k], LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_add_flag(objects[k], LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        if (!used) continue;
+
+        char clock[8] = "--:--";
+        char duration[16] = "0:00";
+        if (s_entries[i].recorded_at > 0) {
+            memo_time_clock((int64_t)s_entries[i].recorded_at, tz, clock, sizeof(clock));
+            memo_time_duration((int64_t)s_entries[i].duration_ms, duration, sizeof(duration));
+        }
+        lv_label_set_text(s_row_time[i], clock);
+        /* 转写文本要等 M4 与服务端连通，这里先如实写"待上传"。 */
+        lv_label_set_text(s_row_text[i], s_entries[i].recorded_at ? "待上传" : "时间未知");
+        lv_label_set_text(s_row_dur[i], duration);
+        row_highlight(i, i == s_selected);
     }
 
-    char text[48];
-    snprintf(text, sizeof(text), "pending %d / total %d", pending, total);
-    if (s_list_status != NULL) lv_label_set_text(s_list_status, text);
+    if (s_entry_count == 0) {
+        lv_label_set_text(s_list_status, "还没有录音");
+    } else {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%d 条待上传", s_entry_count);
+        lv_label_set_text(s_list_status, buf);
+    }
 
-    snprintf(text, sizeof(text), "free %u KB", (unsigned)(memo_spool_free_bytes() / 1024));
-    if (s_list_hint != NULL) lv_label_set_text(s_list_hint, text);
+    int soc = bsp_battery_soc();
+    if (soc < 0) {
+        lv_label_set_text(s_battery, "--");
+    } else {
+        char buf[12];
+        snprintf(buf, sizeof(buf), "%d%%", soc);
+        lv_label_set_text(s_battery, buf);
+    }
 
-    ESP_LOGI(TAG, "spool: pending=%d total=%d free=%u KB",
-             pending, total, (unsigned)(memo_spool_free_bytes() / 1024));
+    ESP_LOGI(TAG, "list: %d entr%s, free=%u KB", s_entry_count,
+             s_entry_count == 1 ? "y" : "ies", (unsigned)(memo_spool_free_bytes() / 1024));
 }
 
 /* ---------- 动作执行 ---------- */
@@ -354,7 +446,7 @@ static void execute(memo_action_t action)
         s_warned = false;
         strncpy(s_last_id, id, sizeof(s_last_id) - 1);
         if (bsp_lvgl_lock(100)) {
-            if (s_sheet != NULL) lv_obj_add_flag(s_sheet, LV_OBJ_FLAG_HIDDEN);
+            sheet_visible(false);
             bsp_lvgl_unlock();
         }
         ESP_LOGI(TAG, "recording started: %s", id);
@@ -374,7 +466,7 @@ static void execute(memo_action_t action)
             ESP_LOGE(TAG, "recorder stop: %s", esp_err_to_name(err));
         }
         if (bsp_lvgl_lock(200)) {
-            if (s_sheet != NULL) lv_obj_clear_flag(s_sheet, LV_OBJ_FLAG_HIDDEN);
+            sheet_visible(true);
             refresh_confirm_sheet();
             bsp_lvgl_unlock();
         }
@@ -391,9 +483,9 @@ static void execute(memo_action_t action)
     case MEMO_ACT_CONFIRM_SAVE:
         ESP_LOGI(TAG, "recording kept: %s", s_last_id);
         if (bsp_lvgl_lock(200)) {
-            if (s_sheet != NULL) lv_obj_add_flag(s_sheet, LV_OBJ_FLAG_HIDDEN);
+            sheet_visible(false);
             show_screen(s_list_screen);
-            refresh_list_labels();
+            refresh_list();
             bsp_lvgl_unlock();
         }
         break;
@@ -405,9 +497,25 @@ static void execute(memo_action_t action)
             s_last_id[0] = '\0';
         }
         if (bsp_lvgl_lock(200)) {
-            if (s_sheet != NULL) lv_obj_add_flag(s_sheet, LV_OBJ_FLAG_HIDDEN);
+            sheet_visible(false);
             show_screen(s_list_screen);
-            refresh_list_labels();
+            refresh_list();
+            bsp_lvgl_unlock();
+        }
+        break;
+
+    case MEMO_ACT_SELECT_PREV:
+        if (s_selected > 0) s_selected--;
+        if (bsp_lvgl_lock(100)) {
+            refresh_list();
+            bsp_lvgl_unlock();
+        }
+        break;
+
+    case MEMO_ACT_SELECT_NEXT:
+        if (s_selected + 1 < s_entry_count) s_selected++;
+        if (bsp_lvgl_lock(100)) {
+            refresh_list();
             bsp_lvgl_unlock();
         }
         break;
@@ -415,14 +523,43 @@ static void execute(memo_action_t action)
     case MEMO_ACT_BACK_TO_LIST:
         if (bsp_lvgl_lock(200)) {
             show_screen(s_list_screen);
-            refresh_list_labels();
+            refresh_list();
             bsp_lvgl_unlock();
         }
         break;
 
-    case MEMO_ACT_OPEN_DETAIL:
+    case MEMO_ACT_OPEN_DETAIL: {
+        /* M2 预览：详情页在 M3 落地，这里先把最新一条待上传录音播出来，
+           用来验证录音质量与播放通路。M3 会把它换成真正的详情页。 */
+        memo_spool_entry_t entries[MEMO_SPOOL_MAX_ENTRIES];
+        int total = memo_spool_scan(entries, MEMO_SPOOL_MAX_ENTRIES);
+        const char *newest = NULL;
+        for (int i = 0; i < total && i < MEMO_SPOOL_MAX_ENTRIES; i++) {
+            if (entries[i].state == MEMO_SPOOL_PENDING) {
+                newest = entries[i].id;
+                break;
+            }
+        }
+        if (newest == NULL) {
+            ESP_LOGI(TAG, "nothing to play");
+            break;
+        }
+        if (memo_player_is_active()) {
+            memo_player_stop();
+        }
+        if (memo_player_play(newest) == ESP_OK) {
+            ESP_LOGI(TAG, "M2 preview: playing %s", newest);
+        } else {
+            ESP_LOGE(TAG, "M2 preview: playback failed");
+        }
+        /* 没有详情页可停留，回到列表。 */
+        s_sm.state = MEMO_STATE_LIST;
+        break;
+    }
+
     case MEMO_ACT_OPEN_SETTINGS:
         ESP_LOGI(TAG, "action %s arrives in M3", memo_action_name(action));
+        s_sm.state = MEMO_STATE_LIST;
         break;
 
     default:
@@ -545,9 +682,11 @@ void app_main(void)
     }
 
     if (bsp_lvgl_lock(1000)) {
+        /* 必须在建任何控件之前挂好 fallback 描述符，否则中文会走 Montserrat 显示成方块。 */
+        memo_fonts_init();
         build_list_page();
         build_record_page();
-        refresh_list_labels();
+        refresh_list();
         show_screen(s_list_screen);
         bsp_lvgl_unlock();
     }
@@ -559,6 +698,9 @@ void app_main(void)
     }
     if (memo_recorder_init() != ESP_OK) {
         ESP_LOGE(TAG, "recorder unavailable; recording will not work");
+    }
+    if (memo_player_init() != ESP_OK) {
+        ESP_LOGE(TAG, "player unavailable; playback will not work");
     }
     bsp_battery_init();
 

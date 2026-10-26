@@ -114,11 +114,17 @@ esp_err_t memo_spool_finalize(void *file, uint32_t frame_count, uint32_t duratio
         fclose(f);
         return ESP_FAIL;
     }
-    long size = ftell(f);
-    if (size_out != NULL) *size_out = (uint32_t)size;
+    /* ftell 返回的是当前位置，不是文件长度：刚在偏移 0 写完头部，它就等于 80。
+       必须 seek 到末尾再取长度。 */
+    uint32_t size = 0;
+    if (fseek(f, 0, SEEK_END) == 0) {
+        long end = ftell(f);
+        if (end > 0) size = (uint32_t)end;
+    }
+    if (size_out != NULL) *size_out = size;
     if (fclose(f) != 0) return ESP_FAIL;
-    ESP_LOGI(TAG, "saved %u frames, %u ms, %ld bytes",
-             (unsigned)frame_count, (unsigned)duration_ms, size);
+    ESP_LOGI(TAG, "saved %u frames, %u ms, %u bytes",
+             (unsigned)frame_count, (unsigned)duration_ms, (unsigned)size);
     return ESP_OK;
 }
 
@@ -172,6 +178,22 @@ int memo_spool_scan(memo_spool_entry_t *out, size_t max_entries)
         path_for(path, sizeof(path), entry.id, entry.state);
         struct stat info;
         entry.size = (stat(path, &info) == 0) ? (uint32_t)info.st_size : 0;
+
+        /* 头部里有录音时刻与时长，列表直接用它，不必再解析一次。 */
+        if (entry.state == MEMO_SPOOL_PENDING && entry.size >= MEMO_CONTAINER_HEADER_SIZE) {
+            FILE *file = fopen(path, "rb");
+            if (file != NULL) {
+                uint8_t raw[MEMO_CONTAINER_HEADER_SIZE];
+                if (fread(raw, 1, sizeof(raw), file) == sizeof(raw)) {
+                    memo_container_header_t header;
+                    if (memo_container_decode(raw, &header)) {
+                        entry.recorded_at = header.recorded_at;
+                        entry.duration_ms = header.duration_ms;
+                    }
+                }
+                fclose(file);
+            }
+        }
 
         if (out != NULL && (size_t)count < max_entries) {
             out[count] = entry;
