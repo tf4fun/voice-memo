@@ -55,8 +55,9 @@ main/
 ├── memo_ui_settings.c  设置页及其子页
 ├── memo_ui_common.c/.h 状态栏、页面骨架、共用控件
 ├── memo_font.c         lv_font_conv 生成的中文子集
-├── memo_recorder.c/.h  音频输入 → Opus → spool
-├── memo_player.c/.h    WAV 流 → I2S
+├── memo_codec.c        唯一的编解码任务
+├── memo_recorder.c/.h  音频输入 → Opus → spool（跑在 memo_codec 上）
+├── memo_player.c/.h    WAV 流 → I2S（跑在 memo_codec 上）
 ├── memo_spool.c/.h     文件命名、追加、标记、启动扫描
 ├── memo_net.c/.h       STA 连接、SNTP、重连策略
 ├── memo_discovery.c/.h mDNS 查询与健康探测
@@ -76,9 +77,8 @@ main/
 | --- | ---: | ---: | --- | --- |
 | LVGL 任务（BSP） | 4 | 6 KB | 全部控件访问 | 绘制 |
 | `memo_input` | 5 | 4 KB | 状态机、页面切换 | 从不（只入队与切页） |
-| `memo_recorder` | 6 | 6 KB | codec 输入、编码、spool 追加 | `bsp_audio_read` |
+| `memo_codec` | 6 | 20 KB | 录音或播放，永不并行 | codec 收发与网络读取 |
 | `memo_uploader` | 4 | 7 KB | HTTP 上传、spool 改名 | 网络 |
-| `memo_player` | 5 | 5 KB | HTTP 读取、WAV 解析、`bsp_audio_write` | 网络与 codec 输出 |
 | `memo_net` | 3 | 4 KB | STA 连接、SNTP、发现重试 | 网络 |
 
 遵循仓库不变量的几条规则：
@@ -88,6 +88,9 @@ main/
 - 录音与播放互斥：启动其一时先停另一个，并等它确认。
 - 每次停页都是有界握手（带超时的信号量），然后删句柄。超时则保留句柄以便重试，并把错误
   显示出来，而不是留下一个还能碰 UI 的孤儿任务。
+- 编码与解码共用一个任务，因为产品上两者永不同时发生。这样是**一份 20 KB 栈**，而不是
+  两个按最坏情况各配一份；"播放前先停录音"也从"每个调用方要记得的规则"变成了任务本身的
+  性质。
 
 ## 6. 状态机
 
@@ -306,12 +309,43 @@ spiffs 首次挂载时格式化（`format_if_mount_failed = true`）。
 | 录音批次 | 4 K | |
 | 播放环形缓冲 | 16 K | |
 | HTTP 缓冲 | 8 K | 同一时刻只有一个操作 |
-| 任务栈 | 32 K | 五个任务，多数时候空闲 |
-| WiFi | 约 50 K | 协议栈与缓冲 |
+| 任务栈 | 46 K | 六个任务；其中编解码任务独占 20 K |
+| WiFi | 约 40 K | 按 16.1 的调参之后 |
 | NimBLE | 约 40 K | 仅配网期间，之后释放 |
 
-WiFi 已关联时录音的峰值大约 190 KB；配网时峰值更高，但那时 codec 空闲。编码器与解码器
+WiFi 已关联时录音的峰值大约 200 KB；配网时峰值更高，但那时 codec 空闲。编码器与解码器
 永不共存。这是整个设计里最紧的一块，也是上真机后第一个要量的数。
+
+### 16.1 借鉴自参考项目的调优
+
+小智固件跑在同一颗没有 PSRAM 的芯片上，且被上游构建矩阵长期验证，它的内存配置比我的估算
+更可信，因此直接采用。
+
+| 配置项 | 参考值 | 作用 |
+| --- | --- | --- |
+| `ESP_WIFI_STATIC_RX_BUFFER_NUM` | 3（默认 6） | 常驻 WiFi 缓冲更少 |
+| `ESP_WIFI_DYNAMIC_RX_BUFFER_NUM` | 6 | |
+| `ESP_WIFI_RX_BA_WIN` | 3 | 更小的块确认窗口 |
+| `LWIP_TCPIP_RECVMBOX_SIZE` | 16 | |
+| `LWIP_IPV6` | 关闭 | 完全不建 IPv6 结构 |
+| `ESP_WIFI_ENABLE_WPA3_SAE` | 关闭 | 不留 SAE 状态 |
+| `ESP_WIFI_ESPNOW_MAX_ENCRYPT_NUM` | 0 | |
+| `ESP_WIFI_IRAM_OPT`、`ESP_WIFI_RX_IRAM_OPT` | 关闭 | 让出 IRAM，接受稍慢的 WiFi 路径 |
+| `FREERTOS_IDLE_TASK_STACKSIZE` | 768（默认 1536） | |
+| `LV_USE_CLIB_MALLOC` | 开启 | LVGL 从系统堆分配，不再自带 TLSF，只有一个分配器、一种碎片行为 |
+| 用不到的 LVGL 控件 | chart、calendar、keyboard、list、menu、msgbox、span、spinbox、spinner、tabview、tileview、win、animimg、led 全关 | flash 与池子 |
+| `LV_FONT_FMT_TXT_LARGE` | 开启 | 3755 字字体的前提 |
+| LVGL 绘制缓冲 | `width × 20`，单缓冲 | 9.6 KB，与基线一致 |
+
+两处刻意不同：
+
+- 参考项目把 `LV_USE_FONT_PLACEHOLDER` 关了。我们保持开启：开发期缺字必须看得见，这是
+  仓库字体指南的要求。
+- 参考项目把 LVGL 任务降到优先级 1。我们保持 BSP 默认的 4，只保证编解码任务在其之上，
+  因为录音页的重绘频率比待机表情屏高；如果录音时渲染卡顿，第一个旋钮是把 LVGL 降到 3。
+
+编码器与解码器在两边都是堆分配；20 KB 指的是栈，这正是合并后的任务需要参考项目给
+`opus_codec` 那份余量（它给了 24 KB）的原因。
 
 ## 17. 时序图
 
@@ -451,7 +485,14 @@ sequenceDiagram
 - `main/idf_component.yml`：`espressif/mdns`、`espressif/esp_audio_codec`、
   `espressif/button`（BSP 已带）。
 - `sdkconfig.defaults`：`CONFIG_I2S_ISR_IRAM_SAFE=y`、`CONFIG_LV_USE_QRCODE=n`、
-  `CONFIG_BT_NIMBLE_ENABLED=y`；如果将来真的上 TLS，再调小 mbedTLS 的缓冲。
+  `CONFIG_BT_NIMBLE_ENABLED=y`；如果将来真的上 TLS，再调小 mbedTLS 的缓冲。外加 16.1 的
+  调参：`CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=3`、
+  `CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=6`、`CONFIG_ESP_WIFI_RX_BA_WIN=3`、
+  `CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=16`、`CONFIG_LWIP_IPV6=n`、
+  `CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=n`、`CONFIG_ESP_WIFI_ESPNOW_MAX_ENCRYPT_NUM=0`、
+  `CONFIG_ESP_WIFI_IRAM_OPT=n`、`CONFIG_ESP_WIFI_RX_IRAM_OPT=n`、
+  `CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=768`、`CONFIG_LV_USE_CLIB_MALLOC=y`、
+  `CONFIG_LV_FONT_FMT_TXT_LARGE=y`。
 - `partitions.csv`：第 15 节的表。
 - `dependencies.lock`：清单变化后重新生成一次。
 

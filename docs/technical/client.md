@@ -62,8 +62,9 @@ main/
 ├── memo_ui_settings.c  settings and its sub-pages
 ├── memo_ui_common.c/.h status bar, page chrome, shared widgets
 ├── memo_font.c         generated CJK subsets (lv_font_conv output)
-├── memo_recorder.c/.h  audio in -> Opus -> spool
-├── memo_player.c/.h    WAV stream -> I2S
+├── memo_codec.c        the single encode/decode task
+├── memo_recorder.c/.h  audio in -> Opus -> spool (runs on memo_codec)
+├── memo_player.c/.h    WAV stream -> I2S (runs on memo_codec)
 ├── memo_spool.c/.h     file naming, append, sync marking, boot scan
 ├── memo_net.c/.h       STA connect, SNTP, reconnect policy
 ├── memo_discovery.c/.h mDNS query and health probe
@@ -84,9 +85,8 @@ tested off-device.
 | --- | ---: | ---: | --- | --- |
 | LVGL task (BSP) | 4 | 6 KB | all widget access | draws |
 | `memo_input` | 5 | 4 KB | state machine, page switching | never (enqueues and switches) |
-| `memo_recorder` | 6 | 6 KB | codec in, encoder, spool appends | `bsp_audio_read` |
+| `memo_codec` | 6 | 20 KB | records or plays, never both | codec I/O and network reads |
 | `memo_uploader` | 4 | 7 KB | HTTP uploads, spool renames | network |
-| `memo_player` | 5 | 5 KB | HTTP reads, WAV parsing, `bsp_audio_write` | network + codec out |
 | `memo_net` | 3 | 4 KB | STA connect, SNTP, discovery retries | network |
 
 Rules that follow from the repository invariants:
@@ -100,6 +100,10 @@ Rules that follow from the repository invariants:
 - Every page stop is a bounded handshake (semaphore with timeout), then the
   handle is deleted. A timed-out stop keeps the handle for retry and reports a
   visible error rather than leaking a task that can still touch the UI.
+- Encoding and decoding share one task, because the product never does both at
+  once. That is one 20 KB stack instead of two sized for the worst case, and it
+  makes "stop recording before playing" a property of the task rather than a
+  rule every caller has to remember.
 
 ## 6. State machine
 
@@ -364,14 +368,49 @@ spiffs partition is formatted on first mount (`format_if_mount_failed = true`).
 | Record batch | 4 K | |
 | Playback ring | 16 K | |
 | HTTP client buffers | 8 K | one operation at a time |
-| Task stacks | 32 K | five tasks, mostly idle |
-| Wi-Fi | ~50 K | stack and buffers |
+| Task stacks | 46 K | six tasks; the codec task alone takes 20 K |
+| Wi-Fi | ~40 K | after the tuning in 16.1 |
 | NimBLE | ~40 K | provisioning only, freed afterwards |
 
-Peak while recording with Wi-Fi associated is roughly 190 KB; peak during
+Peak while recording with Wi-Fi associated is roughly 200 KB; peak during
 provisioning is higher but the codec is idle then. The encoder and decoder are
 never resident at the same time. This is the tightest part of the design and is
 the first thing to measure on real hardware.
+
+### 16.1 Tuning taken from the reference project
+
+The XiaoZhi firmware runs the same chip with no PSRAM and is exercised by an
+upstream build matrix, so its memory configuration is a safer starting point
+than my estimates.
+
+| Setting | Reference value | Effect |
+| --- | --- | --- |
+| `ESP_WIFI_STATIC_RX_BUFFER_NUM` | 3 (default 6) | fewer permanently allocated Wi-Fi buffers |
+| `ESP_WIFI_DYNAMIC_RX_BUFFER_NUM` | 6 | |
+| `ESP_WIFI_RX_BA_WIN` | 3 | smaller block-ack window |
+| `LWIP_TCPIP_RECVMBOX_SIZE` | 16 | |
+| `LWIP_IPV6` | off | no IPv6 structures at all |
+| `ESP_WIFI_ENABLE_WPA3_SAE` | off | no SAE state |
+| `ESP_WIFI_ESPNOW_MAX_ENCRYPT_NUM` | 0 | |
+| `ESP_WIFI_IRAM_OPT`, `ESP_WIFI_RX_IRAM_OPT` | off | gives IRAM back, accepts slower Wi-Fi paths |
+| `FREERTOS_IDLE_TASK_STACKSIZE` | 768 (default 1536) | |
+| `LV_USE_CLIB_MALLOC` | on | LVGL allocates from the system heap instead of its own TLSF, so there is one allocator and one fragmentation story |
+| unused LVGL widgets | chart, calendar, keyboard, list, menu, msgbox, span, spinbox, spinner, tabview, tileview, win, animimg, led all off | flash and pool |
+| `LV_FONT_FMT_TXT_LARGE` | on | required for a 3755-glyph font |
+| LVGL draw buffer | `width × 20`, single buffered | 9.6 KB, same as the baseline |
+
+Two deliberate deviations:
+
+- The reference disables `LV_USE_FONT_PLACEHOLDER`. We keep it enabled: a missing
+  glyph must be visible during development, as the repository font guide requires.
+- The reference lowers the LVGL task to priority 1. We leave it at the BSP
+  default of 4 and keep the codec task above it, because the record page draws
+  more often than an idle emote screen; if rendering stutters during recording,
+  dropping LVGL to 3 is the first knob.
+
+Encoder and decoder are heap allocations in both designs; the 20 KB figure is
+stack, which is why the merged task needs the headroom the reference gives its
+`opus_codec` task (24 KB there).
 
 ## 17. Sequence diagrams
 
@@ -513,7 +552,14 @@ partition layout, not the behaviour.
   `espressif/button` (already via the BSP).
 - `sdkconfig.defaults`: `CONFIG_I2S_ISR_IRAM_SAFE=y`, `CONFIG_LV_USE_QRCODE=n`,
   `CONFIG_BT_NIMBLE_ENABLED=y`, `CONFIG_MBEDTLS_*` sized down later if TLS is
-  ever used.
+  ever used, plus the memory tuning listed in 16.1 —
+  `CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=3`,
+  `CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=6`, `CONFIG_ESP_WIFI_RX_BA_WIN=3`,
+  `CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=16`, `CONFIG_LWIP_IPV6=n`,
+  `CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=n`, `CONFIG_ESP_WIFI_ESPNOW_MAX_ENCRYPT_NUM=0`,
+  `CONFIG_ESP_WIFI_IRAM_OPT=n`, `CONFIG_ESP_WIFI_RX_IRAM_OPT=n`,
+  `CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=768`, `CONFIG_LV_USE_CLIB_MALLOC=y`,
+  `CONFIG_LV_FONT_FMT_TXT_LARGE=y`.
 - `partitions.csv`: the table in section 15.
 - `dependencies.lock`: regenerated once the manifests change.
 
