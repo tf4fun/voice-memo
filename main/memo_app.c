@@ -32,6 +32,8 @@
 #include "memo_ui_detail.h"
 #include "memo_player.h"
 #include "memo_settings.h"
+#include "memo_provision.h"
+#include "memo_ui_provision.h"
 #include "memo_ui_settings.h"
 #include "memo_state.h"
 #include "memo_time.h"
@@ -121,6 +123,14 @@ static bool s_warned;
 static void tick_timer_cb(void *arg)
 {
     (void)arg;
+
+    if (s_sm.state == MEMO_STATE_PROVISIONING) {
+        if (bsp_lvgl_lock(50)) {
+            memo_ui_provision_refresh();
+            bsp_lvgl_unlock();
+        }
+        return;
+    }
 
     /* 详情页：刷新播放条，并在播放自然结束时回到"已展开"。 */
     if (!memo_state_is_recording(s_sm.state) && s_sm.state != MEMO_STATE_ARMING) {
@@ -615,6 +625,22 @@ static void execute(memo_action_t action)
         break;
 
     case MEMO_ACT_SUB_PAGE_ENTER:
+        if (memo_ui_settings_row() == MEMO_SETTING_NETWORK) {
+            /* 网络行不是子页，而是进入蓝牙配网。 */
+            if (memo_provision_start() == ESP_OK) {
+                s_sm.state = MEMO_STATE_PROVISIONING;
+                if (bsp_lvgl_lock(200)) {
+                    memo_ui_provision_enter();
+                    lv_screen_load(memo_ui_provision_screen());
+                    bsp_lvgl_unlock();
+                }
+                esp_timer_start_periodic(s_tick_timer, 200 * 1000);
+            } else {
+                ESP_LOGE(TAG, "provisioning start failed");
+                s_sm.state = MEMO_STATE_SETTINGS;
+            }
+            break;
+        }
         if (bsp_lvgl_lock(150)) {
             memo_ui_settings_enter();
             const bool in_sheet = memo_ui_settings_in_sheet();
@@ -772,6 +798,7 @@ void app_main(void)
         build_record_page();
         memo_ui_detail_build();
         memo_ui_settings_build();
+        memo_ui_provision_build();
         refresh_list();
         show_screen(s_list_screen);
         bsp_lvgl_unlock();

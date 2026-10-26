@@ -17,6 +17,19 @@ int memo_ui_settings_move(int direction);
 /* 当前行号。 */
 int memo_ui_settings_selected(void);
 
+/* 行的语义编号，外壳据此决定进入配网页还是子页。 */
+typedef enum {
+    MEMO_SETTING_NETWORK = 0,
+    MEMO_SETTING_SERVER,
+    MEMO_SETTING_VOLUME,
+    MEMO_SETTING_TIMEOUT,
+    MEMO_SETTING_SLEEP,
+    MEMO_SETTING_AUTOPLAY,
+    MEMO_SETTING_ABOUT,
+} memo_setting_row_t;
+
+memo_setting_row_t memo_ui_settings_row(void);
+
 /* 当前行是否可进入子页（音量/息屏/休眠）或可切换（自动播放）。 */
 bool memo_ui_settings_row_editable(int row);
 

@@ -16,8 +16,12 @@ idf_component_register(
          "memo_ui_detail.c"
          "memo_ui_settings.c"
          "memo_settings.c"
+         "memo_provision.c"
+         "memo_provision_security.c"
+         "memo_ui_provision.c"
     INCLUDE_DIRS "."
-    REQUIRES bsp esp_audio_codec esp_timer nvs_flash spiffs
+    REQUIRES bsp bt esp_audio_codec esp_event esp_netif esp_timer esp_wifi
+             mbedtls nvs_flash spiffs
 )
 
 # Generated CJK subsets live outside main/ so they stay next to the fonts they

@@ -175,6 +175,11 @@ int memo_ui_settings_selected(void)
     return s_selected;
 }
 
+memo_setting_row_t memo_ui_settings_row(void)
+{
+    return (memo_setting_row_t)s_selected;
+}
+
 bool memo_ui_settings_row_editable(int row)
 {
     return row == ROW_VOLUME || row == ROW_TIMEOUT || row == ROW_SLEEP || row == ROW_AUTOPLAY;
