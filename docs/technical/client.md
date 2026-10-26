@@ -289,6 +289,9 @@ Hard rules:
 
 ## 13. UI
 
+The palette, card geometry, per-page composition and motion rules are
+specified in the [visual language](../design/visual-language.md).
+
 ### 13.1 Fonts
 
 The UI is Chinese and the text is arbitrary ASR output, so the font contract has

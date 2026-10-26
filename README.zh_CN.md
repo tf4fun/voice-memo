@@ -95,6 +95,7 @@ macOS 上静态门禁无法原生通过：两个 demo 运行时测试用 `-Wl,--
 | 文档 | 内容 |
 | --- | --- |
 | [产品方案](docs/product/product-spec.zh_CN.md) | 界面、操作、行为规则、验收 |
+| [视觉设计语言](docs/design/visual-language.zh_CN.md) | 配色、卡片几何、页面构成、动效 |
 | [上游文档索引](docs/README.zh_CN.md) | 硬件、工程与贡献规范 |
 | [AGENTS.md](AGENTS.zh_CN.md) | 本仓库 AI 协作规则 |
 
