@@ -77,6 +77,18 @@ IDF_TAG=v6.1 IDF_DIR="$PWD/bin/esp-idf-v6.1" \
 `setup-idf.sh` repairs an interrupted submodule fetch instead of re-cloning, and
 prints `git describe --tags` so the checkout identity is visible.
 
+### Go toolchain (server)
+
+The server needs Go 1.27.3, which is installed system-wide. Its module and build
+caches default to `~/go` and `~/Library/Caches/go-build`; the script moves them
+under the ignored `bin/go` so the workspace stays self-contained and the sandbox
+stays happy.
+
+```bash
+source scripts/go-env.sh
+cd server && go build ./... && go test ./...
+```
+
 ## Build and validate
 
 ```bash

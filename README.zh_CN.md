@@ -70,6 +70,17 @@ IDF_TAG=v6.1 IDF_DIR="$PWD/bin/esp-idf-v6.1" \
 `setup-idf.sh` 对中断的子模块拉取是"修复"而不是重新克隆，并会打印 `git describe --tags`，
 让检出身份可见。
 
+### Go 工具链（服务端）
+
+服务端需要 Go 1.27.3，本机已全局安装。它的模块缓存与构建缓存默认落在 `~/go` 和
+`~/Library/Caches/go-build`；脚本把它们移到被忽略的 `bin/go` 下，工作区保持自包含，
+也不碰沙箱之外的目录。
+
+```bash
+source scripts/go-env.sh
+cd server && go build ./... && go test ./...
+```
+
 ## 构建与校验
 
 ```bash

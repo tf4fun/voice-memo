@@ -85,6 +85,8 @@ from `GET /memos`, play the WAV back.
 - Power-cycling the device preserves the file and lists it after boot.
 - A five-minute recording stops by itself.
 - Host tests cover every state transition, truncation case and backoff step.
+- The key-wake guard wiring returns with the input task, and its contract test
+  (removed with the baseline demo entry point in M0) is reintroduced.
 - No audible glitch during recording while the screen updates.
 
 **Demo:** record a memo, reboot, see it still there, open it and play it locally
