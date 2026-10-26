@@ -263,6 +263,29 @@ Error mapping decides the policy:
 | 413 | mark `.bad` (a server cap smaller than ours) |
 | 200 or 201 | rename to `.sent` |
 
+## 10.5 The upload window
+
+Uploading is the only moment the device needs a large contiguous block: with TLS
+a handshake alone wants tens of kilobytes. The design therefore treats an upload
+as the device's exclusive activity, which matches the product rule that only one
+recording is ever pending.
+
+| Before upload | During upload | After |
+| --- | --- | --- |
+| recorder idle, player idle | Opus encoder closed, decoder closed | reopened on demand |
+| BLE torn down after provisioning | NimBLE not resident | stays down until next provisioning |
+| UI static, animations stopped | only the progress label updates | normal redraws |
+| — | reduced TLS buffers (`IN/OUT` 4 KB/2 KB) if HTTPS | — |
+
+The point is not to squeeze TLS into a permanently tight heap but to hand the
+device over for the duration of the transfer: roughly 80 KB is released before
+the connection opens, and the boot-time headroom (~90 KB) is not consumed by
+anything else meanwhile.
+
+Measured heap high-water marks are reported by the firmware log; the gate for
+M4 is "upload completes with TLS on a 16 KB-buffer build", not "it happened to
+work once".
+
 ## 11. Time and settings
 
 - SNTP starts on association; until the first successful sync `recorded_at` is 0

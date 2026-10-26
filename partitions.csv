@@ -1,7 +1,11 @@
 # Name,   Type, SubType, Offset,   Size,     Flags
-# The voice memo application: a larger app partition for the embedded CJK font
-# subsets, and a SPIFFS data partition for the unsynced recording spool.
+# Voice memo application.
+#
+# factory spans everything except a 1 MB spool. The spool holds exactly one
+# recording while it is uploaded: local storage is a transient "processing"
+# state, so a queue is neither needed nor allowed. 1 MB covers a five-minute
+# Opus memo (~760 KB) with margin.
 nvs,      data, nvs,     0x9000,   0x6000,
 phy_init, data, phy,     0xf000,   0x1000,
-factory,  app,  factory, 0x10000,  0x380000,
-memo,     data, spiffs,  0x390000, 0x470000,
+factory,  app,  factory, 0x10000,  0x6f0000,
+memo,     data, spiffs,  0x700000, 0x100000,
