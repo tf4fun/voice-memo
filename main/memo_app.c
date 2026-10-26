@@ -14,6 +14,7 @@
 #include "esp_sleep.h"
 #include "esp_timer.h"
 
+#include "bsp_audio.h"
 #include "bsp_battery.h"
 #include "bsp_button.h"
 #include "bsp_pins.h"
@@ -60,6 +61,10 @@ static lv_obj_t *s_list_hint;
 static lv_obj_t *s_timer_label;
 static lv_obj_t *s_arm_arc;
 static lv_obj_t *s_level_bars[VM_LEVEL_BARS];
+static lv_obj_t *s_sheet;
+static lv_obj_t *s_opt_save;
+static lv_obj_t *s_opt_cancel;
+static char s_last_id[37];
 
 /* ---------- 小工具 ---------- */
 static void flat_rect(lv_obj_t *obj, uint32_t color, int radius)
@@ -97,18 +102,53 @@ static lv_obj_t *label_create(lv_obj_t *parent, const lv_font_t *font, uint32_t 
 
 static void enqueue_input(memo_input_t input);
 
+static void arc_anim_cb(void *obj, int32_t value)
+{
+    lv_arc_set_value((lv_obj_t *)obj, value);
+}
+
+static void arm_ring_start(void)
+{
+    if (s_arm_arc == NULL) return;
+    lv_obj_clear_flag(s_arm_arc, LV_OBJ_FLAG_HIDDEN);
+    lv_arc_set_value(s_arm_arc, 0);
+
+    lv_anim_t anim;
+    lv_anim_init(&anim);
+    lv_anim_set_var(&anim, s_arm_arc);
+    lv_anim_set_values(&anim, 0, MEMO_ARMING_MS);
+    lv_anim_set_duration(&anim, MEMO_ARMING_MS);
+    lv_anim_set_exec_cb(&anim, arc_anim_cb);
+    lv_anim_start(&anim);
+}
+
+static void arm_ring_hide(void)
+{
+    if (s_arm_arc == NULL) return;
+    lv_anim_delete(s_arm_arc, arc_anim_cb);
+    lv_obj_add_flag(s_arm_arc, LV_OBJ_FLAG_HIDDEN);
+}
+
 static void arm_timer_cb(void *arg)
 {
     (void)arg;
     enqueue_input(MEMO_IN_ARM_COMPLETE);
 }
 
+static bool s_warned;
+
 static void tick_timer_cb(void *arg)
 {
     (void)arg;
-    if (memo_recorder_elapsed_ms() >= MEMO_RECORD_LIMIT_MS) {
+    const uint32_t elapsed = memo_recorder_elapsed_ms();
+    if (elapsed >= MEMO_RECORD_LIMIT_MS) {
+        ESP_LOGW(TAG, "five minute cap reached, stopping");
         enqueue_input(MEMO_IN_RECORD_LIMIT);
         return;
+    }
+    if (!s_warned && elapsed >= MEMO_RECORD_WARN_MS) {
+        s_warned = true;
+        ESP_LOGW(TAG, "recording at %u ms, 30 s left", (unsigned)elapsed);
     }
     if (!bsp_lvgl_lock(50)) return;
     if (s_timer_label != NULL) {
@@ -207,8 +247,32 @@ static void build_record_page(void)
     }
 
     lv_obj_t *hint = label_create(s_record_screen, &lv_font_montserrat_14, VM_MUTED);
-    lv_label_set_text(hint, "OK stop   hold OK cancel");
+    lv_label_set_text(hint, "release to finish");
     lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -VM_INSET - 6);
+
+    /* 松手后弹出的选择条：保存 / 取消 */
+    const int width = lv_display_get_horizontal_resolution(NULL);
+    s_sheet = card_create(s_record_screen, VM_INSET + 12, 210,
+                          width - 2 * VM_INSET - 24 - VM_SHADOW, 84);
+    lv_obj_add_flag(s_sheet, LV_OBJ_FLAG_HIDDEN);
+
+    s_opt_save = label_create(s_sheet, &lv_font_montserrat_20, VM_INK);
+    lv_label_set_text(s_opt_save, "save");
+    lv_obj_align(s_opt_save, LV_ALIGN_TOP_MID, 0, 10);
+
+    s_opt_cancel = label_create(s_sheet, &lv_font_montserrat_20, VM_MUTED);
+    lv_label_set_text(s_opt_cancel, "cancel");
+    lv_obj_align(s_opt_cancel, LV_ALIGN_TOP_MID, 0, 44);
+}
+
+static void refresh_confirm_sheet(void)
+{
+    if (s_sheet == NULL) return;
+    const bool save = s_sm.confirm_save;
+    lv_obj_set_style_text_color(s_opt_save, lv_color_hex(save ? VM_INK : VM_MUTED), 0);
+    lv_obj_set_style_text_color(s_opt_cancel, lv_color_hex(save ? VM_MUTED : VM_INK), 0);
+    lv_obj_set_style_text_decor(s_opt_save, save ? LV_TEXT_DECOR_UNDERLINE : LV_TEXT_DECOR_NONE, 0);
+    lv_obj_set_style_text_decor(s_opt_cancel, save ? LV_TEXT_DECOR_NONE : LV_TEXT_DECOR_UNDERLINE, 0);
 }
 
 static void refresh_list_labels(void)
@@ -226,6 +290,9 @@ static void refresh_list_labels(void)
 
     snprintf(text, sizeof(text), "free %u KB", (unsigned)(memo_spool_free_bytes() / 1024));
     if (s_list_hint != NULL) lv_label_set_text(s_list_hint, text);
+
+    ESP_LOGI(TAG, "spool: pending=%d total=%d free=%u KB",
+             pending, total, (unsigned)(memo_spool_free_bytes() / 1024));
 }
 
 /* ---------- 动作执行 ---------- */
@@ -239,10 +306,7 @@ static void execute(memo_action_t action)
     switch (action) {
     case MEMO_ACT_START_ARMING:
         if (bsp_lvgl_lock(100)) {
-            if (s_arm_arc != NULL) {
-                lv_obj_clear_flag(s_arm_arc, LV_OBJ_FLAG_HIDDEN);
-                lv_arc_set_value(s_arm_arc, 0);
-            }
+            arm_ring_start();
             bsp_lvgl_unlock();
         }
         esp_timer_stop(s_arm_timer);
@@ -252,7 +316,7 @@ static void execute(memo_action_t action)
     case MEMO_ACT_CANCEL_ARMING:
         esp_timer_stop(s_arm_timer);
         if (bsp_lvgl_lock(100)) {
-            if (s_arm_arc != NULL) lv_obj_add_flag(s_arm_arc, LV_OBJ_FLAG_HIDDEN);
+            arm_ring_hide();
             bsp_lvgl_unlock();
         }
         break;
@@ -266,15 +330,20 @@ static void execute(memo_action_t action)
         esp_err_t err = memo_recorder_start(id);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "recorder start failed: %s", esp_err_to_name(err));
-            s_sm.state = MEMO_STATE_ERROR;
-            if (bsp_lvgl_lock(100)) {
-                if (s_arm_arc != NULL) lv_obj_add_flag(s_arm_arc, LV_OBJ_FLAG_HIDDEN);
+            if (bsp_lvgl_lock(200)) {
+                arm_ring_hide();
+                if (s_list_status != NULL) {
+                    lv_label_set_text(s_list_status, "recorder unavailable");
+                    lv_obj_set_style_text_color(s_list_status, lv_color_hex(VM_CORAL), 0);
+                }
                 bsp_lvgl_unlock();
             }
+            /* 回到可操作状态，而不是把一个非法迁移塞进状态机。 */
+            s_sm.state = MEMO_STATE_LIST;
             break;
         }
         if (bsp_lvgl_lock(100)) {
-            if (s_arm_arc != NULL) lv_obj_add_flag(s_arm_arc, LV_OBJ_FLAG_HIDDEN);
+            arm_ring_hide();
             if (s_timer_label != NULL) {
                 lv_label_set_text(s_timer_label, "00:00");
                 lv_obj_set_style_text_color(s_timer_label, lv_color_hex(VM_INK), 0);
@@ -282,29 +351,66 @@ static void execute(memo_action_t action)
             show_screen(s_record_screen);
             bsp_lvgl_unlock();
         }
+        s_warned = false;
+        strncpy(s_last_id, id, sizeof(s_last_id) - 1);
+        if (bsp_lvgl_lock(100)) {
+            if (s_sheet != NULL) lv_obj_add_flag(s_sheet, LV_OBJ_FLAG_HIDDEN);
+            bsp_lvgl_unlock();
+        }
+        ESP_LOGI(TAG, "recording started: %s", id);
         esp_timer_start_periodic(s_tick_timer, 200 * 1000);
         break;
     }
 
-    case MEMO_ACT_STOP_AND_SAVE:
-    case MEMO_ACT_CANCEL_RECORDING: {
+    case MEMO_ACT_STOP_AND_SAVE: {
+        /* 松手（或到点）先落盘，再问用户保存还是取消；此时还没有回列表。 */
         esp_timer_stop(s_tick_timer);
-        bool keep = (action == MEMO_ACT_STOP_AND_SAVE);
         memo_recorder_result_t result;
-        esp_err_t err = memo_recorder_stop(keep, &result);
-        if (err == ESP_OK && keep) {
-            ESP_LOGI(TAG, "saved %s (%u ms, %u bytes)", result.id,
-                     (unsigned)result.duration_ms, (unsigned)result.size_bytes);
-        } else if (err != ESP_OK) {
+        esp_err_t err = memo_recorder_stop(true, &result);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "recorded %s (%u ms, %u bytes)",
+                     result.id, (unsigned)result.duration_ms, (unsigned)result.size_bytes);
+        } else {
             ESP_LOGE(TAG, "recorder stop: %s", esp_err_to_name(err));
         }
         if (bsp_lvgl_lock(200)) {
+            if (s_sheet != NULL) lv_obj_clear_flag(s_sheet, LV_OBJ_FLAG_HIDDEN);
+            refresh_confirm_sheet();
+            bsp_lvgl_unlock();
+        }
+        break;
+    }
+
+    case MEMO_ACT_CONFIRM_TOGGLE:
+        if (bsp_lvgl_lock(100)) {
+            refresh_confirm_sheet();
+            bsp_lvgl_unlock();
+        }
+        break;
+
+    case MEMO_ACT_CONFIRM_SAVE:
+        ESP_LOGI(TAG, "recording kept: %s", s_last_id);
+        if (bsp_lvgl_lock(200)) {
+            if (s_sheet != NULL) lv_obj_add_flag(s_sheet, LV_OBJ_FLAG_HIDDEN);
             show_screen(s_list_screen);
             refresh_list_labels();
             bsp_lvgl_unlock();
         }
         break;
-    }
+
+    case MEMO_ACT_CONFIRM_CANCEL:
+        ESP_LOGI(TAG, "recording discarded: %s", s_last_id);
+        if (s_last_id[0] != '\0') {
+            memo_spool_remove(s_last_id, MEMO_SPOOL_PENDING);
+            s_last_id[0] = '\0';
+        }
+        if (bsp_lvgl_lock(200)) {
+            if (s_sheet != NULL) lv_obj_add_flag(s_sheet, LV_OBJ_FLAG_HIDDEN);
+            show_screen(s_list_screen);
+            refresh_list_labels();
+            bsp_lvgl_unlock();
+        }
+        break;
 
     case MEMO_ACT_BACK_TO_LIST:
         if (bsp_lvgl_lock(200)) {
@@ -355,6 +461,9 @@ static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user)
         input = (btn == BSP_BTN_OK) ? MEMO_IN_OK_CLICK
               : (btn == BSP_BTN_UP) ? MEMO_IN_UP_CLICK
               : (btn == BSP_BTN_DOWN) ? MEMO_IN_DOWN_CLICK : MEMO_IN_COUNT;
+    } else if (ev == BSP_BTN_PRESS && btn == BSP_BTN_OK) {
+        /* 圆环从按下瞬间起算，不再叠加长按判定时间。 */
+        input = MEMO_IN_OK_PRESS;
     } else if (ev == BSP_BTN_RELEASE && btn == BSP_BTN_OK) {
         input = MEMO_IN_OK_RELEASE;
     }
@@ -369,10 +478,12 @@ static void input_task(void *arg)
         memo_input_t input;
         if (xQueueReceive(s_queue, &input, portMAX_DELAY) != pdTRUE) continue;
 
+        const memo_state_t before = s_sm.state;
         memo_action_t action = memo_sm_handle(&s_sm, input);
         if (action != MEMO_ACT_NONE) {
-            ESP_LOGD(TAG, "state %s + %s -> %s", memo_state_name(s_sm.state),
-                     memo_input_name(input), memo_action_name(action));
+            ESP_LOGI(TAG, "%s + %s -> %s (now %s)", memo_state_name(before),
+                     memo_input_name(input), memo_action_name(action),
+                     memo_state_name(s_sm.state));
             execute(action);
         }
     }
@@ -423,6 +534,16 @@ void app_main(void)
     }
     bsp_display_backlight(100);
 
+    /* 列表页要显示待上传条数与剩余空间，所以 spool 必须在建页面之前挂好。 */
+    if (memo_spool_mount() != ESP_OK) {
+        ESP_LOGE(TAG, "spool mount failed; recordings will not persist");
+    } else {
+        const int dropped = memo_spool_drop_empty();
+        if (dropped > 0) {
+            ESP_LOGW(TAG, "removed %d incomplete recording(s)", dropped);
+        }
+    }
+
     if (bsp_lvgl_lock(1000)) {
         build_list_page();
         build_record_page();
@@ -431,6 +552,11 @@ void app_main(void)
         bsp_lvgl_unlock();
     }
 
+    /* 录音通路依赖 codec：不先 init，bsp_audio_set_format 会直接返回
+       ESP_ERR_INVALID_STATE，表现就是"按了没反应"。 */
+    if (bsp_audio_init() != ESP_OK) {
+        ESP_LOGE(TAG, "audio codec unavailable; recording will not work");
+    }
     if (memo_recorder_init() != ESP_OK) {
         ESP_LOGE(TAG, "recorder unavailable; recording will not work");
     }

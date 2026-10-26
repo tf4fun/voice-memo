@@ -2,6 +2,7 @@
 #include "memo_spool.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -60,9 +61,20 @@ esp_err_t memo_spool_create(const char *id, const uint8_t header[80], void **fil
     char path[64];
     path_for(path, sizeof(path), id, MEMO_SPOOL_PENDING);
 
-    FILE *file = fopen(path, "wb");
+    /* SPIFFS 的对象名上限由 CONFIG_SPIFFS_OBJ_NAME_LEN 决定，超了只会得到 ENAMETOOLONG。
+       先自己判一次，日志里就能直接看出是名字太长还是别的原因。 */
+    const char *base = path + sizeof(MEMO_SPOOL_MOUNT_POINT);
+    if (strlen(base) >= CONFIG_SPIFFS_OBJ_NAME_LEN) {
+        ESP_LOGE(TAG, "file name too long for SPIFFS (%u >= %d): %s",
+                 (unsigned)strlen(base), CONFIG_SPIFFS_OBJ_NAME_LEN, base);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    /* 必须是读写模式：收尾时要先读回头部再回填帧数与时长，只写模式会让
+       fread 失败，表现为"录音存不下来"。 */
+    FILE *file = fopen(path, "w+b");
     if (file == NULL) {
-        ESP_LOGE(TAG, "cannot create %s", path);
+        ESP_LOGE(TAG, "cannot create %s: errno=%d", path, errno);
         return ESP_FAIL;
     }
     if (fwrite(header, 1, 80, file) != 80) {
@@ -168,6 +180,41 @@ int memo_spool_scan(memo_spool_entry_t *out, size_t max_entries)
     }
     closedir(dir);
     return count;
+}
+
+int memo_spool_drop_empty(void)
+{
+    if (!s_mounted) return 0;
+
+    memo_spool_entry_t entries[MEMO_SPOOL_MAX_ENTRIES];
+    int total = memo_spool_scan(entries, MEMO_SPOOL_MAX_ENTRIES);
+    int dropped = 0;
+
+    for (int i = 0; i < total && i < MEMO_SPOOL_MAX_ENTRIES; i++) {
+        if (entries[i].state != MEMO_SPOOL_PENDING) continue;
+        if (entries[i].size <= MEMO_CONTAINER_HEADER_SIZE) {
+            /* 只有头部、没有任何帧：上一次录音在中途被打断。 */
+            ESP_LOGW(TAG, "dropping empty stub %s (%u bytes)",
+                     entries[i].id, (unsigned)entries[i].size);
+            if (memo_spool_remove(entries[i].id, MEMO_SPOOL_PENDING) == ESP_OK) dropped++;
+            continue;
+        }
+
+        char path[64];
+        path_for(path, sizeof(path), entries[i].id, MEMO_SPOOL_PENDING);
+        FILE *file = fopen(path, "rb");
+        if (file == NULL) continue;
+        uint8_t header[MEMO_CONTAINER_HEADER_SIZE];
+        bool ok = fread(header, 1, sizeof(header), file) == sizeof(header);
+        fclose(file);
+
+        memo_container_header_t parsed;
+        if (ok && memo_container_decode(header, &parsed) && parsed.frame_count == 0) {
+            ESP_LOGW(TAG, "dropping zero-frame recording %s", entries[i].id);
+            if (memo_spool_remove(entries[i].id, MEMO_SPOOL_PENDING) == ESP_OK) dropped++;
+        }
+    }
+    return dropped;
 }
 
 esp_err_t memo_spool_set_state(const char *id, memo_spool_state_t state)

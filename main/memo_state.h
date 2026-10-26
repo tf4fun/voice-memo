@@ -11,6 +11,7 @@ typedef enum {
     MEMO_STATE_LIST = 0,
     MEMO_STATE_ARMING,
     MEMO_STATE_RECORDING,
+    MEMO_STATE_CONFIRM,
     MEMO_STATE_DETAIL_COLLAPSED,
     MEMO_STATE_DETAIL_EXPANDED,
     MEMO_STATE_PLAYING,
@@ -27,6 +28,7 @@ typedef enum {
     MEMO_IN_DOWN_CLICK,
     MEMO_IN_OK_CLICK,
     MEMO_IN_OK_HOLD,
+    MEMO_IN_OK_PRESS,
     MEMO_IN_OK_RELEASE,
     MEMO_IN_UP_HOLD,
     MEMO_IN_DOWN_HOLD,
@@ -46,6 +48,9 @@ typedef enum {
     MEMO_ACT_BEGIN_RECORDING,
     MEMO_ACT_STOP_AND_SAVE,
     MEMO_ACT_CANCEL_RECORDING,
+    MEMO_ACT_CONFIRM_TOGGLE,
+    MEMO_ACT_CONFIRM_SAVE,
+    MEMO_ACT_CONFIRM_CANCEL,
     MEMO_ACT_EXPAND,
     MEMO_ACT_PLAY,
     MEMO_ACT_PAUSE,
@@ -72,10 +77,13 @@ typedef struct {
     memo_state_t state;
     /* Latches the "expanded once" rule: returning from detail resets it. */
     bool expanded;
+    /* 录音结束后的选择条当前落在"保存"(true)还是"取消"(false)。 */
+    bool confirm_save;
 } memo_sm_t;
 
-/* ARMING lasts this long before recording starts by itself. */
-#define MEMO_ARMING_MS 3000
+/* 圆环从"按下"开始填，填满即开始录音；手指仍按着，所以这是一个动作。
+   这个值只算一次：长按判定(500 ms)与它不叠加。 */
+#define MEMO_ARMING_MS 1000
 
 /* A single memo is capped here; the UI warns from 4:30 and stops at 5:00. */
 #define MEMO_RECORD_LIMIT_MS (5 * 60 * 1000)

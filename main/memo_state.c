@@ -17,21 +17,24 @@ static const transition_t TRANSITIONS[] = {
     {MEMO_STATE_LIST, MEMO_IN_UP_CLICK, MEMO_STATE_LIST, MEMO_ACT_SELECT_PREV},
     {MEMO_STATE_LIST, MEMO_IN_DOWN_CLICK, MEMO_STATE_LIST, MEMO_ACT_SELECT_NEXT},
     {MEMO_STATE_LIST, MEMO_IN_OK_CLICK, MEMO_STATE_DETAIL_COLLAPSED, MEMO_ACT_OPEN_DETAIL},
-    {MEMO_STATE_LIST, MEMO_IN_OK_HOLD, MEMO_STATE_ARMING, MEMO_ACT_START_ARMING},
+    {MEMO_STATE_LIST, MEMO_IN_OK_PRESS, MEMO_STATE_ARMING, MEMO_ACT_START_ARMING},
     {MEMO_STATE_LIST, MEMO_IN_UP_HOLD, MEMO_STATE_SETTINGS, MEMO_ACT_OPEN_SETTINGS},
     {MEMO_STATE_LIST, MEMO_IN_DOWN_HOLD, MEMO_STATE_SETTINGS, MEMO_ACT_OPEN_SETTINGS},
 
-    /* 待录音：按住够 3 秒才真正开始 */
+    /* 待发：圆环填满就开始录音（手指还按着）；提前松手则放弃 */
     {MEMO_STATE_ARMING, MEMO_IN_ARM_COMPLETE, MEMO_STATE_RECORDING, MEMO_ACT_BEGIN_RECORDING},
     {MEMO_STATE_ARMING, MEMO_IN_OK_RELEASE, MEMO_STATE_LIST, MEMO_ACT_CANCEL_ARMING},
-    {MEMO_STATE_ARMING, MEMO_IN_OK_CLICK, MEMO_STATE_LIST, MEMO_ACT_CANCEL_ARMING},
-    {MEMO_STATE_ARMING, MEMO_IN_UP_CLICK, MEMO_STATE_LIST, MEMO_ACT_CANCEL_ARMING},
-    {MEMO_STATE_ARMING, MEMO_IN_DOWN_CLICK, MEMO_STATE_LIST, MEMO_ACT_CANCEL_ARMING},
 
-    /* 录音：只接受停止、取消和到点 */
-    {MEMO_STATE_RECORDING, MEMO_IN_OK_CLICK, MEMO_STATE_LIST, MEMO_ACT_STOP_AND_SAVE},
-    {MEMO_STATE_RECORDING, MEMO_IN_OK_HOLD, MEMO_STATE_LIST, MEMO_ACT_CANCEL_RECORDING},
-    {MEMO_STATE_RECORDING, MEMO_IN_RECORD_LIMIT, MEMO_STATE_LIST, MEMO_ACT_STOP_AND_SAVE},
+    /* 录音：松手即结束，进入保存/取消选择；到点也走同一条路 */
+    {MEMO_STATE_RECORDING, MEMO_IN_OK_RELEASE, MEMO_STATE_CONFIRM, MEMO_ACT_STOP_AND_SAVE},
+    {MEMO_STATE_RECORDING, MEMO_IN_RECORD_LIMIT, MEMO_STATE_CONFIRM, MEMO_ACT_STOP_AND_SAVE},
+
+    /* 选择条：上下切换，OK 确认，长按等同取消 */
+    {MEMO_STATE_CONFIRM, MEMO_IN_UP_CLICK, MEMO_STATE_CONFIRM, MEMO_ACT_CONFIRM_TOGGLE},
+    {MEMO_STATE_CONFIRM, MEMO_IN_DOWN_CLICK, MEMO_STATE_CONFIRM, MEMO_ACT_CONFIRM_TOGGLE},
+    {MEMO_STATE_CONFIRM, MEMO_IN_OK_CLICK, MEMO_STATE_LIST, MEMO_ACT_CONFIRM_SAVE},
+    {MEMO_STATE_CONFIRM, MEMO_IN_OK_HOLD, MEMO_STATE_LIST, MEMO_ACT_CONFIRM_CANCEL},
+    {MEMO_STATE_CONFIRM, MEMO_IN_OK_RELEASE, MEMO_STATE_CONFIRM, MEMO_ACT_NONE},
 
     /* 详情：OK 单击三步循环 */
     {MEMO_STATE_DETAIL_COLLAPSED, MEMO_IN_OK_CLICK, MEMO_STATE_DETAIL_EXPANDED, MEMO_ACT_EXPAND},
@@ -81,6 +84,7 @@ void memo_sm_init(memo_sm_t *sm)
     if (sm == NULL) return;
     sm->state = MEMO_STATE_LIST;
     sm->expanded = false;
+    sm->confirm_save = true; /* 刚录完，默认"保存"更顺手 */
 }
 
 memo_action_t memo_sm_handle(memo_sm_t *sm, memo_input_t input)
@@ -92,6 +96,18 @@ memo_action_t memo_sm_handle(memo_sm_t *sm, memo_input_t input)
         if (t->from != sm->state || t->input != input) continue;
 
         sm->state = t->to;
+        if (t->action == MEMO_ACT_STOP_AND_SAVE) {
+            sm->confirm_save = true; /* 每次停录都回到默认项 */
+        } else if (t->action == MEMO_ACT_CONFIRM_TOGGLE) {
+            sm->confirm_save = !sm->confirm_save;
+        } else if (t->action == MEMO_ACT_CONFIRM_SAVE) {
+            const bool save = sm->confirm_save;
+            sm->confirm_save = true;
+            return save ? MEMO_ACT_CONFIRM_SAVE : MEMO_ACT_CONFIRM_CANCEL;
+        } else if (t->action == MEMO_ACT_CONFIRM_CANCEL) {
+            sm->confirm_save = true;
+            return MEMO_ACT_CONFIRM_CANCEL;
+        }
         if (t->action == MEMO_ACT_EXPAND) {
             sm->expanded = true;
         } else if (t->action == MEMO_ACT_OPEN_DETAIL) {
@@ -110,6 +126,7 @@ const char *memo_state_name(memo_state_t state)
     case MEMO_STATE_LIST: return "list";
     case MEMO_STATE_ARMING: return "arming";
     case MEMO_STATE_RECORDING: return "recording";
+    case MEMO_STATE_CONFIRM: return "confirm";
     case MEMO_STATE_DETAIL_COLLAPSED: return "detail_collapsed";
     case MEMO_STATE_DETAIL_EXPANDED: return "detail_expanded";
     case MEMO_STATE_PLAYING: return "playing";
@@ -135,6 +152,9 @@ const char *memo_action_name(memo_action_t action)
     case MEMO_ACT_BEGIN_RECORDING: return "begin_recording";
     case MEMO_ACT_STOP_AND_SAVE: return "stop_and_save";
     case MEMO_ACT_CANCEL_RECORDING: return "cancel_recording";
+    case MEMO_ACT_CONFIRM_TOGGLE: return "confirm_toggle";
+    case MEMO_ACT_CONFIRM_SAVE: return "confirm_save";
+    case MEMO_ACT_CONFIRM_CANCEL: return "confirm_cancel";
     case MEMO_ACT_EXPAND: return "expand";
     case MEMO_ACT_PLAY: return "play";
     case MEMO_ACT_PAUSE: return "pause";
@@ -165,6 +185,7 @@ const char *memo_input_name(memo_input_t input)
     case MEMO_IN_DOWN_CLICK: return "down_click";
     case MEMO_IN_OK_CLICK: return "ok_click";
     case MEMO_IN_OK_HOLD: return "ok_hold";
+    case MEMO_IN_OK_PRESS: return "ok_press";
     case MEMO_IN_OK_RELEASE: return "ok_release";
     case MEMO_IN_UP_HOLD: return "up_hold";
     case MEMO_IN_DOWN_HOLD: return "down_hold";
@@ -177,7 +198,8 @@ const char *memo_input_name(memo_input_t input)
 bool memo_state_keeps_screen_on(memo_state_t state)
 {
     return state == MEMO_STATE_ARMING || state == MEMO_STATE_RECORDING ||
-           state == MEMO_STATE_PLAYING || state == MEMO_STATE_PROVISIONING;
+           state == MEMO_STATE_CONFIRM || state == MEMO_STATE_PLAYING ||
+           state == MEMO_STATE_PROVISIONING;
 }
 
 bool memo_state_is_recording(memo_state_t state)

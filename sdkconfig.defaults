@@ -44,6 +44,13 @@ CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 CONFIG_BT_NIMBLE_HOST_BASED_PRIVACY=n
 CONFIG_BT_NIMBLE_NVS_PERSIST=n
 
+# --- 文件系统 ---
+# 录音暂存文件名是 36 字符 UUID + ".memo"，共 41 字符。SPIFFS 默认对象名上限是
+# 32（含结尾 NUL 前 31 个字符），不放开就会 fopen 失败，表现为"录音启动不了"。
+# 约束：SPIFFS_OBJ_NAME_LEN + META_LENGTH 不得超过 PAGE_SIZE - 64（256 - 64 = 192），
+# 所以 48 是安全的。
+CONFIG_SPIFFS_OBJ_NAME_LEN=48
+
 # --- 内存调优 ---
 # 取值与理由见 docs/technical/client.zh_CN.md §16.1：参考项目在同一颗无 PSRAM 的
 # C3 上长期跑通这些配置。目标是给 WiFi + Opus 编解码 + LVGL 同时在场时留出余量。

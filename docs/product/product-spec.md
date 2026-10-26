@@ -89,20 +89,33 @@ immediately and the first OK press pauses instead of expanding.
 
 ### 4.3 Recording
 
-Large elapsed timer, a level bar, battery in the top-right corner.
+Large elapsed timer, a level bar, battery in the top-right corner. **Hold to
+record, release to stop**: one gesture covers the whole capture.
 
-| Input | Action |
-| --- | --- |
-| OK click | Stop, save, return to the top of the list |
-| OK hold | Cancel and discard this entry |
+```text
+press OK ──ring fills (1 s)──► recording starts (finger still down)
+                                   │
+                              release OK
+                                   ▼
+                       stop and ask: save / cancel
+```
 
-No navigation is accepted while recording, so an accidental key cannot cut a
-sentence short.
+| Phase | Input | Action |
+| --- | --- | --- |
+| Ring filling | release early | abandon, nothing recorded |
+| Recording | release OK | stop and show the choice sheet |
+| Choice sheet | UP / DOWN | move between save and cancel |
+| Choice sheet | OK click | confirm the highlighted item |
+| Choice sheet | OK hold | same as cancel |
+
+The ring counts from the **press**, not from the long-press threshold, so
+touching the key and speaking are about a second apart. No navigation is
+accepted while recording.
 
 ### 4.4 Recording arming
 
-Holding OK from the list shows a ring that fills over three seconds; releasing
-early cancels. The ring is the only feedback that a hold is long enough, and it
+Pressing OK on the list immediately shows a ring that fills in one second;
+releasing early cancels. The ring is the only feedback that a hold is long enough, and it
 is what distinguishes "open this entry" from "start recording".
 
 ### 4.5 Settings
@@ -185,8 +198,8 @@ device finds the server on the same local network by itself.
    entry without text yet still opens, still plays, and says so.
 3. **Status stays quiet.** Pending upload and pending transcription are a dot
    and, at most, one short label on the detail screen — not a task state.
-4. **Five-minute cap.** The timer turns red at 4:30 and the entry stops and
-   saves itself at 5:00.
+4. **Five-minute cap.** The timer turns red at 4:30 and the recording stops at
+   5:00 with the same save/cancel sheet, so one press cannot run forever.
 5. **One entry, one moment.** No titles, tags, folders, or edits on the device.
 6. **Battery is always visible.** If the gauge is unavailable, the corner shows
    an icon without a number rather than a fake value.

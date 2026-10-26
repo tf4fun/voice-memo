@@ -112,9 +112,10 @@ state and never decide transitions.
 
 | State | UP click | DOWN click | OK click | OK hold | UP/DOWN hold |
 | --- | --- | --- | --- | --- | --- |
-| `LIST` | select previous | select next | open detail | arm recording | open settings |
-| `ARMING` | cancel | cancel | cancel | — | cancel |
-| `RECORDING` | ignored | ignored | stop and save | cancel and discard | ignored |
+| `LIST` | select previous | select next | open detail | — (arming starts on press) | open settings |
+| `ARMING` | ignored | ignored | ignored | ignored | ignored |
+| `RECORDING` | ignored | ignored | ignored | ignored | ignored |
+| `CONFIRM` | toggle save/cancel | toggle save/cancel | confirm highlighted | cancel | ignored |
 | `DETAIL_COLLAPSED` | previous memo | next memo | expand text | back to list | ignored |
 | `DETAIL_EXPANDED` | scroll up | scroll down | start playback | back to list | ignored |
 | `PLAYING` | scroll up | scroll down | pause | back to list (playback stops) | ignored |
@@ -124,10 +125,15 @@ state and never decide transitions.
 | `PROVISIONING` | ignored | ignored | ignored | cancel and return | ignored |
 | `ERROR` | ignored | ignored | dismiss | dismiss | ignored |
 
-`ARMING` is entered on an OK hold from `LIST` and lasts three seconds while the
-ring fills. A short press that ends before the ring completes returns to `LIST`
-without recording, which is what makes "open" and "record" distinguishable on a
-single key.
+`ARMING` is entered on the **press** event, not on the long-press threshold, and
+lasts one second while the ring fills. Recording therefore begins while the key
+is still held: the user keeps holding, speaks, and releases to finish. Release
+moves to `CONFIRM`, a two-item sheet (save / cancel) driven by UP/DOWN and
+confirmed with OK; holding OK there cancels.
+
+Counting the ring from the press is what keeps the whole gesture near one
+second. Starting it at the long-press threshold would add that threshold on top
+and make every recording feel sluggish.
 
 Transitions are expressed as `(state, input) -> (state, action)` in a table, so
 the host test can walk every combination and assert that no state is

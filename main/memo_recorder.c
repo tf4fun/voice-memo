@@ -28,7 +28,10 @@ static const char *TAG = "memo_recorder";
 #define REC_FRAME_MS 60
 #define REC_FRAME_SAMPLES (REC_SAMPLE_RATE * REC_FRAME_MS / 1000) /* 960 */
 #define REC_BATCH_BYTES 4096
-#define REC_TASK_STACK 20480
+/* esp_opus_enc 在编码路径上吃栈很凶：20 KB 会在第一帧附近就撞到保护页
+   （实测 panic: Stack protection fault in task "memo_rec"）。参考项目给
+   编解码任务的是 24 KB，这里留余量到 28 KB，并在停止时记录高水位。 */
+#define REC_TASK_STACK 28672
 
 typedef struct {
     bool active;
@@ -203,6 +206,11 @@ static void recorder_task(void *arg)
     }
 
     flush_batch();
+
+    /* 记录栈高水位，下一次调栈大小就有依据，而不是再靠猜。 */
+    UBaseType_t high_water = uxTaskGetStackHighWaterMark(NULL);
+    ESP_LOGI(TAG, "recorder stack high-water: %u bytes free", (unsigned)(high_water * sizeof(StackType_t)));
+
     free(pcm);
     free(encoded);
     s_rec.level = 0;

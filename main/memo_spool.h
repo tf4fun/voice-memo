@@ -50,5 +50,8 @@ esp_err_t memo_spool_set_state(const char *id, memo_spool_state_t state);
 /* 删除某一状态的遗留文件。 */
 esp_err_t memo_spool_remove(const char *id, memo_spool_state_t state);
 
+/* 清掉没有帧的残缺录音（上次录音被打断），返回清理条数。 */
+int memo_spool_drop_empty(void);
+
 /* 剩余空间（字节），失败返回 0。 */
 size_t memo_spool_free_bytes(void);
