@@ -105,6 +105,7 @@ explicitly approved step; report `Build`, `Host tests`, `Device tests` and
 | --- | --- |
 | [Product specification](docs/product/product-spec.md) | Screens, controls, behaviour rules, acceptance |
 | [Visual language](docs/design/visual-language.md) | Palette, card geometry, page composition, motion |
+| [Milestones](docs/project/milestones.md) | Delivery order, exit criteria, effort, risks |
 | [Upstream documentation index](docs/README.md) | Hardware, engineering and contribution guides |
 | [AGENTS.md](AGENTS.md) | Rules for AI-assisted work in this repository |
 
