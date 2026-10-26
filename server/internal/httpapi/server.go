@@ -30,6 +30,16 @@ func New(st *store.Store, cfg config.Config, log *slog.Logger) http.Handler {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/health", s.handleHealth)
+	mux.HandleFunc("GET /api/v1/ping", s.handlePing)
+	mux.HandleFunc("GET /api/v1/server", s.handleServerInfo)
+
+	mux.HandleFunc("POST /api/v1/memos", s.handleUpload)
+	mux.HandleFunc("GET /api/v1/memos", s.handleList)
+	mux.HandleFunc("GET /api/v1/memos/{id}", s.handleGet)
+	mux.HandleFunc("PATCH /api/v1/memos/{id}", s.handlePatch)
+	mux.HandleFunc("DELETE /api/v1/memos/{id}", s.handleDelete)
+	mux.HandleFunc("GET /api/v1/memos/{id}/audio", s.handleAudio)
+	mux.HandleFunc("POST /api/v1/memos/{id}/transcribe", s.handleTranscribe)
 
 	return s.withRecovery(s.withLogging(mux))
 }

@@ -345,9 +345,9 @@ Content-Type: application/json
 | 10 | 2 | 保留，0 |
 | 12 | 4 | 时长（毫秒） |
 | 16 | 8 | `recorded_at`，Unix 秒，0 表示从未对时 |
-| 24 | 32 | memo id，ASCII UUID，不足补 0 |
-| 56 | 4 | 帧数 |
-| 60 | 20 | 保留，0 |
+| 24 | 36 | memo id，带连字符的 ASCII UUID，不足补 0 |
+| 60 | 4 | 帧数 |
+| 64 | 16 | 保留，0 |
 | 80 | … | 帧：先 `uint16` 长度，再负载，循环 |
 
 以下情况拒绝上传：魔数、版本、编码、采样率或声道数与上表不符；声明的帧数与实际帧数不符；
@@ -558,9 +558,14 @@ Restart=always
 | `internal/jobs` | 退避时间表、永久错误的短路、`transcribing` 行的崩溃恢复 |
 | `internal/store` | 真实临时 SQLite，写入期间并发读，软删除过滤 |
 
-`go test ./...` 不需要网络即可全绿。一个素材文件
-（`internal/audio/testdata/one-second.opus`）用 `ffmpeg` 按 16 kHz 单声道 SILK 生成一次
-后提交，让解码路径在没有真实提供方的情况下也有覆盖。
+`go test ./...` 不需要网络即可全绿。素材文件
+`internal/audio/testdata/tone-1s.memo` 是一段 1 秒 16 kHz Opus 正弦音，已按容器格式封装
+并提交，让解码路径在没有真实提供方的情况下也有覆盖。`cmd/memogen` 可以按同样方式从任意
+Ogg Opus 文件重新生成素材：
+
+```bash
+go run ./cmd/memogen -in tone.ogg -out tone.memo -frame-ms 20
+```
 
 ## 16. 待定
 

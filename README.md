@@ -87,6 +87,7 @@ stays happy.
 ```bash
 source scripts/go-env.sh
 cd server && go build ./... && go test ./...
+./scripts/e2e-server.sh   # real binary, fake transcriber, full HTTP flow
 ```
 
 ## Build and validate

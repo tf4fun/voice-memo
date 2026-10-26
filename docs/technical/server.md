@@ -375,9 +375,9 @@ Defined once here and implemented on both sides. All integers little-endian.
 | 10 | 2 | reserved, zero |
 | 12 | 4 | duration in ms |
 | 16 | 8 | recorded_at, Unix seconds, 0 if the clock was never set |
-| 24 | 32 | memo id, ASCII UUID, NUL padded |
-| 56 | 4 | frame count |
-| 60 | 20 | reserved, zero |
+| 24 | 36 | memo id, dashed ASCII UUID, NUL padded |
+| 60 | 4 | frame count |
+| 64 | 16 | reserved, zero |
 | 80 | … | frames: `uint16` length then payload, repeated |
 
 Validation rejects the upload when the magic, version, codec, sample rate or
@@ -604,10 +604,14 @@ A container image is optional; if used, it needs `--network host` for mDNS.
 | `internal/jobs` | backoff schedule, permanent-error short-circuit, crash recovery of `transcribing` rows |
 | `internal/store` | real temporary SQLite, concurrent reads during a write, soft-delete filtering |
 
-`go test ./...` runs without network access. One fixture
-(`internal/audio/testdata/one-second.opus`) is generated once with `ffmpeg` at
-16 kHz mono SILK and committed, so the decoder path is covered without a live
-provider.
+`go test ./...` runs without network access. The fixture
+`internal/audio/testdata/tone-1s.memo` is a one-second 16 kHz Opus tone wrapped
+in the container, committed so the decoder path is exercised without a live
+provider. `cmd/memogen` rebuilds such a fixture from any Ogg Opus file:
+
+```bash
+go run ./cmd/memogen -in tone.ogg -out tone.memo -frame-ms 20
+```
 
 ## 16. Open questions
 

@@ -79,6 +79,7 @@ IDF_TAG=v6.1 IDF_DIR="$PWD/bin/esp-idf-v6.1" \
 ```bash
 source scripts/go-env.sh
 cd server && go build ./... && go test ./...
+./scripts/e2e-server.sh   # 起真实二进制 + 假转写，跑完整 HTTP 流程
 ```
 
 ## 构建与校验

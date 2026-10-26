@@ -8,14 +8,19 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
+	"github.com/tf4fun/voice-memo/server/internal/asr"
 	"github.com/tf4fun/voice-memo/server/internal/config"
+	"github.com/tf4fun/voice-memo/server/internal/discovery"
 	"github.com/tf4fun/voice-memo/server/internal/httpapi"
+	"github.com/tf4fun/voice-memo/server/internal/jobs"
 	"github.com/tf4fun/voice-memo/server/internal/store"
 )
 
@@ -69,6 +74,32 @@ func serve(args []string) error {
 	}
 	defer st.Close()
 
+	// Repair anything a previous process left mid-transcription before any
+	// worker starts claiming jobs.
+	recovered, err := st.RecoverJobs(context.Background(), time.Now().Unix())
+	if err != nil {
+		return fmt.Errorf("recover jobs: %w", err)
+	}
+	if recovered > 0 {
+		logger.Info("recovered interrupted transcriptions", "count", recovered)
+	}
+
+	transcriber, err := newTranscriber(cfg, logger)
+	if err != nil {
+		return err
+	}
+
+	runCtx, stopWorkers := context.WithCancel(context.Background())
+	defer stopWorkers()
+	go (&jobs.Runner{Store: st, Transcriber: transcriber, Log: logger}).Run(runCtx)
+
+	port := listenPort(cfg.Addr)
+	publisher, err := discovery.Advertise(cfg.MDNSName, port, logger)
+	if err != nil {
+		logger.Warn("mDNS advertisement unavailable", "error", err)
+	}
+	defer publisher.Close()
+
 	handler := httpapi.New(st, cfg, logger)
 	srv := &http.Server{
 		Addr:              cfg.Addr,
@@ -98,6 +129,7 @@ func serve(args []string) error {
 	case sig := <-stop:
 		logger.Info("shutting down", "signal", sig.String())
 	}
+	stopWorkers()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -124,4 +156,34 @@ func gc(args []string) error {
 	// expired rows. Until then it only proves the store opens.
 	fmt.Println("gc: nothing to do yet (sweeping arrives in M1)")
 	return nil
+}
+
+// newTranscriber builds the configured provider. A missing credential fails
+// startup instead of accepting uploads that can never be transcribed.
+func newTranscriber(cfg config.Config, log *slog.Logger) (asr.Transcriber, error) {
+	switch cfg.ASR.Provider {
+	case "fake":
+		return &asr.Fake{}, nil
+	case "siliconflow":
+		return &asr.SiliconFlow{
+			APIKey:  cfg.ASR.APIKey,
+			Model:   cfg.ASR.Model,
+			BaseURL: cfg.ASR.BaseURL,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unknown ASR provider %q", cfg.ASR.Provider)
+	}
+}
+
+// listenPort extracts the port from a host:port listen address.
+func listenPort(addr string) int {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 8080
+	}
+	value, err := strconv.Atoi(port)
+	if err != nil {
+		return 8080
+	}
+	return value
 }
