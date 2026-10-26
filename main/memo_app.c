@@ -28,6 +28,8 @@
 #include "memo_recorder.h"
 #include "memo_spool.h"
 #include "memo_font.h"
+#include "memo_ui_common.h"
+#include "memo_ui_detail.h"
 #include "memo_player.h"
 #include "memo_state.h"
 #include "memo_time.h"
@@ -71,44 +73,9 @@ static lv_obj_t *s_opt_cancel;
 static char s_last_id[37];
 
 /* ---------- 小工具 ---------- */
-static void flat_rect(lv_obj_t *obj, uint32_t color, int radius)
-{
-    lv_obj_remove_style_all(obj);
-    lv_obj_set_style_bg_color(obj, lv_color_hex(color), 0);
-    lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(obj, radius, 0);
-    lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
-}
-
-static lv_obj_t *card_create_ex(lv_obj_t *parent, int x, int y, int w, int h,
-                                lv_obj_t **shadow_out)
-{
-    lv_obj_t *shadow = lv_obj_create(parent);
-    flat_rect(shadow, VM_INK, VM_RADIUS_CARD);
-    lv_obj_set_pos(shadow, x + VM_SHADOW, y + VM_SHADOW);
-    lv_obj_set_size(shadow, w, h);
-    if (shadow_out != NULL) *shadow_out = shadow;
-
-    lv_obj_t *face = lv_obj_create(parent);
-    flat_rect(face, VM_CARD, VM_RADIUS_CARD);
-    lv_obj_set_style_border_color(face, lv_color_hex(VM_INK), 0);
-    lv_obj_set_style_border_width(face, VM_STROKE, 0);
-    lv_obj_set_pos(face, x, y);
-    lv_obj_set_size(face, w, h);
-    return face;
-}
-
 static lv_obj_t *card_create(lv_obj_t *parent, int x, int y, int w, int h)
 {
-    return card_create_ex(parent, x, y, w, h, NULL);
-}
-
-static lv_obj_t *label_create(lv_obj_t *parent, const lv_font_t *font, uint32_t color)
-{
-    lv_obj_t *label = lv_label_create(parent);
-    lv_obj_set_style_text_font(label, font, 0);
-    lv_obj_set_style_text_color(label, lv_color_hex(color), 0);
-    return label;
+    return memo_ui_card(parent, x, y, w, h, NULL);
 }
 
 static void enqueue_input(memo_input_t input);
@@ -151,6 +118,21 @@ static bool s_warned;
 static void tick_timer_cb(void *arg)
 {
     (void)arg;
+
+    /* 详情页：刷新播放条，并在播放自然结束时回到"已展开"。 */
+    if (!memo_state_is_recording(s_sm.state) && s_sm.state != MEMO_STATE_ARMING) {
+        const bool playing = memo_player_is_active();
+        if (bsp_lvgl_lock(50)) {
+            memo_ui_detail_set_playback(playing, memo_player_position_ms(),
+                                        memo_player_duration_ms());
+            bsp_lvgl_unlock();
+        }
+        if (!playing && s_sm.state == MEMO_STATE_PLAYING) {
+            s_sm.state = MEMO_STATE_DETAIL_EXPANDED;
+        }
+        return;
+    }
+
     const uint32_t elapsed = memo_recorder_elapsed_ms();
     if (elapsed >= MEMO_RECORD_LIMIT_MS) {
         ESP_LOGW(TAG, "five minute cap reached, stopping");
@@ -197,45 +179,45 @@ static int s_selected;
 static void build_list_page(void)
 {
     s_list_screen = lv_obj_create(NULL);
-    flat_rect(s_list_screen, VM_PAPER, 0);
+    memo_ui_flat_rect(s_list_screen, VM_PAPER, 0);
     lv_obj_set_style_radius(s_list_screen, 0, 0);
 
     const int width = lv_display_get_horizontal_resolution(NULL);
 
-    lv_obj_t *title = label_create(s_list_screen, memo_font_label(), VM_INK);
+    lv_obj_t *title = memo_ui_label(s_list_screen, memo_font_label(), VM_INK);
     lv_label_set_text(title, "备忘");
     lv_obj_set_pos(title, VM_INSET + 4, VM_INSET + 4);
 
-    s_battery = label_create(s_list_screen, &lv_font_montserrat_14, VM_MUTED);
+    s_battery = memo_ui_label(s_list_screen, &lv_font_montserrat_14, VM_MUTED);
     lv_label_set_text(s_battery, "--");
     lv_obj_align(s_battery, LV_ALIGN_TOP_RIGHT, -VM_INSET - 4, VM_INSET + 6);
 
     lv_obj_t *divider = lv_obj_create(s_list_screen);
-    flat_rect(divider, VM_INK, 0);
+    memo_ui_flat_rect(divider, VM_INK, 0);
     lv_obj_set_size(divider, width - 2 * VM_INSET, 2);
     lv_obj_set_pos(divider, VM_INSET, 34);
 
     for (int i = 0; i < LIST_ROWS; i++) {
-        lv_obj_t *row = card_create_ex(s_list_screen, VM_INSET, 44 + i * 46,
-                                       width - 2 * VM_INSET - VM_SHADOW, 40,
-                                       &s_row_shadows[i]);
+        lv_obj_t *row = memo_ui_card(s_list_screen, VM_INSET, 44 + i * 46,
+                                     width - 2 * VM_INSET - VM_SHADOW, 40,
+                                     &s_row_shadows[i]);
         s_rows[i] = row;
 
-        s_row_time[i] = label_create(row, &lv_font_montserrat_14, VM_MUTED);
+        s_row_time[i] = memo_ui_label(row, &lv_font_montserrat_14, VM_MUTED);
         lv_obj_align(s_row_time[i], LV_ALIGN_LEFT_MID, 8, 0);
 
-        s_row_text[i] = label_create(row, memo_font_label(), VM_INK);
+        s_row_text[i] = memo_ui_label(row, memo_font_label(), VM_INK);
         lv_obj_align(s_row_text[i], LV_ALIGN_LEFT_MID, 52, 0);
 
-        s_row_dur[i] = label_create(row, &lv_font_montserrat_14, VM_MUTED);
+        s_row_dur[i] = memo_ui_label(row, &lv_font_montserrat_14, VM_MUTED);
         lv_obj_align(s_row_dur[i], LV_ALIGN_RIGHT_MID, -8, 0);
     }
 
-    s_list_hint = label_create(s_list_screen, memo_font_label(), VM_MUTED);
+    s_list_hint = memo_ui_label(s_list_screen, memo_font_label(), VM_MUTED);
     lv_label_set_text(s_list_hint, "长按 OK 录音");
     lv_obj_align(s_list_hint, LV_ALIGN_BOTTOM_LEFT, VM_INSET + 4, -VM_INSET - 2);
 
-    s_list_status = label_create(s_list_screen, memo_font_label(), VM_MUTED);
+    s_list_status = memo_ui_label(s_list_screen, memo_font_label(), VM_MUTED);
     lv_label_set_text(s_list_status, "");
     lv_obj_align(s_list_status, LV_ALIGN_BOTTOM_RIGHT, -VM_INSET - 4, -VM_INSET - 2);
 }
@@ -243,19 +225,19 @@ static void build_list_page(void)
 static void build_record_page(void)
 {
     s_record_screen = lv_obj_create(NULL);
-    flat_rect(s_record_screen, VM_PAPER, 0);
+    memo_ui_flat_rect(s_record_screen, VM_PAPER, 0);
     lv_obj_set_style_radius(s_record_screen, 0, 0);
 
     lv_obj_t *dot = lv_obj_create(s_record_screen);
-    flat_rect(dot, VM_CORAL, LV_RADIUS_CIRCLE);
+    memo_ui_flat_rect(dot, VM_CORAL, LV_RADIUS_CIRCLE);
     lv_obj_set_size(dot, 12, 12);
     lv_obj_set_pos(dot, VM_INSET + 6, VM_INSET + 10);
 
-    lv_obj_t *rec = label_create(s_record_screen, &lv_font_montserrat_14, VM_INK);
+    lv_obj_t *rec = memo_ui_label(s_record_screen, &lv_font_montserrat_14, VM_INK);
     lv_label_set_text(rec, "REC");
     lv_obj_set_pos(rec, VM_INSET + 26, VM_INSET + 6);
 
-    s_timer_label = label_create(s_record_screen, &lv_font_montserrat_40, VM_INK);
+    s_timer_label = memo_ui_label(s_record_screen, &lv_font_montserrat_40, VM_INK);
     lv_label_set_text(s_timer_label, "00:00");
     lv_obj_align(s_timer_label, LV_ALIGN_TOP_MID, 0, 70);
 
@@ -265,7 +247,7 @@ static void build_record_page(void)
     int x = (lv_display_get_horizontal_resolution(NULL) - total) / 2;
     for (int i = 0; i < VM_LEVEL_BARS; i++) {
         lv_obj_t *bar = lv_obj_create(s_record_screen);
-        flat_rect(bar, VM_PAPER, 3);
+        memo_ui_flat_rect(bar, VM_PAPER, 3);
         lv_obj_set_style_border_color(bar, lv_color_hex(VM_INK), 0);
         lv_obj_set_style_border_width(bar, 1, 0);
         lv_obj_set_size(bar, bar_w, 20);
@@ -273,21 +255,21 @@ static void build_record_page(void)
         s_level_bars[i] = bar;
     }
 
-    lv_obj_t *hint = label_create(s_record_screen, &lv_font_montserrat_14, VM_MUTED);
+    lv_obj_t *hint = memo_ui_label(s_record_screen, &lv_font_montserrat_14, VM_MUTED);
     lv_label_set_text(hint, "release to finish");
     lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -VM_INSET - 6);
 
     /* 松手后弹出的选择条：保存 / 取消 */
     const int width = lv_display_get_horizontal_resolution(NULL);
-    s_sheet = card_create_ex(s_record_screen, VM_INSET + 12, 210,
-                             width - 2 * VM_INSET - 24 - VM_SHADOW, 84,
-                             &s_sheet_shadow);
+    s_sheet = memo_ui_card(s_record_screen, VM_INSET + 12, 210,
+                           width - 2 * VM_INSET - 24 - VM_SHADOW, 84,
+                           &s_sheet_shadow);
 
-    s_opt_save = label_create(s_sheet, &lv_font_montserrat_20, VM_INK);
+    s_opt_save = memo_ui_label(s_sheet, &lv_font_montserrat_20, VM_INK);
     lv_label_set_text(s_opt_save, "save");
     lv_obj_align(s_opt_save, LV_ALIGN_TOP_MID, 0, 10);
 
-    s_opt_cancel = label_create(s_sheet, &lv_font_montserrat_20, VM_MUTED);
+    s_opt_cancel = memo_ui_label(s_sheet, &lv_font_montserrat_20, VM_MUTED);
     lv_label_set_text(s_opt_cancel, "cancel");
     lv_obj_align(s_opt_cancel, LV_ALIGN_TOP_MID, 0, 44);
 }
@@ -521,6 +503,8 @@ static void execute(memo_action_t action)
         break;
 
     case MEMO_ACT_BACK_TO_LIST:
+        memo_player_stop();
+        esp_timer_stop(s_tick_timer);
         if (bsp_lvgl_lock(200)) {
             show_screen(s_list_screen);
             refresh_list();
@@ -529,31 +513,61 @@ static void execute(memo_action_t action)
         break;
 
     case MEMO_ACT_OPEN_DETAIL: {
-        /* M2 预览：详情页在 M3 落地，这里先把最新一条待上传录音播出来，
-           用来验证录音质量与播放通路。M3 会把它换成真正的详情页。 */
-        memo_spool_entry_t entries[MEMO_SPOOL_MAX_ENTRIES];
-        int total = memo_spool_scan(entries, MEMO_SPOOL_MAX_ENTRIES);
-        const char *newest = NULL;
-        for (int i = 0; i < total && i < MEMO_SPOOL_MAX_ENTRIES; i++) {
-            if (entries[i].state == MEMO_SPOOL_PENDING) {
-                newest = entries[i].id;
-                break;
-            }
-        }
-        if (newest == NULL) {
-            ESP_LOGI(TAG, "nothing to play");
+        if (s_selected >= s_entry_count) {
+            ESP_LOGI(TAG, "nothing selected");
+            s_sm.state = MEMO_STATE_LIST;
             break;
         }
-        if (memo_player_is_active()) {
-            memo_player_stop();
+        const memo_spool_entry_t *entry = &s_entries[s_selected];
+        if (bsp_lvgl_lock(200)) {
+            memo_ui_detail_show((int64_t)entry->recorded_at, entry->duration_ms, NULL);
+            lv_screen_load(memo_ui_detail_screen());
+            bsp_lvgl_unlock();
         }
-        if (memo_player_play(newest) == ESP_OK) {
-            ESP_LOGI(TAG, "M2 preview: playing %s", newest);
+        esp_timer_start_periodic(s_tick_timer, 200 * 1000);
+        ESP_LOGI(TAG, "detail: %s (%u ms)", entry->id, (unsigned)entry->duration_ms);
+        break;
+    }
+
+    case MEMO_ACT_EXPAND:
+        if (bsp_lvgl_lock(150)) {
+            memo_ui_detail_set_expanded(true);
+            bsp_lvgl_unlock();
+        }
+        break;
+
+    case MEMO_ACT_PLAY:
+    case MEMO_ACT_RESUME: {
+        if (s_selected >= s_entry_count) break;
+        const char *id = s_entries[s_selected].id;
+        if (memo_player_is_active()) memo_player_stop();
+        if (memo_player_play(id) == ESP_OK) {
+            ESP_LOGI(TAG, "playing %s", id);
         } else {
-            ESP_LOGE(TAG, "M2 preview: playback failed");
+            ESP_LOGE(TAG, "play failed");
         }
-        /* 没有详情页可停留，回到列表。 */
-        s_sm.state = MEMO_STATE_LIST;
+        break;
+    }
+
+    case MEMO_ACT_PAUSE:
+        /* M3 只支持"停止后从头再播"；真正的暂停/续播随 M4 的流式播放一起做。 */
+        memo_player_stop();
+        if (bsp_lvgl_lock(150)) {
+            memo_ui_detail_set_playback(false, memo_player_position_ms(),
+                                        memo_player_duration_ms());
+            bsp_lvgl_unlock();
+        }
+        break;
+
+    case MEMO_ACT_NEXT_MEMO:
+    case MEMO_ACT_PREV_MEMO: {
+        if (action == MEMO_ACT_NEXT_MEMO && s_selected + 1 < s_entry_count) s_selected++;
+        if (action == MEMO_ACT_PREV_MEMO && s_selected > 0) s_selected--;
+        const memo_spool_entry_t *entry = &s_entries[s_selected];
+        if (bsp_lvgl_lock(200)) {
+            memo_ui_detail_show((int64_t)entry->recorded_at, entry->duration_ms, NULL);
+            bsp_lvgl_unlock();
+        }
         break;
     }
 

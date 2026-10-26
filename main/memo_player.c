@@ -28,6 +28,8 @@ static SemaphoreHandle_t s_done;
 static volatile bool s_active;
 static char s_id[37];
 static bool s_ready;
+static volatile uint32_t s_position_ms;
+static volatile uint32_t s_duration_ms;
 
 esp_err_t memo_player_init(void)
 {
@@ -82,6 +84,9 @@ static void player_task(void *arg)
         goto done;
     }
 
+    s_duration_ms = header.duration_ms;
+    s_position_ms = 0;
+
     if (bsp_audio_set_format(header.sample_rate, 16, header.channels) != ESP_OK) {
         ESP_LOGE(TAG, "codec format for playback failed");
         fclose(file);
@@ -119,6 +124,8 @@ static void player_task(void *arg)
             break;
         }
         played++;
+        /* 16 bit 单声道：字节数 / (采样率 × 2) → 毫秒 */
+        s_position_ms = (uint32_t)(played * header.frame_ms);
     }
 
     ESP_LOGI(TAG, "played %u frames", (unsigned)played);
@@ -127,6 +134,7 @@ static void player_task(void *arg)
     fclose(file);
 
 done:
+    s_position_ms = 0;
     s_active = false;
     if (s_done != NULL) xSemaphoreGive(s_done);
     s_task = NULL;
@@ -167,4 +175,14 @@ esp_err_t memo_player_stop(void)
 bool memo_player_is_active(void)
 {
     return s_active;
+}
+
+uint32_t memo_player_position_ms(void)
+{
+    return s_position_ms;
+}
+
+uint32_t memo_player_duration_ms(void)
+{
+    return s_duration_ms;
 }

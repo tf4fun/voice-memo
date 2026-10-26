@@ -12,6 +12,8 @@ idf_component_register(
          "memo_recorder.c"
          "memo_player.c"
          "memo_font.c"
+         "memo_ui_common.c"
+         "memo_ui_detail.c"
     INCLUDE_DIRS "."
     REQUIRES bsp esp_audio_codec esp_timer nvs_flash spiffs
 )

@@ -1,11 +1,12 @@
 // main/memo_player.h —— 本地录音回放：spool 里的 Opus 帧解码成 PCM 送到 I2S。
 //
-// M2 只用于验证录音质量；M3 的详情页会复用同一条通路（并加上服务端流式播放）。
+// M2 用于验证录音质量；M3 的详情页复用同一条通路（M4 会再加服务端流式播放）。
 #pragma once
 
 #include "esp_err.h"
 
 #include <stdbool.h>
+#include <stdint.h>
 
 /* 打开解码器（幂等）。 */
 esp_err_t memo_player_init(void);
@@ -18,3 +19,9 @@ esp_err_t memo_player_stop(void);
 
 /* 是否正在播放。 */
 bool memo_player_is_active(void);
+
+/* 已播放的毫秒数（按解码出的采样数计算）。 */
+uint32_t memo_player_position_ms(void);
+
+/* 当前这条录音的总时长（来自容器头）。 */
+uint32_t memo_player_duration_ms(void);
