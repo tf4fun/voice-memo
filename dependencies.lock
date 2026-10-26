@@ -14,7 +14,7 @@ dependencies:
       type: service
     version: 4.2.0
   espressif/cmake_utilities:
-    component_hash: 05165f30922b422b4b90c08845e6d449329b97370fbd06309803d8cb539d79e3
+    component_hash: 2061cf92b3ecd45dbfac0b9c8c1392108aaa584bd1a205cd1885cffb59a06266
     dependencies:
     - name: idf
       require: private
@@ -22,7 +22,17 @@ dependencies:
     source:
       registry_url: https://components.espressif.com
       type: service
-    version: 1.1.1
+    version: 1.2.0
+  espressif/esp_audio_codec:
+    component_hash: a5b9275af74247e3ce536d16a7080e4d77207a185b63e1bea368eb4d57176c2b
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.4'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 2.6.2
   espressif/esp_codec_dev:
     component_hash: 4779f31a3ba3f9b38aee1afe6ccb9ba8f6108dc3a6e77d39d7d714e9a215371b
     dependencies:
@@ -52,18 +62,43 @@ dependencies:
       type: idf
     version: 5.5.3
   lvgl/lvgl:
-    component_hash: 184e532558c1c45fefed631f3e235423d22582aafb4630f3e8885c35281a49ae
-    dependencies: []
+    component_hash: 7d82410747bbfb319531449749e940f440f8414f041f9eaba13f0d1dd7f58cdd
+    dependencies:
+    - name: espressif/freetype
+      registry_url: https://components.espressif.com
+      require: private
+      rules:
+      - if: idf_version >=5.5 && $CONFIG{LV_USE_FREETYPE} == True
+      version: ^2.14.3
+    - name: espressif/libjpeg-turbo
+      registry_url: https://components.espressif.com
+      require: private
+      rules:
+      - if: idf_version >=5.5 && $CONFIG{LV_USE_LIBJPEG_TURBO} == True
+      version: ^3.1.1
+    - name: espressif/libpng
+      registry_url: https://components.espressif.com
+      require: private
+      rules:
+      - if: idf_version >=5.5 && $CONFIG{LV_USE_LIBPNG} == True
+      version: ^1.6.58
+    - name: espressif/lz4
+      registry_url: https://components.espressif.com
+      require: private
+      rules:
+      - if: idf_version >=5.5 && $CONFIG{LV_USE_LZ4} == True && $CONFIG{LV_USE_LZ4_INTERNAL} == False
+      version: ^1.10.0
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 9.5.0
+    version: 9.6.0~1
 direct_dependencies:
 - espressif/button
+- espressif/esp_audio_codec
 - espressif/esp_codec_dev
 - espressif/esp_lvgl_port
 - idf
 - lvgl/lvgl
-manifest_hash: db5703744958b4654342908988a87f1da9cac5e5612d3aceb0191f6bec59ba49
+manifest_hash: 21042ec5218c7db9c1ebf33ab02f29c5ef2812fd1d84ed41f78ace2ba40754c5
 target: esp32c3
 version: 2.0.0
