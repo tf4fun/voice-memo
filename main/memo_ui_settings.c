@@ -4,6 +4,7 @@
 #include <stdio.h>
 
 #include "memo_font.h"
+#include "memo_net.h"
 #include "memo_settings.h"
 #include "memo_spool.h"
 #include "memo_ui_common.h"
@@ -55,7 +56,20 @@ static void format_value(int row, char *buf, size_t cap)
     const memo_settings_t *st = memo_settings_get();
     switch (row) {
     case ROW_NETWORK:
-        snprintf(buf, cap, "未配置");
+        switch (memo_net_state()) {
+        case MEMO_NET_CONNECTED:
+            snprintf(buf, cap, "%s", memo_net_ssid());
+            break;
+        case MEMO_NET_CONNECTING:
+            snprintf(buf, cap, "连接中");
+            break;
+        case MEMO_NET_NO_CREDENTIALS:
+            snprintf(buf, cap, "未配置");
+            break;
+        default:
+            snprintf(buf, cap, "未连接");
+            break;
+        }
         break;
     case ROW_SERVER:
         snprintf(buf, cap, "未发现");

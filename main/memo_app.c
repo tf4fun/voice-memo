@@ -32,6 +32,7 @@
 #include "memo_ui_detail.h"
 #include "memo_player.h"
 #include "memo_settings.h"
+#include "memo_net.h"
 #include "memo_provision.h"
 #include "memo_ui_provision.h"
 #include "memo_ui_settings.h"
@@ -627,6 +628,7 @@ static void execute(memo_action_t action)
     case MEMO_ACT_SUB_PAGE_ENTER:
         if (memo_ui_settings_row() == MEMO_SETTING_NETWORK) {
             /* 网络行不是子页，而是进入蓝牙配网。 */
+            memo_net_suspend(); /* 配网要独占 WiFi */
             if (memo_provision_start() == ESP_OK) {
                 s_sm.state = MEMO_STATE_PROVISIONING;
                 if (bsp_lvgl_lock(200)) {
@@ -819,6 +821,11 @@ void app_main(void)
         ESP_LOGE(TAG, "player unavailable; playback will not work");
     }
     bsp_battery_init();
+
+    /* 有凭据就自己连上；没有则等用户从设置里配网。 */
+    if (memo_net_start() != ESP_OK) {
+        ESP_LOGW(TAG, "network start failed");
+    }
 
     if (bsp_button_init(on_key, NULL) != ESP_OK) {
         ESP_LOGE(TAG, "button init failed");

@@ -16,6 +16,7 @@ idf_component_register(
          "memo_ui_detail.c"
          "memo_ui_settings.c"
          "memo_settings.c"
+         "memo_net.c"
          "memo_provision.c"
          "memo_provision_security.c"
          "memo_ui_provision.c"

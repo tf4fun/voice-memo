@@ -17,6 +17,7 @@
 
 #include "bsp_audio.h"
 #include "memo_container.h"
+#include "memo_net.h"
 #include "memo_spool.h"
 
 #include "esp_opus_enc.h"
@@ -232,8 +233,7 @@ esp_err_t memo_recorder_start(const char *id)
 
     /* 没连过网、也没 SNTP，time() 会是 1970 年起步的值。这种时间写进容器只会
        让列表显示一个假日期，所以按协议约定记 0（"从未对时"），由服务端兜底。 */
-    const time_t wall = time(NULL);
-    const uint64_t recorded_at = (wall > 1577836800) ? (uint64_t)wall : 0; /* 2020-01-01 */
+    const uint64_t recorded_at = memo_net_now(); /* 未对时则为 0，由服务端兜底 */
 
     memo_container_header_t header = {
         .sample_rate = REC_SAMPLE_RATE,
