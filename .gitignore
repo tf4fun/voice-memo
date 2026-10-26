@@ -11,3 +11,8 @@ managed_components/
 /.agents/skills/passport-build
 /.agents/skills/passport-device-test
 /.agents/skills/passport-debug
+
+# Local development environment and reference checkouts (not part of the product).
+/bin/
+/.dsh/
+/reference/
