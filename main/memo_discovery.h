@@ -24,6 +24,9 @@ esp_err_t memo_discovery_init(void);
 /* 查一次服务，超时 timeo_ms。成功后 memo_discovery_host/port 可用。 */
 esp_err_t memo_discovery_search(uint32_t timeout_ms);
 
+/* 释放 mDNS 占用的内存（约十几 KB）。下次 search 会自动重新初始化。 */
+void memo_discovery_stop(void);
+
 memo_discovery_state_t memo_discovery_state(void);
 const char *memo_discovery_host(void);
 uint16_t memo_discovery_port(void);

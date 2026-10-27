@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 
 #include "esp_log.h"
+#include "esp_system.h"
 
 #include "bsp_audio.h"
 #include "memo_container.h"
@@ -31,9 +32,9 @@ static bool s_ready;
 static volatile uint32_t s_position_ms;
 static volatile uint32_t s_duration_ms;
 
-esp_err_t memo_player_init(void)
+static bool decoder_open(void)
 {
-    if (s_ready) return ESP_OK;
+    if (s_decoder != NULL) return true;
 
     esp_opus_dec_cfg_t cfg = {
         .sample_rate = 16000,
@@ -45,14 +46,26 @@ esp_err_t memo_player_init(void)
     if (err != ESP_AUDIO_ERR_OK) {
         ESP_LOGE(TAG, "opus decoder open failed: %d", (int)err);
         s_decoder = NULL;
-        return ESP_FAIL;
+        return false;
     }
+    ESP_LOGI(TAG, "decoder opened, free heap %u", (unsigned)esp_get_free_heap_size());
+    return true;
+}
+
+static void decoder_close(void)
+{
+    if (s_decoder == NULL) return;
+    esp_opus_dec_close(s_decoder);
+    s_decoder = NULL;
+    ESP_LOGI(TAG, "decoder released, free heap %u", (unsigned)esp_get_free_heap_size());
+}
+
+esp_err_t memo_player_init(void)
+{
+    if (s_ready) return ESP_OK;
+
     s_done = xSemaphoreCreateBinary();
-    if (s_done == NULL) {
-        esp_opus_dec_close(s_decoder);
-        s_decoder = NULL;
-        return ESP_ERR_NO_MEM;
-    }
+    if (s_done == NULL) return ESP_ERR_NO_MEM;
     s_ready = true;
     return ESP_OK;
 }
@@ -89,6 +102,11 @@ static void player_task(void *arg)
 
     if (bsp_audio_set_format(header.sample_rate, 16, header.channels) != ESP_OK) {
         ESP_LOGE(TAG, "codec format for playback failed");
+        fclose(file);
+        goto done;
+    }
+
+    if (!decoder_open()) {
         fclose(file);
         goto done;
     }
@@ -132,6 +150,7 @@ static void player_task(void *arg)
     free(pcm);
     free(packet);
     fclose(file);
+    decoder_close();
 
 done:
     s_position_ms = 0;

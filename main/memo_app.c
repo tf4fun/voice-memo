@@ -6,6 +6,9 @@
 #include <string.h>
 #include <time.h>
 
+#include "esp_heap_caps.h"
+#include "esp_system.h"
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -432,11 +435,17 @@ static void execute(memo_action_t action)
         break;
 
     case MEMO_ACT_BEGIN_RECORDING: {
+        /* 录音任务需要 28 KB 连续栈，WiFi 在时会占掉最大连续块。
+           录音本身不需要网络，按"一次只做一件事"的思路先让出 WiFi。 */
+        memo_net_suspend();
         char id[37];
         uint8_t random[16];
         esp_fill_random(random, sizeof(random));
         memo_container_make_uuid(id, random);
 
+        ESP_LOGI(TAG, "recording start: free heap %u (largest block %u)",
+                 (unsigned)esp_get_free_heap_size(),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
         esp_err_t err = memo_recorder_start(id);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "recorder start failed: %s", esp_err_to_name(err));
@@ -480,6 +489,8 @@ static void execute(memo_action_t action)
         if (err == ESP_OK) {
             ESP_LOGI(TAG, "recorded %s (%u ms, %u bytes)",
                      result.id, (unsigned)result.duration_ms, (unsigned)result.size_bytes);
+            /* 有了待上传的录音才拉起上传任务。 */
+            memo_upload_start();
         } else {
             ESP_LOGE(TAG, "recorder stop: %s", esp_err_to_name(err));
         }
@@ -555,11 +566,8 @@ static void execute(memo_action_t action)
             break;
         }
         const memo_spool_entry_t *entry = &s_entries[s_selected];
-        if (memo_ui_detail_screen() == NULL) {
-            ESP_LOGE(TAG, "detail page was never built");
-            break;
-        }
         if (bsp_lvgl_lock(200)) {
+            if (memo_ui_detail_screen() == NULL) memo_ui_detail_build();
             memo_ui_detail_show((int64_t)entry->recorded_at, entry->duration_ms, NULL);
             /* 没有转写文本时"展开"在屏幕上看不出变化，会让第一次点击像没反应。
                此时直接按"已展开"进入，第一下 OK 就开始播放。 */
@@ -626,11 +634,8 @@ static void execute(memo_action_t action)
     }
 
     case MEMO_ACT_OPEN_SETTINGS:
-        if (memo_ui_settings_screen() == NULL) {
-            ESP_LOGE(TAG, "settings page was never built");
-            break;
-        }
         if (bsp_lvgl_lock(200)) {
+            if (memo_ui_settings_screen() == NULL) memo_ui_settings_build();
             memo_ui_settings_refresh();
             lv_screen_load(memo_ui_settings_screen());
             bsp_lvgl_unlock();
@@ -648,11 +653,13 @@ static void execute(memo_action_t action)
     case MEMO_ACT_SUB_PAGE_ENTER:
         if (memo_ui_settings_row() == MEMO_SETTING_NETWORK) {
             /* 网络行不是子页，而是进入蓝牙配网。 */
-            memo_upload_stop();  /* 上传也要让出 WiFi */
+            memo_upload_stop();      /* 上传也要让出 WiFi */
+            memo_discovery_stop();   /* 连同 mDNS 的十几 KB 一起收回 */
             memo_net_suspend();
             if (memo_provision_start() == ESP_OK) {
                 s_sm.state = MEMO_STATE_PROVISIONING;
                 if (bsp_lvgl_lock(200)) {
+                    if (memo_ui_provision_screen() == NULL) memo_ui_provision_build();
                     memo_ui_provision_enter();
                     lv_screen_load(memo_ui_provision_screen());
                     bsp_lvgl_unlock();
@@ -761,6 +768,8 @@ void app_main(void)
 
     memo_sm_init(&s_sm);
 
+    ESP_LOGI(TAG, "heap after boot: %u", (unsigned)esp_get_free_heap_size());
+
     if (memo_settings_init() != ESP_OK) {
         ESP_LOGW(TAG, "settings unavailable; using defaults");
     }
@@ -805,6 +814,7 @@ void app_main(void)
     bsp_display_backlight(100);
 
     /* 列表页要显示待上传条数与剩余空间，所以 spool 必须在建页面之前挂好。 */
+    ESP_LOGI(TAG, "heap after display/LVGL: %u", (unsigned)esp_get_free_heap_size());
     if (memo_spool_mount() != ESP_OK) {
         ESP_LOGE(TAG, "spool mount failed; recordings will not persist");
     } else {
@@ -819,9 +829,8 @@ void app_main(void)
         memo_fonts_init();
         build_list_page();
         build_record_page();
-        memo_ui_detail_build();
-        memo_ui_settings_build();
-        memo_ui_provision_build();
+        /* 详情/设置/配网页改为按需构建：三张页面加起来约十几 KB，
+           在配网这种内存敏感场景下不值得常驻。 */
         refresh_list();
         show_screen(s_list_screen);
         bsp_lvgl_unlock();
@@ -829,6 +838,7 @@ void app_main(void)
 
     /* 录音通路依赖 codec：不先 init，bsp_audio_set_format 会直接返回
        ESP_ERR_INVALID_STATE，表现就是"按了没反应"。 */
+    ESP_LOGI(TAG, "heap after spool: %u", (unsigned)esp_get_free_heap_size());
     if (bsp_audio_init() != ESP_OK) {
         ESP_LOGE(TAG, "audio codec unavailable; recording will not work");
     } else {
@@ -843,11 +853,13 @@ void app_main(void)
     }
     bsp_battery_init();
 
+    ESP_LOGI(TAG, "heap after audio/battery: %u", (unsigned)esp_get_free_heap_size());
     /* 有凭据就自己连上；没有则等用户从设置里配网。 */
     if (memo_net_start() != ESP_OK) {
         ESP_LOGW(TAG, "network start failed");
     }
-    if (memo_upload_start() != ESP_OK) {
+    /* 上传任务按需启动：空闲时不占 8 KB 栈，把堆留给配网。 */
+    if (memo_upload_pending() && memo_upload_start() != ESP_OK) {
         ESP_LOGW(TAG, "uploader start failed");
     }
 
@@ -859,5 +871,7 @@ void app_main(void)
         key_guard_sync_released(&s_guard, released);
     }
 
-    ESP_LOGI(TAG, "idle");
+    ESP_LOGI(TAG, "idle; free heap %u (largest block %u)",
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 }

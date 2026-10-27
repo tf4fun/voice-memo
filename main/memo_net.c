@@ -100,18 +100,30 @@ esp_err_t memo_net_start(void)
     }
 
     esp_err_t err = esp_netif_init();
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "netif init: %s", esp_err_to_name(err));
+        return err;
+    }
     err = esp_event_loop_create_default();
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "event loop: %s", esp_err_to_name(err));
+        return err;
+    }
 
     if (s_netif == NULL) {
         s_netif = esp_netif_create_default_wifi_sta();
-        if (s_netif == NULL) return ESP_FAIL;
+        if (s_netif == NULL) {
+            ESP_LOGE(TAG, "cannot create station netif");
+            return ESP_FAIL;
+        }
     }
 
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     err = esp_wifi_init(&init_cfg);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "wifi init: %s", esp_err_to_name(err));
+        return err;
+    }
 
     if (!s_handlers_registered) {
         esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL,
@@ -138,9 +150,15 @@ esp_err_t memo_net_start(void)
     memcpy(s_ssid, cfg.sta.ssid, ssid_len < sizeof(s_ssid) ? ssid_len : sizeof(s_ssid) - 1);
 
     err = esp_wifi_set_mode(WIFI_MODE_STA);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "set mode: %s", esp_err_to_name(err));
+        return err;
+    }
     err = esp_wifi_start();
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "wifi start: %s", esp_err_to_name(err));
+        return err;
+    }
     if (esp_wifi_set_ps(WIFI_PS_MIN_MODEM) != ESP_OK) {
         ESP_LOGW(TAG, "cannot enable modem sleep");
     }
@@ -165,7 +183,7 @@ void memo_net_suspend(void)
     s_started = false;
     s_ip[0] = '\0';
     s_state = MEMO_NET_OFF;
-    ESP_LOGI(TAG, "suspended for provisioning");
+    ESP_LOGI(TAG, "WiFi suspended, free heap %u", (unsigned)esp_get_free_heap_size());
 }
 
 memo_net_state_t memo_net_state(void)

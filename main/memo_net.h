@@ -20,8 +20,9 @@ typedef enum {
 /* 初始化 WiFi 并用 NVS 里的凭据开始连接。可重复调用（例如配网结束后）。 */
 esp_err_t memo_net_start(void);
 
-/* 配网要接管 WiFi 时先挂起本模块（会停止 STA 并注销自己的事件处理）。 */
+/* 配网要接管 WiFi 时先挂起本模块；netif 会移交给配网，避免重复创建默认 STA。 */
 void memo_net_suspend(void);
+
 
 memo_net_state_t memo_net_state(void);
 const char *memo_net_ssid(void);

@@ -11,6 +11,8 @@
 #include "esp_blufi_api.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "esp_system.h"
 #include "esp_netif.h"
 #include "nvs_flash.h"
 #include "esp_wifi.h"
@@ -26,7 +28,7 @@
 
 static const char *TAG = "memo_prov";
 // ESP Config 微信小程序默认只显示以 "BLUFI" 开头的设备。
-static const char *DEVICE_NAME = "BLUFI_FoloPassport";
+static const char *DEVICE_NAME = MEMO_PROV_DEVICE_NAME;
 
 #define BLUFI_AP_LIST_COUNT 16
 
@@ -53,6 +55,18 @@ static bool s_wifi_connecting;
 static bool s_wifi_got_ip;
 static bool s_reconnect_after_disconnect;
 static SemaphoreHandle_t s_host_stopped;
+
+static esp_err_t wifi_start(void);
+
+/* 收到凭据或要求扫描时才启动 WiFi 驱动。 */
+static esp_err_t ensure_wifi(void)
+{
+    if (s_wifi_started) return ESP_OK;
+    const esp_err_t err = wifi_start();
+    ESP_LOGI(TAG, "lazy wifi_start: %s, free heap %u", esp_err_to_name(err),
+             (unsigned)esp_get_free_heap_size());
+    return err;
+}
 
 static void send_wifi_report(esp_blufi_sta_conn_state_t state)
 {
@@ -177,8 +191,10 @@ static void host_task(void *arg)
 static void blufi_event(esp_blufi_cb_event_t event, esp_blufi_cb_param_t *param)
 {
     switch (event) {
-    case ESP_BLUFI_EVENT_INIT_FINISH:
+    case ESP_BLUFI_EVENT_INIT_FINISH: {
         esp_blufi_adv_start_with_name(DEVICE_NAME);
+        ESP_LOGI(TAG, "INIT_FINISH: advertising as %s, free heap %u",
+                 DEVICE_NAME, (unsigned)esp_get_free_heap_size());
         if (s_wifi_got_ip) {
             s_state = MEMO_PROV_WIFI_CONNECTED;
         } else if (s_wifi_connecting) {
@@ -187,8 +203,12 @@ static void blufi_event(esp_blufi_cb_event_t event, esp_blufi_cb_param_t *param)
             s_state = MEMO_PROV_ADVERTISING;
         }
         break;
+    }
     case ESP_BLUFI_EVENT_BLE_CONNECT:
         s_ble_connected = true;
+        ESP_LOGI(TAG, "phone connected; free heap %u (largest block %u)",
+                 (unsigned)esp_get_free_heap_size(),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
         esp_blufi_adv_stop();
         if (memo_provision_security_init() != 0) {
             s_error = ESP_ERR_NO_MEM;
@@ -212,6 +232,10 @@ static void blufi_event(esp_blufi_cb_event_t event, esp_blufi_cb_param_t *param)
         esp_wifi_set_config(WIFI_IF_STA, &s_sta_config);
         break;
     case ESP_BLUFI_EVENT_RECV_STA_SSID:
+        if (ensure_wifi() != ESP_OK) {
+            esp_blufi_send_error_info(ESP_BLUFI_WIFI_SCAN_FAIL);
+            break;
+        }
         if (param->sta_ssid.ssid_len >= sizeof(s_sta_config.sta.ssid)) {
             esp_blufi_send_error_info(ESP_BLUFI_DATA_FORMAT_ERROR);
             break;
@@ -226,6 +250,10 @@ static void blufi_event(esp_blufi_cb_event_t event, esp_blufi_cb_param_t *param)
         esp_wifi_set_config(WIFI_IF_STA, &s_sta_config);
         break;
     case ESP_BLUFI_EVENT_RECV_STA_PASSWD:
+        if (ensure_wifi() != ESP_OK) {
+            esp_blufi_send_error_info(ESP_BLUFI_WIFI_SCAN_FAIL);
+            break;
+        }
         if (param->sta_passwd.passwd_len >= sizeof(s_sta_config.sta.password)) {
             esp_blufi_send_error_info(ESP_BLUFI_DATA_FORMAT_ERROR);
             break;
@@ -251,6 +279,10 @@ static void blufi_event(esp_blufi_cb_event_t event, esp_blufi_cb_param_t *param)
         }
         break;
     case ESP_BLUFI_EVENT_GET_WIFI_LIST: {
+        if (ensure_wifi() != ESP_OK) {
+            esp_blufi_send_error_info(ESP_BLUFI_WIFI_SCAN_FAIL);
+            break;
+        }
         wifi_scan_config_t config = { 0 };
         if (esp_wifi_scan_start(&config, false) != ESP_OK) {
             esp_blufi_send_error_info(ESP_BLUFI_WIFI_SCAN_FAIL);
@@ -289,8 +321,13 @@ static esp_err_t wifi_start(void)
     err = esp_event_loop_create_default();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
 
-    s_sta_netif = esp_netif_create_default_wifi_sta();
-    if (!s_sta_netif) return ESP_ERR_NO_MEM;
+    /* 默认 STA netif 可能已由常驻联网建立：按 ifkey 复用，重复创建会撞
+       "duplicate key" 并触发 assert。 */
+    s_sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (s_sta_netif == NULL) {
+        s_sta_netif = esp_netif_create_default_wifi_sta();
+        if (s_sta_netif == NULL) return ESP_ERR_NO_MEM;
+    }
     wifi_init_config_t config = WIFI_INIT_CONFIG_DEFAULT();
     err = esp_wifi_init(&config);
     if (err != ESP_OK) return err;
@@ -390,10 +427,8 @@ static void provisioning_stop(void)
         esp_wifi_deinit();
         s_wifi_initialized = false;
     }
-    if (s_sta_netif) {
-        esp_netif_destroy_default_wifi(s_sta_netif);
-        s_sta_netif = NULL;
-    }
+    /* netif 归常驻联网所有，这里只放弃引用，不销毁。 */
+    s_sta_netif = NULL;
     s_state = MEMO_PROV_IDLE;
 }
 
@@ -409,8 +444,12 @@ esp_err_t memo_provision_start(void)
     s_reconnect_after_disconnect = false;
     s_state = MEMO_PROV_STARTING;
 
-    esp_err_t err = wifi_start();
-    if (err == ESP_OK) err = host_start();
+    /* 只启动蓝牙：WiFi 驱动要等手机真的送来凭据再开。
+       连接阶段控制器最需要内存，此时不该让 WiFi 的收发缓冲占着。 */
+    ESP_LOGI(TAG, "start: BLE only, free heap %u", (unsigned)esp_get_free_heap_size());
+    esp_err_t err = host_start();
+    ESP_LOGI(TAG, "start: host_start done (%s), free heap %u", esp_err_to_name(err),
+             (unsigned)esp_get_free_heap_size());
     if (err != ESP_OK) {
         s_error = err;
         s_state = MEMO_PROV_FAILED;

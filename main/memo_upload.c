@@ -166,6 +166,7 @@ static void upload_task(void *arg)
 {
     (void)arg;
     derive_device_id();
+    ESP_LOGI(TAG, "uploader running, device id %s", s_device_id);
 
     while (s_running) {
         memo_spool_entry_t entry;
@@ -211,7 +212,7 @@ esp_err_t memo_upload_start(void)
         s_running = false;
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "uploader started (device %s)", s_device_id);
+    ESP_LOGI(TAG, "uploader task created");
     return ESP_OK;
 }
 

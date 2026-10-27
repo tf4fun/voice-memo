@@ -7,6 +7,7 @@ package discovery
 import (
 	"fmt"
 	"log/slog"
+	"net"
 
 	"github.com/grandcat/zeroconf"
 )
@@ -21,8 +22,31 @@ type Publisher struct {
 
 // Advertise publishes the service. A failure is not fatal: the server still
 // works for a device configured by address, so callers log and continue.
+// lanIPv4 returns the first non-loopback IPv4 address. It is published in the
+// TXT record because some mDNS clients on small devices resolve the PTR but not
+// the SRV target, and an address in TXT always works.
+func lanIPv4() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return ""
+	}
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if v4 := ipnet.IP.To4(); v4 != nil {
+				return v4.String()
+			}
+		}
+	}
+	return ""
+}
+
+// Advertise publishes the service. A failure is not fatal: the server still
+// works for a device configured by address, so callers log and continue.
 func Advertise(instance string, port int, log *slog.Logger) (*Publisher, error) {
 	txt := []string{"ver=1", "path=/api/v1", "caps=opus"}
+	if ip := lanIPv4(); ip != "" {
+		txt = append(txt, "ip="+ip)
+	}
 	server, err := zeroconf.Register(instance, ServiceType, "local.", port, txt, nil)
 	if err != nil {
 		return nil, fmt.Errorf("advertise %s: %w", ServiceType, err)
