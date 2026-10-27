@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/tf4fun/voice-memo/server/internal/config"
+	"github.com/tf4fun/voice-memo/server/internal/events"
 	"github.com/tf4fun/voice-memo/server/internal/store"
 )
 
@@ -21,18 +22,29 @@ type Server struct {
 	cfg     config.Config
 	log     *slog.Logger
 	started time.Time
+	events  *events.Hub
 }
 
 // New builds the handler tree. Later milestones add routes here; the shape stays
 // the same so tests keep working.
 func New(st *store.Store, cfg config.Config, log *slog.Logger) http.Handler {
-	s := &Server{store: st, cfg: cfg, log: log, started: time.Now()}
+	return NewWithEvents(st, cfg, log, events.NewHub())
+}
+
+// NewWithEvents builds the handler with a caller-supplied hub so the
+// transcription worker can publish to the same subscribers.
+func NewWithEvents(st *store.Store, cfg config.Config, log *slog.Logger, hub *events.Hub) http.Handler {
+	if hub == nil {
+		hub = events.NewHub()
+	}
+	s := &Server{store: st, cfg: cfg, log: log, started: time.Now(), events: hub}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/health", s.handleHealth)
 	mux.HandleFunc("GET /api/v1/ping", s.handlePing)
 	mux.HandleFunc("GET /api/v1/server", s.handleServerInfo)
 
+	mux.HandleFunc("GET /api/v1/events", s.handleEvents)
 	mux.HandleFunc("POST /api/v1/memos", s.handleUpload)
 	mux.HandleFunc("GET /api/v1/memos", s.handleList)
 	mux.HandleFunc("GET /api/v1/memos/{id}", s.handleGet)

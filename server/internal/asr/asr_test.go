@@ -13,11 +13,17 @@ import (
 	"time"
 )
 
-func writeAudio(t *testing.T, size int) string {
+// writeContainer copies the shared MEMO fixture: the provider now receives the
+// device's Opus container and decodes it to WAV in memory before posting.
+func writeContainer(t *testing.T) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "sample.wav")
-	if err := os.WriteFile(path, make([]byte, size), 0o600); err != nil {
-		t.Fatalf("write audio: %v", err)
+	data, err := os.ReadFile("../audio/testdata/tone-1s.memo")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "sample.memo")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write container: %v", err)
 	}
 	return path
 }
@@ -50,7 +56,7 @@ func TestSiliconFlowSendsFileAndModel(t *testing.T) {
 
 	provider := &SiliconFlow{APIKey: "key", Model: "FunAudioLLM/SenseVoiceSmall", BaseURL: srv.URL}
 	result, err := provider.Transcribe(context.Background(), Input{
-		AudioPath: writeAudio(t, 1024),
+		AudioPath: writeContainer(t),
 		Duration:  2 * time.Second,
 	})
 	if err != nil {
@@ -62,8 +68,9 @@ func TestSiliconFlowSendsFileAndModel(t *testing.T) {
 	if gotModel != "FunAudioLLM/SenseVoiceSmall" {
 		t.Errorf("model = %q", gotModel)
 	}
-	if gotFile != 1024 {
-		t.Errorf("uploaded bytes = %d, want 1024", gotFile)
+	/* 上传给服务商的是解码后的 WAV：应以 RIFF 开头且明显大于 Opus 原件。 */
+	if gotFile < 44 {
+		t.Errorf("uploaded bytes = %d, want a wav payload", gotFile)
 	}
 	if result.Text != "下午三点对进度" || result.TraceID != "trace-123" {
 		t.Errorf("result = %+v", result)
@@ -95,7 +102,7 @@ func TestSiliconFlowClassifiesErrors(t *testing.T) {
 
 			provider := &SiliconFlow{APIKey: "key", Model: "m", BaseURL: srv.URL}
 			_, err := provider.Transcribe(context.Background(), Input{
-				AudioPath: writeAudio(t, 16),
+				AudioPath: writeContainer(t),
 				Duration:  time.Second,
 			})
 			if err == nil {
@@ -110,17 +117,20 @@ func TestSiliconFlowClassifiesErrors(t *testing.T) {
 
 func TestSiliconFlowRequiresKey(t *testing.T) {
 	provider := &SiliconFlow{Model: "m", BaseURL: "http://127.0.0.1:1"}
-	_, err := provider.Transcribe(context.Background(), Input{AudioPath: writeAudio(t, 8)})
+	_, err := provider.Transcribe(context.Background(), Input{AudioPath: writeContainer(t)})
 	if !IsPermanent(err) {
 		t.Fatalf("error = %v, want permanent", err)
 	}
 }
 
-func TestSiliconFlowRejectsOversizeFile(t *testing.T) {
+func TestSiliconFlowRejectsUndecodableContainer(t *testing.T) {
+	/* 服务商限制针对解码后的 WAV，所以先失效容器会以"永久失败"报出而不是重试。 */
+	path := filepath.Join(t.TempDir(), "broken.memo")
+	if err := os.WriteFile(path, []byte("not a memo container"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
 	provider := &SiliconFlow{APIKey: "k", Model: "m", BaseURL: "http://127.0.0.1:1"}
-	_, err := provider.Transcribe(context.Background(), Input{
-		AudioPath: writeAudio(t, siliconflowMaxBytes+1),
-	})
+	_, err := provider.Transcribe(context.Background(), Input{AudioPath: path})
 	if !IsPermanent(err) {
 		t.Fatalf("error = %v, want permanent", err)
 	}

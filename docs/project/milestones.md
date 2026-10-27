@@ -119,9 +119,10 @@ Chinese typography.
 | --- | --- |
 | Wi-Fi | STA connect, credentials in NVS, reconnect policy |
 | Provisioning | BLUFI over NimBLE, started from settings, torn down afterwards |
-| Discovery | mDNS query, `/ping` and `/server` probe, limits adopted |
+| Discovery | mDNS query with SRV/A and an `ip=` TXT fallback, `/ping` and `/server` probe, limits adopted |
 | Upload | uploader task, idempotent retry, `.sent` / `.bad` marking |
-| Playback | streaming WAV from the server with Range resume |
+| Live updates | SSE subscription (`/api/v1/events`) so a finished transcription appears without polling |
+| Playback | the stored Opus container is downloaded and played locally; streaming straight from the server is still open |
 | Time | SNTP, timezone from settings |
 
 **Exit:**

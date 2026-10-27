@@ -10,7 +10,10 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
+
+	"github.com/tf4fun/voice-memo/server/internal/audio"
 )
 
 // Provider limits published by SiliconFlow: 50 MB and one hour per request.
@@ -49,23 +52,28 @@ func (s *SiliconFlow) Transcribe(ctx context.Context, in Input) (Result, error) 
 	}
 	defer file.Close()
 
-	info, err := file.Stat()
+	/* 存储的是 Opus 容器，服务商只吃 PCM WAV：这里在内存里解一次，
+	   解码结果不落盘，请求结束即释放。 */
+	wav, stats, err := audio.DecodeOpusToWAVBytes(file)
 	if err != nil {
-		return Result{}, fmt.Errorf("stat audio: %w", err)
+		return Result{}, fmt.Errorf("%w: decode container: %w", ErrPermanent, err)
 	}
-	if info.Size() > siliconflowMaxBytes {
-		return Result{}, fmt.Errorf("%w: file of %d bytes exceeds the provider limit",
-			ErrPermanent, info.Size())
+	if int64(len(wav)) > siliconflowMaxBytes {
+		return Result{}, fmt.Errorf("%w: decoded %d bytes exceeds the provider limit",
+			ErrPermanent, len(wav))
+	}
+	if in.Duration == 0 && stats.Duration > 0 {
+		in.Duration = stats.Duration
 	}
 
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
-	part, err := writer.CreateFormFile("file", filepath.Base(in.AudioPath))
+	part, err := writer.CreateFormFile("file", strings.TrimSuffix(filepath.Base(in.AudioPath), ".memo")+".wav")
 	if err != nil {
 		return Result{}, fmt.Errorf("build multipart: %w", err)
 	}
-	if _, err := io.Copy(part, file); err != nil {
-		return Result{}, fmt.Errorf("read audio: %w", err)
+	if _, err := part.Write(wav); err != nil {
+		return Result{}, fmt.Errorf("write audio: %w", err)
 	}
 	if err := writer.WriteField("model", s.Model); err != nil {
 		return Result{}, fmt.Errorf("build multipart: %w", err)

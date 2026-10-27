@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"bytes"
-	"encoding/binary"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -253,15 +252,13 @@ func TestAudioSupportsRange(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("audio status = %d", rec.Code)
 	}
-	if ct := rec.Header().Get("Content-Type"); ct != "audio/wav" {
+	/* 服务端存的是设备上传的 Opus 容器原件：转码只在转写时于内存里发生。 */
+	if ct := rec.Header().Get("Content-Type"); ct != "application/octet-stream" {
 		t.Errorf("content type = %q", ct)
 	}
 	body := rec.Body.Bytes()
-	if len(body) < 44 || string(body[0:4]) != "RIFF" {
-		t.Fatalf("audio is not a wav: % x", body[:min(12, len(body))])
-	}
-	if len(body)-44 != int(binary.LittleEndian.Uint32(body[40:44])) {
-		t.Errorf("wav data size does not match the payload")
+	if len(body) < 80 || string(body[0:4]) != "MEMO" {
+		t.Fatalf("audio is not a memo container: % x", body[:min(12, len(body))])
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/memos/"+id+"/audio", nil)
@@ -326,7 +323,7 @@ func TestAudioFilesLiveUnderTheDevice(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if !info.IsDir() && filepath.Base(path) == id+".wav" {
+		if !info.IsDir() && filepath.Base(path) == id+".memo" {
 			found = true
 		}
 		return nil
@@ -335,7 +332,7 @@ func TestAudioFilesLiveUnderTheDevice(t *testing.T) {
 		t.Fatalf("walk: %v", err)
 	}
 	if !found {
-		t.Errorf("no %s.wav under %s", id, env.dataDir)
+		t.Errorf("no %s.memo under %s", id, env.dataDir)
 	}
 }
 

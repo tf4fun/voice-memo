@@ -15,6 +15,7 @@ import (
 
 	"github.com/tf4fun/voice-memo/server/internal/audio"
 	"github.com/tf4fun/voice-memo/server/internal/domain"
+	"github.com/tf4fun/voice-memo/server/internal/events"
 	"github.com/tf4fun/voice-memo/server/internal/store"
 )
 
@@ -216,8 +217,9 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		recordedAt = now
 	}
 
+	/* 存原件（Opus 容器）：设备端能直接播放，转写时再按需在内存里解码成 WAV。 */
 	audioPath := filepath.Join(s.cfg.AudioDir(), deviceID,
-		time.Unix(recordedAt, 0).UTC().Format("200601"), memoID+".wav")
+		time.Unix(recordedAt, 0).UTC().Format("200601"), memoID+".memo")
 	if err := os.MkdirAll(filepath.Dir(audioPath), 0o755); err != nil {
 		s.log.Error("upload: create audio dir", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal", "storage unavailable")
@@ -232,23 +234,16 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer in.Close()
 
-	wav, err := os.Create(audioPath)
-	if err != nil {
-		s.log.Error("upload: create audio file", "error", err)
-		writeError(w, http.StatusInternalServerError, "internal", "storage unavailable")
-		return
-	}
-	stats, decodeErr := audio.DecodeOpusToWAV(in, wav)
-	wavErr := wav.Close()
-	if decodeErr != nil {
-		os.Remove(audioPath)
+	stats, validateErr := audio.ValidateContainer(in)
+	if validateErr != nil {
 		s.keepRejected(partPath, memoID)
-		writeContainerError(w, decodeErr)
+		writeContainerError(w, validateErr)
 		return
 	}
-	if wavErr != nil {
-		os.Remove(audioPath)
-		s.log.Error("upload: close audio file", "error", wavErr)
+
+	/* 校验通过后把临时文件挪到正式位置，内容原样保留。 */
+	if err := os.Rename(partPath, audioPath); err != nil {
+		s.log.Error("upload: move audio into place", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal", "storage unavailable")
 		return
 	}
@@ -293,6 +288,14 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.EnqueueJob(ctx, memoID, now); err != nil {
 		s.log.Error("upload: enqueue job", "error", err)
 	}
+
+	s.events.Publish(events.Event{
+		Type:       "memo",
+		ID:         memo.ID,
+		Status:     memo.Status,
+		RecordedAt: memo.RecordedAt,
+		DurationMS: memo.DurationMS,
+	})
 
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"id":          memoID,
@@ -455,7 +458,8 @@ func (s *Server) handleAudio(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "audio/wav")
 	w.Header().Set("Accept-Ranges", "bytes")
-	http.ServeContent(w, r, memo.ID+".wav", info.ModTime(), file)
+	w.Header().Set("Content-Type", "application/octet-stream")
+	http.ServeContent(w, r, memo.ID+".memo", info.ModTime(), file)
 }
 
 // handleTranscribe re-arms a failed or stale transcription.

@@ -1,8 +1,8 @@
-// Package audio turns a MEMO container into a WAV file.
+// Package audio reads the MEMO container the device uploads.
 //
-// The device uploads Opus frames; everything downstream (transcription, playback)
-// works with 16 kHz mono PCM, so the container is decoded exactly once at upload
-// time and the WAV becomes the canonical asset.
+// The container itself is the canonical asset: it is validated and stored as-is
+// so the device can play it back byte for byte. PCM exists only when a
+// transcription request needs it, decoded into memory and released afterwards.
 package audio
 
 import (
@@ -128,4 +128,88 @@ func writeWAVHeader(w io.WriteSeeker, sampleRate uint16, channels uint8, dataByt
 		return fmt.Errorf("seek to wav end: %w", err)
 	}
 	return nil
+}
+
+// memSeeker is an in-memory io.WriteSeeker. The WAV header is only complete
+// once every frame has been decoded, so a plain buffer is not enough.
+type memSeeker struct {
+	buf []byte
+	off int64
+}
+
+func (m *memSeeker) Write(p []byte) (int, error) {
+	end := m.off + int64(len(p))
+	if end > int64(len(m.buf)) {
+		m.buf = append(m.buf, make([]byte, end-int64(len(m.buf)))...)
+	}
+	copy(m.buf[m.off:], p)
+	m.off = end
+	return len(p), nil
+}
+
+func (m *memSeeker) Seek(offset int64, whence int) (int64, error) {
+	switch whence {
+	case io.SeekStart:
+		m.off = offset
+	case io.SeekCurrent:
+		m.off += offset
+	case io.SeekEnd:
+		m.off = int64(len(m.buf)) + offset
+	}
+	if m.off < 0 {
+		return 0, fmt.Errorf("negative seek offset")
+	}
+	return m.off, nil
+}
+
+// DecodeOpusToWAVBytes decodes a container into a WAV image held in memory.
+//
+// The device's upload is the canonical asset (Opus), so the PCM image only
+// exists for the duration of a transcription request and never touches disk.
+func DecodeOpusToWAVBytes(r io.Reader) ([]byte, Stats, error) {
+	mem := &memSeeker{}
+	stats, err := DecodeOpusToWAV(r, mem)
+	if err != nil {
+		return nil, Stats{}, err
+	}
+	return mem.buf, stats, nil
+}
+
+// ValidateContainer walks the container without decoding it, confirming that
+// the header matches the frames that follow. Upload uses it so the stored file
+// can stay Opus while still rejecting malformed input.
+func ValidateContainer(r io.Reader) (Stats, error) {
+	header, err := domain.ParseHeader(r)
+	if err != nil {
+		return Stats{}, err
+	}
+
+	frames := domain.NewFrameReader(r)
+	var (
+		count  uint32
+		bytes_ int64
+	)
+	for {
+		packet, err := frames.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return Stats{}, err
+		}
+		count++
+		bytes_ += int64(len(packet))
+	}
+
+	if header.FrameCount != 0 && header.FrameCount != count {
+		return Stats{}, fmt.Errorf("frame count: header says %d, found %d", header.FrameCount, count)
+	}
+
+	perFrame := int(header.FrameMS) * int(header.SampleRate) / 1000
+	return Stats{
+		Frames:   count,
+		Samples:  int(count) * perFrame,
+		Duration: time.Duration(count*uint32(header.FrameMS)) * time.Millisecond,
+		WAVBytes: bytes_,
+	}, nil
 }

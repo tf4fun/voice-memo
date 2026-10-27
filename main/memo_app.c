@@ -35,7 +35,9 @@
 #include "memo_ui_detail.h"
 #include "memo_player.h"
 #include "memo_settings.h"
+#include "memo_api.h"
 #include "memo_discovery.h"
+#include "memo_events.h"
 #include "memo_net.h"
 #include "memo_provision.h"
 #include "memo_ui_provision.h"
@@ -81,7 +83,8 @@ static lv_obj_t *s_sheet_shadow;
 static lv_obj_t *s_opt_save;
 static lv_obj_t *s_opt_cancel;
 static char s_last_id[37];
-static uint32_t s_detail_duration_ms; /* 详情页当前条目的时长，播放器未启动时用它 */
+static uint32_t s_detail_duration_ms;  /* 详情页当前条目的时长，播放器未启动时用它 */
+static bool s_rec_network_suspended;   /* 本次录音是否为了腾内存让出过网络 */
 
 /* ---------- 小工具 ---------- */
 static lv_obj_t *card_create(lv_obj_t *parent, int x, int y, int w, int h)
@@ -105,7 +108,8 @@ static void arm_ring_start(void)
     lv_anim_t anim;
     lv_anim_init(&anim);
     lv_anim_set_var(&anim, s_arm_arc);
-    lv_anim_set_values(&anim, 0, MEMO_ARMING_MS);
+    /* 弧的值域是 0..100；把毫秒直接当值会瞬间顶满，看起来像没有动画。 */
+    lv_anim_set_values(&anim, 0, 100);
     lv_anim_set_duration(&anim, MEMO_ARMING_MS);
     lv_anim_set_exec_cb(&anim, arc_anim_cb);
     lv_anim_start(&anim);
@@ -126,9 +130,20 @@ static void arm_timer_cb(void *arg)
 
 static bool s_warned;
 
+static void refresh_list(void);
+
 static void tick_timer_cb(void *arg)
 {
     (void)arg;
+
+    /* 列表页：服务端数据更新了就重绘一次。 */
+    if (s_sm.state == MEMO_STATE_LIST && memo_api_take_updated()) {
+        if (bsp_lvgl_lock(50)) {
+            refresh_list();
+            bsp_lvgl_unlock();
+        }
+        return;
+    }
 
     if (s_sm.state == MEMO_STATE_PROVISIONING) {
         if (bsp_lvgl_lock(50)) {
@@ -193,8 +208,17 @@ static lv_obj_t *s_row_time[LIST_ROWS];
 static lv_obj_t *s_row_text[LIST_ROWS];
 static lv_obj_t *s_row_dur[LIST_ROWS];
 static lv_obj_t *s_battery;
-static memo_spool_entry_t s_entries[MEMO_SPOOL_MAX_ENTRIES];
-static int s_entry_count;
+/* 一屏列表的统一视图：先是本地待上传，然后是服务端返回的历史。 */
+typedef struct {
+    bool local;      /* true = 本地待上传文件 */
+    char id[37];
+    int64_t recorded_at;
+    uint32_t duration_ms;
+    char text[80];
+} list_view_t;
+
+static list_view_t s_view[MEMO_API_MAX_ITEMS + 1];
+static int s_view_count;
 static int s_selected;
 
 static void build_list_page(void)
@@ -333,56 +357,74 @@ static void row_highlight(int index, bool selected)
     }
 }
 
-/* 扫描 spool 并重画列表。没有服务端之前，列表里只有本地待上传的录音。 */
+/* 组装列表视图并重画。本地待上传排在最前，其后是服务端历史。 */
 static void refresh_list(void)
 {
-    s_entry_count = memo_spool_scan(s_entries, MEMO_SPOOL_MAX_ENTRIES);
-    if (s_entry_count > MEMO_SPOOL_MAX_ENTRIES) s_entry_count = MEMO_SPOOL_MAX_ENTRIES;
-    if (s_selected >= s_entry_count) s_selected = s_entry_count > 0 ? s_entry_count - 1 : 0;
+    s_view_count = 0;
+
+    memo_spool_entry_t entries[MEMO_SPOOL_MAX_ENTRIES];
+    const int local = memo_spool_scan(entries, MEMO_SPOOL_MAX_ENTRIES);
+    for (int i = 0; i < local && i < MEMO_SPOOL_MAX_ENTRIES; i++) {
+        if (entries[i].state != MEMO_SPOOL_PENDING) continue;
+        if (s_view_count >= MEMO_API_MAX_ITEMS + 1) break;
+        list_view_t *row = &s_view[s_view_count++];
+        row->local = true;
+        strncpy(row->id, entries[i].id, sizeof(row->id) - 1);
+        row->recorded_at = (int64_t)entries[i].recorded_at;
+        row->duration_ms = entries[i].duration_ms;
+        snprintf(row->text, sizeof(row->text), "待上传");
+    }
+
+    const int remote = memo_api_count();
+    for (int i = 0; i < remote && s_view_count < MEMO_API_MAX_ITEMS + 1; i++) {
+        const memo_api_item_t *item = memo_api_item(i);
+        if (item == NULL) continue;
+        list_view_t *row = &s_view[s_view_count++];
+        row->local = false;
+        strncpy(row->id, item->id, sizeof(row->id) - 1);
+        row->recorded_at = item->recorded_at;
+        row->duration_ms = item->duration_ms;
+        if (item->snippet[0] != '\0') {
+            snprintf(row->text, sizeof(row->text), "%s", item->snippet);
+        } else if (strcmp(item->status, "ready") == 0) {
+            snprintf(row->text, sizeof(row->text), "无转写");
+        } else {
+            snprintf(row->text, sizeof(row->text), "转写中");
+        }
+    }
+
+    if (s_selected >= s_view_count) s_selected = s_view_count > 0 ? s_view_count - 1 : 0;
     if (s_selected < 0) s_selected = 0;
 
     const int32_t tz = memo_settings_get()->tz_offset_min;
 
     for (int i = 0; i < LIST_ROWS; i++) {
-        const bool used = i < s_entry_count;
-        lv_obj_t *objects[] = {s_rows[i], s_row_shadows[i]};
-        for (size_t k = 0; k < 2; k++) {
-            if (objects[k] == NULL) continue;
-            if (used) {
-                lv_obj_clear_flag(objects[k], LV_OBJ_FLAG_HIDDEN);
-            } else {
-                lv_obj_add_flag(objects[k], LV_OBJ_FLAG_HIDDEN);
-            }
-        }
+        const bool used = i < s_view_count;
+        memo_ui_card_visible(s_rows[i], s_row_shadows[i], used);
         if (!used) continue;
 
         char clock[8] = "--:--";
         char duration[16] = "0:00";
-        if (s_entries[i].recorded_at > 0) {
-            memo_time_clock((int64_t)s_entries[i].recorded_at, tz, clock, sizeof(clock));
-            memo_time_duration((int64_t)s_entries[i].duration_ms, duration, sizeof(duration));
+        if (s_view[i].recorded_at > 0) {
+            memo_time_clock(s_view[i].recorded_at, tz, clock, sizeof(clock));
+            memo_time_duration((int64_t)s_view[i].duration_ms, duration, sizeof(duration));
         }
         lv_label_set_text(s_row_time[i], clock);
-        /* 转写文本要等服务端转写完成，这里先如实写上传状态。 */
-        const char *text = "待上传";
-        switch (memo_upload_state()) {
-        case MEMO_UPLOAD_DISCOVERING: text = "找服务器"; break;
-        case MEMO_UPLOAD_SENDING: text = "上传中"; break;
-        case MEMO_UPLOAD_FAILED: text = "上传失败"; break;
-        default: text = s_entries[i].recorded_at ? "待上传" : "待上传·未对时"; break;
-        }
-        lv_label_set_text(s_row_text[i], text);
+        lv_label_set_text(s_row_text[i], s_view[i].text);
         lv_label_set_text(s_row_dur[i], duration);
         row_highlight(i, i == s_selected);
     }
 
-    if (s_entry_count == 0) {
-        lv_label_set_text(s_list_status, "还没有录音");
+    char status[32];
+    if (s_view_count == 0) {
+        snprintf(status, sizeof(status), "还没有录音");
+    } else if (memo_api_count() == 0 && memo_net_has_ip()) {
+        snprintf(status, sizeof(status), "%d 条", s_view_count);
     } else {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%d 条待上传", s_entry_count);
-        lv_label_set_text(s_list_status, buf);
+        snprintf(status, sizeof(status), "%d 条", s_view_count);
     }
+    lv_label_set_text(s_list_status, status);
+    lv_obj_set_style_text_color(s_list_status, lv_color_hex(VM_MUTED), 0);
 
     int soc = bsp_battery_soc();
     if (soc < 0) {
@@ -393,8 +435,33 @@ static void refresh_list(void)
         lv_label_set_text(s_battery, buf);
     }
 
-    ESP_LOGI(TAG, "list: %d entr%s, free=%u KB", s_entry_count,
-             s_entry_count == 1 ? "y" : "ies", (unsigned)(memo_spool_free_bytes() / 1024));
+    ESP_LOGI(TAG, "list: %d row(s) (%d local, %d remote), free=%u KB", s_view_count,
+             local, memo_api_count(), (unsigned)(memo_spool_free_bytes() / 1024));
+}
+
+/* 播放当前选中项：本地文件直接播，服务端条目先下载到 SPIFFS 的临时文件。 */
+static void play_selected(void)
+{
+    if (s_selected >= s_view_count) return;
+    const list_view_t *row = &s_view[s_selected];
+
+    if (memo_player_is_active()) memo_player_stop();
+
+    if (row->local) {
+        if (memo_player_play(row->id) == ESP_OK) {
+            ESP_LOGI(TAG, "playing local %s", row->id);
+        } else {
+            ESP_LOGE(TAG, "play failed");
+        }
+        return;
+    }
+
+    /* 下载在播放任务内部完成：按键任务不能在这里阻塞，否则整个输入队列会停。 */
+    if (memo_player_play_remote(row->id) == ESP_OK) {
+        ESP_LOGI(TAG, "streaming %s from server", row->id);
+    } else {
+        ESP_LOGE(TAG, "remote play failed");
+    }
 }
 
 /* ---------- 动作执行 ---------- */
@@ -435,9 +502,6 @@ static void execute(memo_action_t action)
         break;
 
     case MEMO_ACT_BEGIN_RECORDING: {
-        /* 录音任务需要 28 KB 连续栈，WiFi 在时会占掉最大连续块。
-           录音本身不需要网络，按"一次只做一件事"的思路先让出 WiFi。 */
-        memo_net_suspend();
         char id[37];
         uint8_t random[16];
         esp_fill_random(random, sizeof(random));
@@ -446,7 +510,17 @@ static void execute(memo_action_t action)
         ESP_LOGI(TAG, "recording start: free heap %u (largest block %u)",
                  (unsigned)esp_get_free_heap_size(),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+        /* 录音要 28 KB 连续栈 + 24.6 KB 编码器。网络常驻后通常仍有余量，
+           先直接开；实在不够才让网络暂时让位（并记下来，停止后还要还回去）。 */
         esp_err_t err = memo_recorder_start(id);
+        if (err == ESP_ERR_NO_MEM) {
+            ESP_LOGW(TAG, "no room for the recorder, standing the network down");
+            memo_events_stop();
+            memo_net_suspend();
+            s_rec_network_suspended = true;
+            err = memo_recorder_start(id);
+        }
+
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "recorder start failed: %s", esp_err_to_name(err));
             if (bsp_lvgl_lock(200)) {
@@ -457,7 +531,13 @@ static void execute(memo_action_t action)
                 }
                 bsp_lvgl_unlock();
             }
-            /* 回到可操作状态，而不是把一个非法迁移塞进状态机。 */
+            /* 回到可操作状态，而不是把一个非法迁移塞进状态机。
+               录音没开起来，被让出的网络要还回去。 */
+            if (s_rec_network_suspended) {
+                s_rec_network_suspended = false;
+                memo_net_start();
+                memo_events_start();
+            }
             s_sm.state = MEMO_STATE_LIST;
             break;
         }
@@ -489,10 +569,16 @@ static void execute(memo_action_t action)
         if (err == ESP_OK) {
             ESP_LOGI(TAG, "recorded %s (%u ms, %u bytes)",
                      result.id, (unsigned)result.duration_ms, (unsigned)result.size_bytes);
-            /* 有了待上传的录音才拉起上传任务。 */
             memo_upload_start();
+        memo_events_start();
         } else {
             ESP_LOGE(TAG, "recorder stop: %s", esp_err_to_name(err));
+        }
+
+        if (s_rec_network_suspended) {
+            s_rec_network_suspended = false;
+            ESP_LOGI(TAG, "restart network: %s", esp_err_to_name(memo_net_start()));
+            memo_events_start();
         }
         if (bsp_lvgl_lock(200)) {
             sheet_visible(true);
@@ -542,7 +628,7 @@ static void execute(memo_action_t action)
         break;
 
     case MEMO_ACT_SELECT_NEXT:
-        if (s_selected + 1 < s_entry_count) s_selected++;
+        if (s_selected + 1 < s_view_count) s_selected++;
         if (bsp_lvgl_lock(100)) {
             refresh_list();
             bsp_lvgl_unlock();
@@ -551,6 +637,7 @@ static void execute(memo_action_t action)
 
     case MEMO_ACT_BACK_TO_LIST:
         memo_player_stop();
+        memo_player_drop_cache();
         esp_timer_stop(s_tick_timer);
         if (bsp_lvgl_lock(200)) {
             show_screen(s_list_screen);
@@ -560,15 +647,26 @@ static void execute(memo_action_t action)
         break;
 
     case MEMO_ACT_OPEN_DETAIL: {
-        if (s_selected >= s_entry_count) {
+        if (s_selected >= s_view_count) {
             ESP_LOGI(TAG, "nothing selected");
             s_sm.state = MEMO_STATE_LIST;
             break;
         }
-        const memo_spool_entry_t *entry = &s_entries[s_selected];
+        const list_view_t *entry = &s_view[s_selected];
+
+        /* 服务端条目：拉一次转写全文；拿不到就留空，详情页会给出说明。 */
+        char transcript[512];
+        transcript[0] = '\0';
+        if (!entry->local) {
+            if (memo_api_fetch_transcript(entry->id, transcript, sizeof(transcript)) != ESP_OK) {
+                transcript[0] = '\0';
+            }
+        }
+
         if (bsp_lvgl_lock(200)) {
             if (memo_ui_detail_screen() == NULL) memo_ui_detail_build();
-            memo_ui_detail_show((int64_t)entry->recorded_at, entry->duration_ms, NULL);
+            memo_ui_detail_show(entry->recorded_at, entry->duration_ms,
+                                transcript[0] != '\0' ? transcript : NULL);
             /* 没有转写文本时"展开"在屏幕上看不出变化，会让第一次点击像没反应。
                此时直接按"已展开"进入，第一下 OK 就开始播放。 */
             memo_ui_detail_set_expanded(true);
@@ -579,11 +677,8 @@ static void execute(memo_action_t action)
         s_sm.state = MEMO_STATE_DETAIL_EXPANDED;
 
         if (memo_settings_get()->autoplay) {
-            if (memo_player_is_active()) memo_player_stop();
-            if (memo_player_play(entry->id) == ESP_OK) {
-                s_sm.state = MEMO_STATE_PLAYING;
-                ESP_LOGI(TAG, "autoplay %s", entry->id);
-            }
+            play_selected();
+            if (memo_player_is_active()) s_sm.state = MEMO_STATE_PLAYING;
         }
         esp_timer_start_periodic(s_tick_timer, 200 * 1000);
         ESP_LOGI(TAG, "detail: %s (%u ms)", entry->id, (unsigned)entry->duration_ms);
@@ -598,17 +693,9 @@ static void execute(memo_action_t action)
         break;
 
     case MEMO_ACT_PLAY:
-    case MEMO_ACT_RESUME: {
-        if (s_selected >= s_entry_count) break;
-        const char *id = s_entries[s_selected].id;
-        if (memo_player_is_active()) memo_player_stop();
-        if (memo_player_play(id) == ESP_OK) {
-            ESP_LOGI(TAG, "playing %s", id);
-        } else {
-            ESP_LOGE(TAG, "play failed");
-        }
+    case MEMO_ACT_RESUME:
+        play_selected();
         break;
-    }
 
     case MEMO_ACT_PAUSE:
         /* M3 只支持"停止后从头再播"；真正的暂停/续播随 M4 的流式播放一起做。 */
@@ -622,12 +709,21 @@ static void execute(memo_action_t action)
 
     case MEMO_ACT_NEXT_MEMO:
     case MEMO_ACT_PREV_MEMO: {
-        if (action == MEMO_ACT_NEXT_MEMO && s_selected + 1 < s_entry_count) s_selected++;
+        if (action == MEMO_ACT_NEXT_MEMO && s_selected + 1 < s_view_count) s_selected++;
         if (action == MEMO_ACT_PREV_MEMO && s_selected > 0) s_selected--;
-        const memo_spool_entry_t *entry = &s_entries[s_selected];
-        s_detail_duration_ms = entry->duration_ms;
+        const list_view_t *row = &s_view[s_selected];
+        s_detail_duration_ms = row->duration_ms;
+
+        char transcript[512];
+        transcript[0] = '\0';
+        if (!row->local) {
+            if (memo_api_fetch_transcript(row->id, transcript, sizeof(transcript)) != ESP_OK) {
+                transcript[0] = '\0';
+            }
+        }
         if (bsp_lvgl_lock(200)) {
-            memo_ui_detail_show((int64_t)entry->recorded_at, entry->duration_ms, NULL);
+            memo_ui_detail_show(row->recorded_at, row->duration_ms,
+                                transcript[0] != '\0' ? transcript : NULL);
             bsp_lvgl_unlock();
         }
         break;
@@ -653,6 +749,7 @@ static void execute(memo_action_t action)
     case MEMO_ACT_SUB_PAGE_ENTER:
         if (memo_ui_settings_row() == MEMO_SETTING_NETWORK) {
             /* 网络行不是子页，而是进入蓝牙配网。 */
+            memo_events_stop();
             memo_upload_stop();      /* 上传也要让出 WiFi */
             memo_discovery_stop();   /* 连同 mDNS 的十几 KB 一起收回 */
             memo_net_suspend();
@@ -770,6 +867,14 @@ void app_main(void)
 
     ESP_LOGI(TAG, "heap after boot: %u", (unsigned)esp_get_free_heap_size());
 
+    /* 常驻的 200 ms 心跳：录音计时、播放进度、列表刷新都靠它。 */
+    const esp_timer_create_args_t tick_args = {.callback = tick_timer_cb, .name = "memo_tick"};
+    if (esp_timer_create(&tick_args, &s_tick_timer) != ESP_OK) {
+        ESP_LOGE(TAG, "cannot create tick timer");
+    } else {
+        esp_timer_start_periodic(s_tick_timer, 200 * 1000);
+    }
+
     if (memo_settings_init() != ESP_OK) {
         ESP_LOGW(TAG, "settings unavailable; using defaults");
     }
@@ -793,12 +898,8 @@ void app_main(void)
     const esp_timer_create_args_t arm_args = {
         .callback = arm_timer_cb, .name = "memo_arm",
     };
-    const esp_timer_create_args_t tick_args = {
-        .callback = tick_timer_cb, .name = "memo_tick",
-    };
-    if (esp_timer_create(&arm_args, &s_arm_timer) != ESP_OK ||
-        esp_timer_create(&tick_args, &s_tick_timer) != ESP_OK) {
-        ESP_LOGE(TAG, "cannot create timers");
+    if (esp_timer_create(&arm_args, &s_arm_timer) != ESP_OK) {
+        ESP_LOGE(TAG, "cannot create arming timer");
         return;
     }
 
@@ -858,10 +959,24 @@ void app_main(void)
     if (memo_net_start() != ESP_OK) {
         ESP_LOGW(TAG, "network start failed");
     }
-    /* 上传任务按需启动：空闲时不占 8 KB 栈，把堆留给配网。 */
-    if (memo_upload_pending() && memo_upload_start() != ESP_OK) {
+    /* 常驻的网络 worker：空闲时拉列表，有待上传就上传。配网会让它让位。 */
+    ESP_LOGI(TAG, "heap after wifi: %u (largest %u)",
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+
+    if (memo_upload_start() != ESP_OK) {
         ESP_LOGW(TAG, "uploader start failed");
     }
+    ESP_LOGI(TAG, "heap after uploader: %u (largest %u)",
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+
+    if (memo_events_start() != ESP_OK) {
+        ESP_LOGW(TAG, "event subscriber start failed");
+    }
+    ESP_LOGI(TAG, "heap after subscriber: %u (largest %u)",
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
     if (bsp_button_init(on_key, NULL) != ESP_OK) {
         ESP_LOGE(TAG, "button init failed");

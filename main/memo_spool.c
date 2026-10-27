@@ -145,7 +145,8 @@ static bool parse_name(const char *name, memo_spool_entry_t *entry)
     if (dot == NULL) return false;
 
     size_t id_len = (size_t)(dot - name);
-    if (id_len == 0 || id_len >= sizeof(entry->id)) return false;
+    /* 只认 36 字符的带连字符 UUID：/spool 下的临时文件（play.memo 等）不是录音。 */
+    if (id_len != 36 || id_len >= sizeof(entry->id)) return false;
     memcpy(entry->id, name, id_len);
     entry->id[id_len] = '\0';
 

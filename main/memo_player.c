@@ -13,6 +13,7 @@
 #include "esp_system.h"
 
 #include "bsp_audio.h"
+#include "memo_api.h"
 #include "memo_container.h"
 #include "memo_spool.h"
 
@@ -27,7 +28,8 @@ static void *s_decoder;
 static TaskHandle_t s_task;
 static SemaphoreHandle_t s_done;
 static volatile bool s_active;
-static char s_id[37];
+static char s_path[80];
+static char s_remote_id[37]; /* 非空表示要先下载 */
 static bool s_ready;
 static volatile uint32_t s_position_ms;
 static volatile uint32_t s_duration_ms;
@@ -74,8 +76,18 @@ static void player_task(void *arg)
 {
     (void)arg;
 
-    char path[64];
-    snprintf(path, sizeof(path), "%s/%s.memo", MEMO_SPOOL_MOUNT_POINT, s_id);
+    if (s_remote_id[0] != '\0') {
+        snprintf(s_path, sizeof(s_path), "%s", MEMO_PLAYER_CACHE_PATH);
+        remove(s_path);
+        if (memo_api_download_audio(s_remote_id, s_path) != ESP_OK) {
+            ESP_LOGE(TAG, "download failed for %s", s_remote_id);
+            s_remote_id[0] = '\0';
+            goto done;
+        }
+        s_remote_id[0] = '\0';
+    }
+
+    const char *path = s_path;
 
     FILE *file = fopen(path, "rb");
     if (file == NULL) {
@@ -162,12 +174,21 @@ done:
 
 esp_err_t memo_player_play(const char *id)
 {
-    if (!s_ready) return ESP_ERR_INVALID_STATE;
     if (id == NULL || strlen(id) != 36) return ESP_ERR_INVALID_ARG;
+
+    char path[80];
+    snprintf(path, sizeof(path), "%s/%s.memo", MEMO_SPOOL_MOUNT_POINT, id);
+    return memo_player_play_file(path);
+}
+
+esp_err_t memo_player_play_file(const char *path)
+{
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
+    if (path == NULL || path[0] == '\0') return ESP_ERR_INVALID_ARG;
     if (s_active) return ESP_ERR_INVALID_STATE;
 
-    strncpy(s_id, id, sizeof(s_id) - 1);
-    s_id[sizeof(s_id) - 1] = '\0';
+    strncpy(s_path, path, sizeof(s_path) - 1);
+    s_path[sizeof(s_path) - 1] = '\0';
     s_active = true;
 
     if (xTaskCreate(player_task, "memo_play", PLAYER_STACK, NULL, 5, &s_task) != pdPASS) {
@@ -175,6 +196,31 @@ esp_err_t memo_player_play(const char *id)
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
+}
+
+esp_err_t memo_player_play_remote(const char *id)
+{
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
+    if (id == NULL || strlen(id) != 36) return ESP_ERR_INVALID_ARG;
+    if (s_active) return ESP_ERR_INVALID_STATE;
+
+    strncpy(s_remote_id, id, sizeof(s_remote_id) - 1);
+    s_remote_id[sizeof(s_remote_id) - 1] = '\0';
+    snprintf(s_path, sizeof(s_path), "%s", MEMO_PLAYER_CACHE_PATH);
+    s_active = true;
+
+    if (xTaskCreate(player_task, "memo_play", PLAYER_STACK, NULL, 5, &s_task) != pdPASS) {
+        s_active = false;
+        s_remote_id[0] = '\0';
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+void memo_player_drop_cache(void)
+{
+    if (s_active) return;
+    remove(MEMO_PLAYER_CACHE_PATH);
 }
 
 esp_err_t memo_player_stop(void)

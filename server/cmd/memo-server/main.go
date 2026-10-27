@@ -18,6 +18,7 @@ import (
 
 	"github.com/tf4fun/voice-memo/server/internal/asr"
 	"github.com/tf4fun/voice-memo/server/internal/config"
+	"github.com/tf4fun/voice-memo/server/internal/events"
 	"github.com/tf4fun/voice-memo/server/internal/discovery"
 	"github.com/tf4fun/voice-memo/server/internal/httpapi"
 	"github.com/tf4fun/voice-memo/server/internal/jobs"
@@ -89,9 +90,12 @@ func serve(args []string) error {
 		return err
 	}
 
+	hub := events.NewHub()
+	handler := httpapi.NewWithEvents(st, cfg, logger, hub)
+
 	runCtx, stopWorkers := context.WithCancel(context.Background())
 	defer stopWorkers()
-	go (&jobs.Runner{Store: st, Transcriber: transcriber, Log: logger}).Run(runCtx)
+	go (&jobs.Runner{Store: st, Transcriber: transcriber, Log: logger, Events: hub}).Run(runCtx)
 
 	port := listenPort(cfg.Addr)
 	publisher, err := discovery.Advertise(cfg.MDNSName, port, logger)
@@ -100,7 +104,6 @@ func serve(args []string) error {
 	}
 	defer publisher.Close()
 
-	handler := httpapi.New(st, cfg, logger)
 	srv := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           handler,

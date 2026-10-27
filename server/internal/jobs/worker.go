@@ -13,6 +13,7 @@ import (
 
 	"github.com/tf4fun/voice-memo/server/internal/asr"
 	"github.com/tf4fun/voice-memo/server/internal/domain"
+	"github.com/tf4fun/voice-memo/server/internal/events"
 	"github.com/tf4fun/voice-memo/server/internal/store"
 )
 
@@ -30,6 +31,8 @@ type Runner struct {
 	Poll        time.Duration
 	// Now is injectable so tests do not sleep.
 	Now func() time.Time
+	// Events is optional; when set, status changes are pushed to subscribers.
+	Events *events.Hub
 }
 
 // Run processes jobs until ctx is cancelled.
@@ -84,6 +87,7 @@ func (r *Runner) RunOnce(ctx context.Context) (bool, error) {
 	if err := r.Store.SetStatus(ctx, memoID, domain.StatusTranscribing, ""); err != nil {
 		return true, err
 	}
+	r.publish(memoID, domain.StatusTranscribing, "")
 
 	result, transcribeErr := r.Transcriber.Transcribe(ctx, asr.Input{
 		AudioPath: memo.AudioPath,
@@ -99,6 +103,7 @@ func (r *Runner) RunOnce(ctx context.Context) (bool, error) {
 			if err := r.Store.SetStatus(ctx, memoID, domain.StatusFailed, transcribeErr.Error()); err != nil {
 				return true, err
 			}
+			r.publish(memoID, domain.StatusFailed, "")
 			return true, r.Store.FinishJob(ctx, memoID)
 		}
 
@@ -118,9 +123,20 @@ func (r *Runner) RunOnce(ctx context.Context) (bool, error) {
 		result.Provider, result.Model, result.TraceID); err != nil {
 		return true, err
 	}
+	r.publish(memoID, domain.StatusReady, result.Text)
 	r.log().Info("transcription ready",
 		"memo", memoID, "provider", result.Provider, "chars", len(result.Text))
 	return true, r.Store.FinishJob(ctx, memoID)
+}
+
+// publish pushes a status change when a hub is configured. It reports the
+// snippet so the device can render the row without another request.
+func (r *Runner) publish(memoID, status, snippet string) {
+	if r.Events == nil {
+		return
+	}
+	ev := events.Event{Type: "memo", ID: memoID, Status: status, Snippet: snippet}
+	r.Events.Publish(ev)
 }
 
 func (r *Runner) now() time.Time {

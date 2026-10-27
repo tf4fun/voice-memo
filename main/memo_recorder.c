@@ -77,12 +77,17 @@ esp_err_t memo_recorder_init(void)
     cfg.enable_dtx = false; /* 存档要每帧齐全，DTX 会吞掉静音帧 */
     cfg.enable_vbr = true;
 
+    const uint32_t heap_before = esp_get_free_heap_size();
     esp_audio_err_t aerr = esp_opus_enc_open(&cfg, sizeof(cfg), &s_encoder);
     if (aerr != ESP_AUDIO_ERR_OK) {
         ESP_LOGE(TAG, "opus encoder open failed: %d", (int)aerr);
         s_encoder = NULL;
         return ESP_FAIL;
     }
+    /* 编码器是这个应用最贵的一次性分配：记下它真实吃多少，才知道录音的余量够不够。 */
+    ESP_LOGI(TAG, "opus encoder holds %u bytes (free heap %u)",
+             (unsigned)(heap_before - esp_get_free_heap_size()),
+             (unsigned)esp_get_free_heap_size());
 
     if (esp_opus_enc_get_frame_size(s_encoder, &s_in_frame_bytes, &s_out_frame_bytes) !=
             ESP_AUDIO_ERR_OK ||

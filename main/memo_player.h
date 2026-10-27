@@ -14,6 +14,16 @@ esp_err_t memo_player_init(void);
 /* 播放 spool 里的一条录音，返回后播放仍在后台进行。 */
 esp_err_t memo_player_play(const char *id);
 
+/* 播放任意路径上的容器文件（服务端下载的临时文件用）。 */
+esp_err_t memo_player_play_file(const char *path);
+
+/* 播放服务端的一条：下载在播放任务内部完成，调用方立刻返回。 */
+esp_err_t memo_player_play_remote(const char *id);
+
+/* 下载缓存文件路径，退出详情页时清掉。 */
+#define MEMO_PLAYER_CACHE_PATH "/spool/play.memo"
+void memo_player_drop_cache(void);
+
 /* 停止播放并等待任务退出。 */
 esp_err_t memo_player_stop(void);
 

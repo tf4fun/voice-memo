@@ -13,6 +13,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
+#include "memo_api.h"
 #include "memo_discovery.h"
 #include "memo_net.h"
 #include "memo_spool.h"
@@ -28,6 +29,12 @@ static volatile memo_upload_state_t s_state = MEMO_UPLOAD_IDLE;
 static TaskHandle_t s_task;
 static SemaphoreHandle_t s_done;
 static volatile bool s_running;
+static unsigned s_idle_ticks = 30; /* 首次空闲就立刻拉一次列表 */
+static bool s_hot;                 /* 刚上传完：转写结果很快会回来 */
+
+/* 空闲轮询：热窗口内 2 秒一次，否则 60 秒一次。 */
+#define IDLE_TICKS_HOT 1
+#define IDLE_TICKS_COLD 30
 static char s_error[64];
 static char s_device_id[13];
 static uint32_t s_backoff_ms = UPLOAD_RETRY_MIN_MS;
@@ -71,6 +78,16 @@ static bool upload_once(const memo_spool_entry_t *entry)
             set_error("server not found");
             return false;
         }
+    }
+
+    const uint32_t server_max = memo_api_max_memo_ms();
+    if (server_max > 0 && entry->duration_ms > server_max) {
+        ESP_LOGE(TAG, "memo %s is %u ms, server limit is %u ms: discarding",
+                 entry->id, (unsigned)entry->duration_ms, (unsigned)server_max);
+        snprintf(s_error, sizeof(s_error), "longer than server limit");
+        memo_spool_set_state(entry->id, MEMO_SPOOL_BAD);
+        s_state = MEMO_UPLOAD_FAILED;
+        return true;
     }
 
     char path[64];
@@ -142,6 +159,8 @@ static bool upload_once(const memo_spool_entry_t *entry)
         ESP_LOGI(TAG, "uploaded %s (%u bytes), status %d", entry->id,
                  (unsigned)entry->size, code);
         memo_spool_remove(entry->id, MEMO_SPOOL_PENDING);
+        memo_api_refresh(); /* 让列表立刻能看到这条的转写结果 */
+        s_hot = true;       /* 接下来几秒内转写就会完成，密切轮询 */
         s_state = MEMO_UPLOAD_IDLE;
         s_backoff_ms = UPLOAD_RETRY_MIN_MS;
         return true;
@@ -167,11 +186,28 @@ static void upload_task(void *arg)
     (void)arg;
     derive_device_id();
     ESP_LOGI(TAG, "uploader running, device id %s", s_device_id);
+    bool primed = false;
 
     while (s_running) {
+        /* 一有网就先拉一次整表：否则缓存是空的，上传完成那一刻列表会"只剩一条"。 */
+        if (!primed && memo_net_has_ip()) {
+            /* 先确认这条 mDNS 记录真的可用，再谈上传。 */
+            if (memo_api_probe() == ESP_OK) {
+                primed = memo_api_refresh() == ESP_OK;
+            }
+        }
+
         memo_spool_entry_t entry;
         if (!pending_entry(&entry)) {
             s_state = MEMO_UPLOAD_IDLE;
+            /* 轮询列表：刚上传完的那几秒用快节奏等转写，之后退回低频心跳。 */
+            const unsigned threshold = s_hot ? IDLE_TICKS_HOT : IDLE_TICKS_COLD;
+            if (memo_net_has_ip() && ++s_idle_ticks >= threshold) {
+                s_idle_ticks = 0;
+                if (memo_api_refresh() == ESP_OK && memo_api_all_terminal()) {
+                    s_hot = false;
+                }
+            }
             vTaskDelay(pdMS_TO_TICKS(UPLOAD_POLL_MS));
             continue;
         }
