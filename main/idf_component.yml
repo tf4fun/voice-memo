@@ -4,3 +4,4 @@
 ## its own manifest. `dependencies.lock` pins whatever this resolves to.
 dependencies:
   espressif/esp_audio_codec: "^2.5.0"
+  espressif/mdns: "^1.8.0"

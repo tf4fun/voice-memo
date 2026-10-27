@@ -32,10 +32,12 @@
 #include "memo_ui_detail.h"
 #include "memo_player.h"
 #include "memo_settings.h"
+#include "memo_discovery.h"
 #include "memo_net.h"
 #include "memo_provision.h"
 #include "memo_ui_provision.h"
 #include "memo_ui_settings.h"
+#include "memo_upload.h"
 #include "memo_state.h"
 #include "memo_time.h"
 
@@ -358,8 +360,15 @@ static void refresh_list(void)
             memo_time_duration((int64_t)s_entries[i].duration_ms, duration, sizeof(duration));
         }
         lv_label_set_text(s_row_time[i], clock);
-        /* 转写文本要等 M4 与服务端连通，这里先如实写"待上传"。 */
-        lv_label_set_text(s_row_text[i], s_entries[i].recorded_at ? "待上传" : "时间未知");
+        /* 转写文本要等服务端转写完成，这里先如实写上传状态。 */
+        const char *text = "待上传";
+        switch (memo_upload_state()) {
+        case MEMO_UPLOAD_DISCOVERING: text = "找服务器"; break;
+        case MEMO_UPLOAD_SENDING: text = "上传中"; break;
+        case MEMO_UPLOAD_FAILED: text = "上传失败"; break;
+        default: text = s_entries[i].recorded_at ? "待上传" : "待上传·未对时"; break;
+        }
+        lv_label_set_text(s_row_text[i], text);
         lv_label_set_text(s_row_dur[i], duration);
         row_highlight(i, i == s_selected);
     }
@@ -395,6 +404,17 @@ static void execute(memo_action_t action)
 {
     switch (action) {
     case MEMO_ACT_START_ARMING:
+        if (memo_upload_pending()) {
+            /* 局部存储是"处理中"状态：上一条没走完就不开始新的一条。 */
+            ESP_LOGW(TAG, "recording blocked: previous memo is still being uploaded");
+            if (bsp_lvgl_lock(150)) {
+                lv_label_set_text(s_list_status, "上一条待上传");
+                lv_obj_set_style_text_color(s_list_status, lv_color_hex(VM_CORAL), 0);
+                bsp_lvgl_unlock();
+            }
+            s_sm.state = MEMO_STATE_LIST;
+            break;
+        }
         if (bsp_lvgl_lock(100)) {
             arm_ring_start();
             bsp_lvgl_unlock();
@@ -628,7 +648,8 @@ static void execute(memo_action_t action)
     case MEMO_ACT_SUB_PAGE_ENTER:
         if (memo_ui_settings_row() == MEMO_SETTING_NETWORK) {
             /* 网络行不是子页，而是进入蓝牙配网。 */
-            memo_net_suspend(); /* 配网要独占 WiFi */
+            memo_upload_stop();  /* 上传也要让出 WiFi */
+            memo_net_suspend();
             if (memo_provision_start() == ESP_OK) {
                 s_sm.state = MEMO_STATE_PROVISIONING;
                 if (bsp_lvgl_lock(200)) {
@@ -825,6 +846,9 @@ void app_main(void)
     /* 有凭据就自己连上；没有则等用户从设置里配网。 */
     if (memo_net_start() != ESP_OK) {
         ESP_LOGW(TAG, "network start failed");
+    }
+    if (memo_upload_start() != ESP_OK) {
+        ESP_LOGW(TAG, "uploader start failed");
     }
 
     if (bsp_button_init(on_key, NULL) != ESP_OK) {
