@@ -8,8 +8,11 @@
 /* 建页面（默认隐藏）。需持 LVGL 锁调用。 */
 void memo_ui_settings_build(void);
 
-/* 每次进入设置页时刷新一次显示值。需持 LVGL 锁调用。 */
+/* 每次进入设置页时刷新一次显示值（会收起子页）。需持 LVGL 锁调用。 */
 void memo_ui_settings_refresh(void);
+
+/* 只刷新各行数值，不影响当前打开的子页。需持 LVGL 锁调用。 */
+void memo_ui_settings_refresh_values(void);
 
 /* 选中项移动，返回当前行号。需持 LVGL 锁调用。 */
 int memo_ui_settings_move(int direction);

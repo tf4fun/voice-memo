@@ -4,6 +4,7 @@
 #include <stdio.h>
 
 #include "memo_font.h"
+#include "memo_discovery.h"
 #include "memo_net.h"
 #include "memo_settings.h"
 #include "memo_spool.h"
@@ -72,7 +73,19 @@ static void format_value(int row, char *buf, size_t cap)
         }
         break;
     case ROW_SERVER:
-        snprintf(buf, cap, "未发现");
+        /* 显示实际发现到的服务端，而不是一句写死的"未发现"。 */
+        switch (memo_discovery_state()) {
+        case MEMO_DISCOVERY_FOUND:
+            snprintf(buf, cap, "%s:%u", memo_discovery_host(),
+                     (unsigned)memo_discovery_port());
+            break;
+        case MEMO_DISCOVERY_SEARCHING:
+            snprintf(buf, cap, "查找中");
+            break;
+        default:
+            snprintf(buf, cap, "未发现");
+            break;
+        }
         break;
     case ROW_VOLUME:
         snprintf(buf, cap, "%u%%", st->volume);
@@ -115,7 +128,7 @@ static void sheet_visible(bool visible)
     memo_ui_card_visible(s_sheet, s_sheet_shadow, visible);
     s_in_sheet = visible;
     lv_obj_set_style_text_color(s_hint, lv_color_hex(VM_MUTED), 0);
-    lv_label_set_text(s_hint, visible ? "上下调值 · OK 保存 · 长按取消" : "上下选择 · OK 进入 · 长按返回");
+    lv_label_set_text(s_hint, visible ? "上下调值 · OK 保存 · 长按取消" : "上下选择 · OK 进入 · 长按退出");
 }
 
 void memo_ui_settings_build(void)
@@ -151,7 +164,7 @@ void memo_ui_settings_build(void)
 
     s_hint = memo_ui_label(s_screen, memo_font_label(), VM_MUTED);
     lv_obj_align(s_hint, LV_ALIGN_BOTTOM_LEFT, VM_INSET + 4, -VM_INSET - 2);
-    lv_label_set_text(s_hint, "上下选择 · OK 进入 · 长按返回");
+    lv_label_set_text(s_hint, "上下选择 · OK 进入 · 长按退出");
 
     /* 子页：一张居中的卡片，显示当前项与值。 */
     s_sheet = memo_ui_card(s_screen, VM_INSET + 16, 96, card_w - 32, 96, &s_sheet_shadow);
@@ -171,7 +184,12 @@ void memo_ui_settings_refresh(void)
     refresh_rows();
     memo_ui_card_visible(s_sheet, s_sheet_shadow, false);
     s_in_sheet = false;
-    lv_label_set_text(s_hint, "上下选择 · OK 进入 · 长按返回");
+    lv_label_set_text(s_hint, "上下选择 · OK 进入 · 长按退出");
+}
+
+void memo_ui_settings_refresh_values(void)
+{
+    refresh_rows();
 }
 
 int memo_ui_settings_move(int direction)

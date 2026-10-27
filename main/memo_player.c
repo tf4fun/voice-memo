@@ -13,7 +13,11 @@
 #include "esp_system.h"
 
 #include "bsp_audio.h"
+#include "esp_http_client.h"
+
 #include "memo_api.h"
+#include "memo_discovery.h"
+#include "memo_net.h"
 #include "memo_container.h"
 #include "memo_spool.h"
 
@@ -70,6 +74,20 @@ esp_err_t memo_player_init(void)
     if (s_done == NULL) return ESP_ERR_NO_MEM;
     s_ready = true;
     return ESP_OK;
+}
+
+static void stream_from_server(const char *id);
+
+static void stream_task(void *arg)
+{
+    (void)arg;
+    stream_from_server(s_remote_id);
+    s_remote_id[0] = '\0';
+    s_position_ms = 0;
+    s_active = false;
+    if (s_done != NULL) xSemaphoreGive(s_done);
+    s_task = NULL;
+    vTaskDelete(NULL);
 }
 
 static void player_task(void *arg)
@@ -198,6 +216,99 @@ esp_err_t memo_player_play_file(const char *path)
     return ESP_OK;
 }
 
+/* 从 HTTP 流里读满 n 字节；返回实际读到的字节数。 */
+static int http_read_exact(esp_http_client_handle_t client, uint8_t *buf, int n)
+{
+    int total = 0;
+    while (total < n) {
+        const int got = esp_http_client_read(client, (char *)buf + total, n - total);
+        if (got <= 0) break;
+        total += got;
+    }
+    return total;
+}
+
+/* 边下边播：容器头解析完就开始解码，不必等整条录音下载完。 */
+static void stream_from_server(const char *id)
+{
+    char url[128];
+    snprintf(url, sizeof(url), "http://%s:%u/api/v1/memos/%s/audio",
+             memo_discovery_host(), (unsigned)memo_discovery_port(), id);
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = 20000,
+        .buffer_size = 2048,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (client == NULL) return;
+
+    if (esp_http_client_open(client, 0) != ESP_OK) {
+        ESP_LOGE(TAG, "stream open failed");
+        esp_http_client_cleanup(client);
+        return;
+    }
+    esp_http_client_fetch_headers(client);
+    if (esp_http_client_get_status_code(client) != 200) {
+        ESP_LOGE(TAG, "stream status %d", esp_http_client_get_status_code(client));
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return;
+    }
+
+    uint8_t raw[MEMO_CONTAINER_HEADER_SIZE];
+    if (http_read_exact(client, raw, sizeof(raw)) != (int)sizeof(raw)) {
+        ESP_LOGE(TAG, "stream header truncated");
+        goto done;
+    }
+
+    memo_container_header_t header;
+    if (!memo_container_decode(raw, &header)) {
+        ESP_LOGE(TAG, "stream is not a memo container");
+        goto done;
+    }
+    if (bsp_audio_set_format(header.sample_rate, 16, header.channels) != ESP_OK) {
+        ESP_LOGE(TAG, "codec format for streaming failed");
+        goto done;
+    }
+    if (!decoder_open()) goto done;
+
+    s_duration_ms = header.duration_ms;
+    s_position_ms = 0;
+
+    uint8_t *pcm = malloc(PLAYER_PCM_BYTES);
+    uint8_t packet[512];
+    if (pcm == NULL) goto done;
+
+    uint32_t played = 0;
+    while (s_active) {
+        uint8_t length[2];
+        if (http_read_exact(client, length, 2) != 2) break;
+        const uint16_t size = (uint16_t)(length[0] | (length[1] << 8));
+        if (size == 0 || size > sizeof(packet)) break;
+        if (http_read_exact(client, packet, size) != (int)size) break;
+
+        esp_audio_dec_in_raw_t in = {.buffer = packet, .len = size, .consumed = 0};
+        esp_audio_dec_out_frame_t out = {.buffer = pcm, .len = PLAYER_PCM_BYTES};
+        esp_audio_dec_info_t info = {0};
+        if (esp_opus_dec_decode(s_decoder, &in, &out, &info) != ESP_AUDIO_ERR_OK) break;
+        if (out.decoded_size == 0) continue;
+        if (bsp_audio_write(pcm, out.decoded_size) != ESP_OK) break;
+
+        played++;
+        s_position_ms = (uint32_t)(played * header.frame_ms);
+    }
+
+    ESP_LOGI(TAG, "streamed %u frames (%u ms)", (unsigned)played, (unsigned)s_position_ms);
+    free(pcm);
+
+done:
+    decoder_close();
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+}
+
 esp_err_t memo_player_play_remote(const char *id)
 {
     if (!s_ready) return ESP_ERR_INVALID_STATE;
@@ -206,10 +317,9 @@ esp_err_t memo_player_play_remote(const char *id)
 
     strncpy(s_remote_id, id, sizeof(s_remote_id) - 1);
     s_remote_id[sizeof(s_remote_id) - 1] = '\0';
-    snprintf(s_path, sizeof(s_path), "%s", MEMO_PLAYER_CACHE_PATH);
     s_active = true;
 
-    if (xTaskCreate(player_task, "memo_play", PLAYER_STACK, NULL, 5, &s_task) != pdPASS) {
+    if (xTaskCreate(stream_task, "memo_stream", PLAYER_STACK, NULL, 5, &s_task) != pdPASS) {
         s_active = false;
         s_remote_id[0] = '\0';
         return ESP_ERR_NO_MEM;

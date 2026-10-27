@@ -228,11 +228,12 @@ device with these logs, not merely compiled.
 | List, detail, transcript | verified | rows and transcript pulled from the server |
 | SSE updates | verified | uploaded → transcribing → ready within two seconds |
 | Server limits adopted | verified | `max_memo_ms=300000` read at startup and enforced before upload |
-| Recording with the network up | flashed, not yet confirmed on the screen | 28 KB stack + 24.6 KB encoder against a 73 KB largest block |
-| Arming ring animation | fixed, not yet confirmed on the screen | value range was 0..100 while the animation fed it milliseconds |
+| Recording with the network up | verified | records with the station connected; the encoder's 24.6 KB fits |
+| Arming ring animation | verified | the ring object had never been created; it now fills over one second |
+| Streaming playback | verified | frames decoded straight off `/audio`, nothing cached locally |
 | Upload rejected → `.bad` | code exists, not exercised | needs a deliberate 4xx |
 | Recording while offline | not exercised | needs the access point switched off mid-session |
-| Streaming playback | not implemented | the container is downloaded first, then played |
+
 
 Heap, measured on this device: 231 KB free after boot, 100 KB once Wi-Fi is up,
 84 KB with the uploader and the SSE subscriber running, largest contiguous

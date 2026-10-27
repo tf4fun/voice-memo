@@ -136,6 +136,18 @@ static void tick_timer_cb(void *arg)
 {
     (void)arg;
 
+    /* 设置页：让"服务器"行能跟上发现进度。 */
+    if (s_sm.state == MEMO_STATE_SETTINGS || s_sm.state == MEMO_STATE_SUB_PAGE) {
+        static uint32_t refresh_div;
+        if (++refresh_div >= 5) { /* 1 秒 */
+            refresh_div = 0;
+            if (bsp_lvgl_lock(30)) {
+                memo_ui_settings_refresh_values();
+                bsp_lvgl_unlock();
+            }
+        }
+    }
+
     /* 列表页：服务端数据更新了就重绘一次。 */
     if (s_sm.state == MEMO_STATE_LIST && memo_api_take_updated()) {
         if (bsp_lvgl_lock(50)) {
@@ -299,6 +311,24 @@ static void build_record_page(void)
         lv_obj_set_pos(bar, x + i * (bar_w + gap), 190);
         s_level_bars[i] = bar;
     }
+
+    /* 待发阶段的圆环：按下即开始填充，填满才进入录音。
+       它必须真的被创建——之前这段在某次重写中丢失，导致按下毫无反馈。 */
+    s_arm_arc = lv_arc_create(s_record_screen);
+    lv_obj_remove_style_all(s_arm_arc);
+    lv_obj_set_size(s_arm_arc, 132, 132);
+    lv_obj_align(s_arm_arc, LV_ALIGN_TOP_MID, 0, 46);
+    lv_arc_set_range(s_arm_arc, 0, 100);
+    lv_arc_set_bg_angles(s_arm_arc, 0, 360);
+    lv_arc_set_value(s_arm_arc, 0);
+    lv_obj_set_style_arc_width(s_arm_arc, 10, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_arm_arc, 10, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_arm_arc, lv_color_hex(VM_SUN), LV_PART_MAIN);
+    lv_obj_set_style_arc_opa(s_arm_arc, LV_OPA_20, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(s_arm_arc, lv_color_hex(VM_CORAL), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(s_arm_arc, LV_OPA_TRANSP, LV_PART_KNOB);
+    lv_obj_clear_flag(s_arm_arc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_arm_arc, LV_OBJ_FLAG_HIDDEN);
 
     lv_obj_t *hint = memo_ui_label(s_record_screen, &lv_font_montserrat_14, VM_MUTED);
     lv_label_set_text(hint, "release to finish");
@@ -485,7 +515,9 @@ static void execute(memo_action_t action)
             s_sm.state = MEMO_STATE_LIST;
             break;
         }
-        if (bsp_lvgl_lock(100)) {
+        if (bsp_lvgl_lock(200)) {
+            if (s_timer_label != NULL) lv_label_set_text(s_timer_label, "00:00");
+            show_screen(s_record_screen); /* 圆环在这个页面上，待发时就切过来 */
             arm_ring_start();
             bsp_lvgl_unlock();
         }
@@ -497,6 +529,7 @@ static void execute(memo_action_t action)
         esp_timer_stop(s_arm_timer);
         if (bsp_lvgl_lock(100)) {
             arm_ring_hide();
+            show_screen(s_list_screen);
             bsp_lvgl_unlock();
         }
         break;
