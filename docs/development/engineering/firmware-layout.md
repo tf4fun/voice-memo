@@ -8,6 +8,11 @@ This repository is a minimal base for user-defined firmware targeting an
 ESP32-C3 with 8 MB Flash. Its default does not reserve product-specific
 identity, OTA, or unused data partitions.
 
+On `feature/voice-memo`, `partitions.csv` uses a custom layout with a 1 MiB
+SPIFFS spool. See the [client partition table](../../technical/client.md#9-local-spool-and-partitions)
+for the current application layout. The default table below describes the
+upstream template baseline, not this branch's active partition file.
+
 ## Default layout
 
 The default partition table contains exactly:

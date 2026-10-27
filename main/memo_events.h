@@ -12,7 +12,8 @@
 esp_err_t memo_events_start(void);
 
 /* 断开并结束任务（配网/录音让位时调用）。 */
-void memo_events_stop(void);
+/* Timeout retains ownership; call again to join before releasing network. */
+esp_err_t memo_events_stop(void);
 
 /* 当前是否处于已连接状态。 */
 bool memo_events_connected(void);

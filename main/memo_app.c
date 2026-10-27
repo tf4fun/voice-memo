@@ -3,6 +3,7 @@
 // 分工：按键回调只入队；memo_input 任务把事件翻译成状态机输入、执行动作；
 // 页面渲染全部在 LVGL 锁内。录音与编码在 recorder 任务里，不占用输入任务。
 #include <stdio.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <time.h>
 
@@ -43,6 +44,7 @@
 #include "memo_ui_provision.h"
 #include "memo_ui_settings.h"
 #include "memo_upload.h"
+#include "memo_rejection_layout.h"
 #include "memo_state.h"
 #include "memo_time.h"
 
@@ -68,7 +70,6 @@ static memo_sm_t s_sm;
 static key_guard_t s_guard;
 
 static esp_timer_handle_t s_arm_timer;
-static esp_timer_handle_t s_tick_timer;
 
 /* ---------- 页面对象 ---------- */
 static lv_obj_t *s_list_screen;
@@ -76,6 +77,7 @@ static lv_obj_t *s_record_screen;
 static lv_obj_t *s_list_status;
 static lv_obj_t *s_list_hint;
 static lv_obj_t *s_timer_label;
+static lv_obj_t *s_record_hint;
 static lv_obj_t *s_arm_arc;
 static lv_obj_t *s_level_bars[VM_LEVEL_BARS];
 static lv_obj_t *s_sheet;
@@ -84,7 +86,15 @@ static lv_obj_t *s_opt_save;
 static lv_obj_t *s_opt_cancel;
 static char s_last_id[37];
 static uint32_t s_detail_duration_ms;  /* 详情页当前条目的时长，播放器未启动时用它 */
+static bool s_network_resume_needed;
 static bool s_rec_network_suspended;   /* 本次录音是否为了腾内存让出过网络 */
+static lv_obj_t *s_reject_sheet;
+static lv_obj_t *s_reject_shadow;
+static lv_obj_t *s_reject_message;
+static lv_obj_t *s_reject_retry;
+static lv_obj_t *s_reject_delete;
+static char s_reject_id[37];
+static bool s_reject_deciding;
 
 /* ---------- 小工具 ---------- */
 static lv_obj_t *card_create(lv_obj_t *parent, int x, int y, int w, int h)
@@ -135,6 +145,12 @@ static void refresh_list(void);
 static void tick_timer_cb(void *arg)
 {
     (void)arg;
+    if (s_network_resume_needed && !s_rec_network_suspended && s_sm.state != MEMO_STATE_PROVISIONING) {
+        const esp_err_t upload = memo_upload_start();
+        const esp_err_t events = memo_events_start();
+        if (upload == ESP_OK && events == ESP_OK) s_network_resume_needed = false;
+    }
+    if (s_sm.state == MEMO_STATE_UPLOAD_REJECTED) return;
 
     /* 设置页：让"服务器"行能跟上发现进度。 */
     if (s_sm.state == MEMO_STATE_SETTINGS || s_sm.state == MEMO_STATE_SUB_PAGE) {
@@ -182,7 +198,7 @@ static void tick_timer_cb(void *arg)
     }
 
     const uint32_t elapsed = memo_recorder_elapsed_ms();
-    if (elapsed >= MEMO_RECORD_LIMIT_MS) {
+    if (!memo_recorder_is_active() || elapsed >= MEMO_RECORD_LIMIT_MS) {
         ESP_LOGW(TAG, "five minute cap reached, stopping");
         enqueue_input(MEMO_IN_RECORD_LIMIT);
         return;
@@ -223,6 +239,7 @@ static lv_obj_t *s_battery;
 /* 一屏列表的统一视图：先是本地待上传，然后是服务端返回的历史。 */
 typedef struct {
     bool local;      /* true = 本地待上传文件 */
+    memo_spool_state_t spool_state;
     char id[37];
     int64_t recorded_at;
     uint32_t duration_ms;
@@ -330,9 +347,9 @@ static void build_record_page(void)
     lv_obj_clear_flag(s_arm_arc, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(s_arm_arc, LV_OBJ_FLAG_HIDDEN);
 
-    lv_obj_t *hint = memo_ui_label(s_record_screen, &lv_font_montserrat_14, VM_MUTED);
-    lv_label_set_text(hint, "release to finish");
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -VM_INSET - 6);
+    s_record_hint = memo_ui_label(s_record_screen, &lv_font_montserrat_14, VM_MUTED);
+    lv_label_set_text(s_record_hint, "release to finish");
+    lv_obj_align(s_record_hint, LV_ALIGN_BOTTOM_MID, 0, -VM_INSET - 6);
 
     /* 松手后弹出的选择条：保存 / 取消 */
     const int width = lv_display_get_horizontal_resolution(NULL);
@@ -395,14 +412,18 @@ static void refresh_list(void)
     memo_spool_entry_t entries[MEMO_SPOOL_MAX_ENTRIES];
     const int local = memo_spool_scan(entries, MEMO_SPOOL_MAX_ENTRIES);
     for (int i = 0; i < local && i < MEMO_SPOOL_MAX_ENTRIES; i++) {
-        if (entries[i].state != MEMO_SPOOL_PENDING) continue;
+        if (entries[i].state == MEMO_SPOOL_SENT || entries[i].state == MEMO_SPOOL_RECORDING ||
+            entries[i].state == MEMO_SPOOL_DRAFT) continue;
         if (s_view_count >= MEMO_API_MAX_ITEMS + 1) break;
         list_view_t *row = &s_view[s_view_count++];
         row->local = true;
+        row->spool_state = entries[i].state;
         strncpy(row->id, entries[i].id, sizeof(row->id) - 1);
         row->recorded_at = (int64_t)entries[i].recorded_at;
         row->duration_ms = entries[i].duration_ms;
-        snprintf(row->text, sizeof(row->text), "待上传");
+        snprintf(row->text, sizeof(row->text), "%s",
+                 entries[i].state == MEMO_SPOOL_LEGACY_KEPT ? "待重试" :
+                 entries[i].state == MEMO_SPOOL_BAD ? "上传失败" : "待上传");
     }
 
     const int remote = memo_api_count();
@@ -453,6 +474,10 @@ static void refresh_list(void)
     } else {
         snprintf(status, sizeof(status), "%d 条", s_view_count);
     }
+    if (memo_spool_recovery_blocked()) {
+        lv_label_set_text(s_list_hint, "storage error - restart");
+        status[0] = '\0';
+    }
     lv_label_set_text(s_list_status, status);
     lv_obj_set_style_text_color(s_list_status, lv_color_hex(VM_MUTED), 0);
 
@@ -478,7 +503,11 @@ static void play_selected(void)
     if (memo_player_is_active()) memo_player_stop();
 
     if (row->local) {
-        if (memo_player_play(row->id) == ESP_OK) {
+        const char *ext = row->spool_state == MEMO_SPOOL_LEGACY_KEPT ? "keep" :
+                          row->spool_state == MEMO_SPOOL_BAD ? "bad" : "memo";
+        char path[80];
+        snprintf(path, sizeof(path), "%s/%s.%s", MEMO_SPOOL_MOUNT_POINT, row->id, ext);
+        if (memo_player_play_file(path) == ESP_OK) {
             ESP_LOGI(TAG, "playing local %s", row->id);
         } else {
             ESP_LOGE(TAG, "play failed");
@@ -508,7 +537,8 @@ static void execute(memo_action_t action)
             /* 局部存储是"处理中"状态：上一条没走完就不开始新的一条。 */
             ESP_LOGW(TAG, "recording blocked: previous memo is still being uploaded");
             if (bsp_lvgl_lock(150)) {
-                lv_label_set_text(s_list_status, "上一条待上传");
+                if (memo_spool_recovery_blocked()) refresh_list();
+                else lv_label_set_text(s_list_status, "上一条待上传");
                 lv_obj_set_style_text_color(s_list_status, lv_color_hex(VM_CORAL), 0);
                 bsp_lvgl_unlock();
             }
@@ -535,6 +565,7 @@ static void execute(memo_action_t action)
         break;
 
     case MEMO_ACT_BEGIN_RECORDING: {
+        memo_upload_set_capture_busy(true);
         char id[37];
         uint8_t random[16];
         esp_fill_random(random, sizeof(random));
@@ -548,13 +579,22 @@ static void execute(memo_action_t action)
         esp_err_t err = memo_recorder_start(id);
         if (err == ESP_ERR_NO_MEM) {
             ESP_LOGW(TAG, "no room for the recorder, standing the network down");
-            memo_events_stop();
-            memo_net_suspend();
-            s_rec_network_suspended = true;
-            err = memo_recorder_start(id);
+            esp_err_t events_stop = memo_events_stop();
+            esp_err_t upload_stop = memo_upload_stop();
+            if (events_stop == ESP_OK && upload_stop == ESP_OK) {
+                memo_net_suspend();
+                s_rec_network_suspended = true;
+                err = memo_recorder_start(id);
+            } else {
+                ESP_LOGW(TAG, "network still owned by worker; capture retry deferred");
+                s_network_resume_needed = true;
+                memo_events_start();
+                memo_upload_start();
+            }
         }
 
         if (err != ESP_OK) {
+            memo_upload_set_capture_busy(false);
             ESP_LOGE(TAG, "recorder start failed: %s", esp_err_to_name(err));
             if (bsp_lvgl_lock(200)) {
                 arm_ring_hide();
@@ -570,6 +610,7 @@ static void execute(memo_action_t action)
                 s_rec_network_suspended = false;
                 memo_net_start();
                 memo_events_start();
+                memo_upload_start();
             }
             s_sm.state = MEMO_STATE_LIST;
             break;
@@ -580,6 +621,7 @@ static void execute(memo_action_t action)
                 lv_label_set_text(s_timer_label, "00:00");
                 lv_obj_set_style_text_color(s_timer_label, lv_color_hex(VM_INK), 0);
             }
+            lv_label_set_text(s_record_hint, "release to finish");
             show_screen(s_record_screen);
             bsp_lvgl_unlock();
         }
@@ -590,22 +632,26 @@ static void execute(memo_action_t action)
             bsp_lvgl_unlock();
         }
         ESP_LOGI(TAG, "recording started: %s", id);
-        esp_timer_start_periodic(s_tick_timer, 200 * 1000);
         break;
     }
 
     case MEMO_ACT_STOP_AND_SAVE: {
         /* 松手（或到点）先落盘，再问用户保存还是取消；此时还没有回列表。 */
-        esp_timer_stop(s_tick_timer);
         memo_recorder_result_t result;
         esp_err_t err = memo_recorder_stop(true, &result);
         if (err == ESP_OK) {
             ESP_LOGI(TAG, "recorded %s (%u ms, %u bytes)",
                      result.id, (unsigned)result.duration_ms, (unsigned)result.size_bytes);
             memo_upload_start();
-        memo_events_start();
+            memo_events_start();
         } else {
-            ESP_LOGE(TAG, "recorder stop: %s", esp_err_to_name(err));
+            ESP_LOGE(TAG, "recorder stop: %s; recoverable data retained", esp_err_to_name(err));
+            if (err == ESP_ERR_TIMEOUT) {
+                s_sm.state = MEMO_STATE_RECORDING; /* Retry joining, never close a live writer. */
+                break;
+            }
+            s_sm.state = MEMO_STATE_LIST;
+            memo_upload_set_capture_busy(false);
         }
 
         if (s_rec_network_suspended) {
@@ -614,7 +660,9 @@ static void execute(memo_action_t action)
             memo_events_start();
         }
         if (bsp_lvgl_lock(200)) {
-            sheet_visible(true);
+            lv_label_set_text(s_record_hint, err == ESP_OK ? "choose save or cancel" : "capture interrupted");
+            sheet_visible(err == ESP_OK);
+            if (err != ESP_OK) show_screen(s_list_screen);
             refresh_confirm_sheet();
             bsp_lvgl_unlock();
         }
@@ -629,7 +677,17 @@ static void execute(memo_action_t action)
         break;
 
     case MEMO_ACT_CONFIRM_SAVE:
-        ESP_LOGI(TAG, "recording kept: %s", s_last_id);
+        if (memo_spool_move(s_last_id, MEMO_SPOOL_DRAFT, MEMO_SPOOL_PENDING) != ESP_OK) {
+            s_sm.state = MEMO_STATE_CONFIRM;
+            ESP_LOGE(TAG, "save failed; draft retained for another choice");
+            if (bsp_lvgl_lock(100)) {
+                lv_label_set_text(s_record_hint, "save failed - retry");
+                bsp_lvgl_unlock();
+            }
+            break;
+        }
+        memo_upload_set_capture_busy(false);
+        ESP_LOGI(TAG, "recording saved: %s", s_last_id);
         if (bsp_lvgl_lock(200)) {
             sheet_visible(false);
             show_screen(s_list_screen);
@@ -641,9 +699,18 @@ static void execute(memo_action_t action)
     case MEMO_ACT_CONFIRM_CANCEL:
         ESP_LOGI(TAG, "recording discarded: %s", s_last_id);
         if (s_last_id[0] != '\0') {
-            memo_spool_remove(s_last_id, MEMO_SPOOL_PENDING);
+            if (memo_spool_remove(s_last_id, MEMO_SPOOL_DRAFT) != ESP_OK) {
+                s_sm.state = MEMO_STATE_CONFIRM;
+                ESP_LOGE(TAG, "cancel failed; draft retained for another choice");
+                if (bsp_lvgl_lock(100)) {
+                    lv_label_set_text(s_record_hint, "cancel failed - retry");
+                    bsp_lvgl_unlock();
+                }
+                break;
+            }
             s_last_id[0] = '\0';
         }
+        memo_upload_set_capture_busy(false);
         if (bsp_lvgl_lock(200)) {
             sheet_visible(false);
             show_screen(s_list_screen);
@@ -671,7 +738,6 @@ static void execute(memo_action_t action)
     case MEMO_ACT_BACK_TO_LIST:
         memo_player_stop();
         memo_player_drop_cache();
-        esp_timer_stop(s_tick_timer);
         if (bsp_lvgl_lock(200)) {
             show_screen(s_list_screen);
             refresh_list();
@@ -713,7 +779,6 @@ static void execute(memo_action_t action)
             play_selected();
             if (memo_player_is_active()) s_sm.state = MEMO_STATE_PLAYING;
         }
-        esp_timer_start_periodic(s_tick_timer, 200 * 1000);
         ESP_LOGI(TAG, "detail: %s (%u ms)", entry->id, (unsigned)entry->duration_ms);
         break;
     }
@@ -782,8 +847,16 @@ static void execute(memo_action_t action)
     case MEMO_ACT_SUB_PAGE_ENTER:
         if (memo_ui_settings_row() == MEMO_SETTING_NETWORK) {
             /* 网络行不是子页，而是进入蓝牙配网。 */
-            memo_events_stop();
-            memo_upload_stop();      /* 上传也要让出 WiFi */
+            esp_err_t events_stop = memo_events_stop();
+            esp_err_t upload_stop = memo_upload_stop();
+            if (events_stop != ESP_OK || upload_stop != ESP_OK) {
+                ESP_LOGW(TAG, "network worker still stopping; provisioning deferred");
+                s_network_resume_needed = true;
+                s_sm.state = MEMO_STATE_SETTINGS;
+                memo_events_start();
+                memo_upload_start();
+                break;
+            }
             memo_discovery_stop();   /* 连同 mDNS 的十几 KB 一起收回 */
             memo_net_suspend();
             if (memo_provision_start() == ESP_OK) {
@@ -794,7 +867,6 @@ static void execute(memo_action_t action)
                     lv_screen_load(memo_ui_provision_screen());
                     bsp_lvgl_unlock();
                 }
-                esp_timer_start_periodic(s_tick_timer, 200 * 1000);
             } else {
                 ESP_LOGE(TAG, "provisioning start failed");
                 s_sm.state = MEMO_STATE_SETTINGS;
@@ -828,12 +900,105 @@ static void execute(memo_action_t action)
         }
         break;
 
+    case MEMO_ACT_REJECT_TOGGLE:
+        /* The input loop redraws from the state-machine choice. */
+        break;
+
+    case MEMO_ACT_REJECT_RETRY:
+    case MEMO_ACT_REJECT_DELETE:
+        if (!s_reject_deciding &&
+            memo_upload_choose(s_reject_id, action == MEMO_ACT_REJECT_DELETE) == ESP_OK) {
+            s_reject_deciding = true;
+        }
+        break;
+
     default:
         break;
     }
 }
 
 /* ---------- 输入任务 ---------- */
+/* Called only by memo_input. File mutations are queued to the upload worker. */
+static void poll_rejected_choice(void)
+{
+    if (s_list_screen == NULL) return;
+    memo_upload_rejection_t review;
+    const bool available = memo_upload_rejection(&review);
+    if (s_sm.state == MEMO_STATE_UPLOAD_REJECTED && !available) {
+        if (!bsp_lvgl_lock(100)) return;
+        memo_ui_card_visible(s_reject_sheet, s_reject_shadow, false);
+        refresh_list();
+        bsp_lvgl_unlock();
+        s_sm.state = MEMO_STATE_LIST;
+        s_reject_deciding = false;
+        /* A retry can finish after the choice closes; keep list metadata live. */
+        return;
+    }
+    if (!available || (s_sm.state != MEMO_STATE_LIST &&
+                       s_sm.state != MEMO_STATE_UPLOAD_REJECTED)) return;
+    if (!bsp_lvgl_lock(100)) return;
+    if (s_reject_sheet == NULL) {
+        const int width = lv_display_get_horizontal_resolution(NULL);
+        memo_rejection_layout_t layout;
+        if (!memo_rejection_layout(width, lv_display_get_vertical_resolution(NULL),
+                                   memo_font_label()->line_height, memo_font_body()->line_height,
+                                   &layout)) {
+            bsp_lvgl_unlock();
+            ESP_LOGE(TAG, "rejection dialog font metrics do not fit the display");
+            return;
+        }
+        s_reject_sheet = memo_ui_card(s_list_screen, layout.x, layout.y, layout.width, layout.height,
+                                      &s_reject_shadow);
+        lv_obj_t *title = memo_ui_label(s_reject_sheet, memo_font_body(), VM_CORAL);
+        lv_label_set_text(title, "上传失败");
+        lv_obj_set_pos(title, 12, layout.title_y);
+        s_reject_message = memo_ui_label(s_reject_sheet, memo_font_label(), VM_INK);
+        lv_obj_set_width(s_reject_message, width - 63);
+        lv_label_set_long_mode(s_reject_message, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_line_space(s_reject_message, 0, 0);
+        lv_obj_set_pos(s_reject_message, 12, layout.message_y);
+        s_reject_retry = memo_ui_label(s_reject_sheet, memo_font_body(), VM_INK);
+        lv_label_set_text(s_reject_retry, "重试");
+        lv_obj_set_pos(s_reject_retry, 18, layout.options_y);
+        s_reject_delete = memo_ui_label(s_reject_sheet, memo_font_body(), VM_MUTED);
+        lv_label_set_text(s_reject_delete, "删除");
+        lv_obj_set_pos(s_reject_delete, layout.width / 2 + 10, layout.options_y);
+        lv_obj_t *hint = memo_ui_label(s_reject_sheet, memo_font_label(), VM_MUTED);
+        lv_label_set_text(hint, "上下选择 OK确认");
+        lv_obj_set_pos(hint, 12, layout.hint_y);
+        memo_font_check_text("upload dialog", "上传失败上传被拒绝请选择重试或删除正在处理处理失败请重新选择上下选择 OK确认待重试");
+    }
+    if (s_sm.state == MEMO_STATE_LIST || strcmp(s_reject_id, review.id) != 0) {
+        memo_sm_open_rejection(&s_sm);
+        snprintf(s_reject_id, sizeof(s_reject_id), "%s", review.id);
+        lv_screen_load(s_list_screen);
+    }
+    s_reject_deciding = review.deciding;
+    char clock[8] = "--:--";
+    char duration[16];
+    if (review.recorded_at > 0) {
+        memo_time_clock((int64_t)review.recorded_at, memo_settings_get()->tz_offset_min,
+                        clock, sizeof(clock));
+    }
+    memo_time_duration(review.duration_ms, duration, sizeof(duration));
+    char message[128];
+    snprintf(message, sizeof(message), "%s · %s\n%s", clock, duration,
+             review.deciding ? "正在处理" :
+             review.operation_failed ? "处理失败\n请重新选择" :
+             "上传被拒绝\n请选择重试或删除");
+    lv_label_set_text(s_reject_message, message);
+    lv_obj_set_style_text_color(s_reject_retry,
+        lv_color_hex(s_sm.reject_delete ? VM_MUTED : VM_INK), 0);
+    lv_obj_set_style_text_decor(s_reject_retry,
+        s_sm.reject_delete ? LV_TEXT_DECOR_NONE : LV_TEXT_DECOR_UNDERLINE, 0);
+    lv_obj_set_style_text_color(s_reject_delete,
+        lv_color_hex(s_sm.reject_delete ? VM_CORAL : VM_MUTED), 0);
+    lv_obj_set_style_text_decor(s_reject_delete,
+        s_sm.reject_delete ? LV_TEXT_DECOR_UNDERLINE : LV_TEXT_DECOR_NONE, 0);
+    memo_ui_card_visible(s_reject_sheet, s_reject_shadow, true);
+    bsp_lvgl_unlock();
+}
+
 static void enqueue_input(memo_input_t input)
 {
     if (s_queue == NULL) return;
@@ -873,13 +1038,51 @@ static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user)
     if (input != MEMO_IN_COUNT) enqueue_input(input);
 }
 
+static atomic_bool s_ui_ready;
+
+static void poll_draft(void)
+{
+    if (s_sm.state != MEMO_STATE_LIST || memo_spool_recovery_blocked()) return;
+    memo_spool_entry_t entries[MEMO_SPOOL_MAX_ENTRIES];
+    const int count = memo_spool_scan(entries, MEMO_SPOOL_MAX_ENTRIES);
+    for (int i = 0; i < count && i < MEMO_SPOOL_MAX_ENTRIES; i++) {
+        if (entries[i].state != MEMO_SPOOL_DRAFT) continue;
+        memo_upload_set_capture_busy(true);
+        snprintf(s_last_id, sizeof(s_last_id), "%s", entries[i].id);
+        if (bsp_lvgl_lock(200)) {
+            s_sm.state = MEMO_STATE_CONFIRM;
+            s_sm.confirm_save = true;
+            char text[16];
+            memo_time_timer(entries[i].duration_ms, text, sizeof(text));
+            lv_label_set_text(s_timer_label, text);
+            lv_label_set_text(s_record_hint, "recovered audio - choose");
+            show_screen(s_record_screen);
+            sheet_visible(true);
+            refresh_confirm_sheet();
+            bsp_lvgl_unlock();
+        }
+        return;
+    }
+}
+
 static void input_task(void *arg)
 {
     (void)arg;
 
+    int64_t next_tick = 0;
     for (;;) {
         memo_input_t input;
-        if (xQueueReceive(s_queue, &input, portMAX_DELAY) != pdTRUE) continue;
+        const bool received = xQueueReceive(s_queue, &input, pdMS_TO_TICKS(50)) == pdTRUE;
+        if (!s_ui_ready) continue;
+        const int64_t now = esp_timer_get_time();
+        if (now >= next_tick) {
+            next_tick = now + 200000;
+            tick_timer_cb(NULL);
+            poll_draft();
+            poll_rejected_choice();
+        }
+        if (!received) continue;
+        if (s_sm.state == MEMO_STATE_UPLOAD_REJECTED && s_reject_deciding) continue;
 
         const memo_state_t before = s_sm.state;
         memo_action_t action = memo_sm_handle(&s_sm, input);
@@ -889,6 +1092,7 @@ static void input_task(void *arg)
                      memo_state_name(s_sm.state));
             execute(action);
         }
+        poll_rejected_choice();
     }
 }
 
@@ -899,14 +1103,6 @@ void app_main(void)
     memo_sm_init(&s_sm);
 
     ESP_LOGI(TAG, "heap after boot: %u", (unsigned)esp_get_free_heap_size());
-
-    /* 常驻的 200 ms 心跳：录音计时、播放进度、列表刷新都靠它。 */
-    const esp_timer_create_args_t tick_args = {.callback = tick_timer_cb, .name = "memo_tick"};
-    if (esp_timer_create(&tick_args, &s_tick_timer) != ESP_OK) {
-        ESP_LOGE(TAG, "cannot create tick timer");
-    } else {
-        esp_timer_start_periodic(s_tick_timer, 200 * 1000);
-    }
 
     if (memo_settings_init() != ESP_OK) {
         ESP_LOGW(TAG, "settings unavailable; using defaults");
@@ -952,9 +1148,9 @@ void app_main(void)
     if (memo_spool_mount() != ESP_OK) {
         ESP_LOGE(TAG, "spool mount failed; recordings will not persist");
     } else {
-        const int dropped = memo_spool_drop_empty();
+        const int dropped = memo_spool_recover();
         if (dropped > 0) {
-            ESP_LOGW(TAG, "removed %d incomplete recording(s)", dropped);
+            ESP_LOGW(TAG, "recovered/quarantined %d interrupted recording(s)", dropped);
         }
     }
 
@@ -1022,4 +1218,5 @@ void app_main(void)
     ESP_LOGI(TAG, "idle; free heap %u (largest block %u)",
              (unsigned)esp_get_free_heap_size(),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    s_ui_ready = true;
 }

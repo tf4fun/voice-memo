@@ -247,3 +247,31 @@ func TestTouchDeviceIsIdempotent(t *testing.T) {
 		t.Errorf("device rows = %d, want 1", count)
 	}
 }
+
+func TestAcceptedMemoAndJobCommitTogether(t *testing.T) {
+	st := newStore(t)
+	ctx := t.Context()
+	_, err := st.db.ExecContext(ctx, `CREATE TRIGGER reject_job BEFORE INSERT ON jobs BEGIN SELECT RAISE(ABORT, 'injected queue failure'); END`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := sampleMemo("atomic", 1000)
+	if created, err := st.InsertMemoAndEnqueue(ctx, m); err == nil || created {
+		t.Fatalf("queue failure accepted: created=%v err=%v", created, err)
+	}
+	if _, err := st.Memo(ctx, m.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("memo survived rollback: %v", err)
+	}
+	if _, err := st.db.ExecContext(ctx, `DROP TRIGGER reject_job`); err != nil {
+		t.Fatal(err)
+	}
+	if created, err := st.InsertMemoAndEnqueue(ctx, m); err != nil || !created {
+		t.Fatalf("retry: %v %v", created, err)
+	}
+	if created, err := st.InsertMemoAndEnqueue(ctx, m); err != nil || created {
+		t.Fatalf("replay: %v %v", created, err)
+	}
+	if count, err := st.QueueDepth(ctx); err != nil || count != 1 {
+		t.Fatalf("jobs: %d %v", count, err)
+	}
+}

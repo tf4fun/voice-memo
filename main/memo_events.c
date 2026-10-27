@@ -2,6 +2,8 @@
 #include "memo_events.h"
 
 #include <stdio.h>
+#include <errno.h>
+#include <stdatomic.h>
 #include <string.h>
 
 #include "cJSON.h"
@@ -24,8 +26,8 @@ static const char *TAG = "memo_events";
 
 static TaskHandle_t s_task;
 static SemaphoreHandle_t s_done;
-static volatile bool s_running;
-static volatile bool s_connected;
+static atomic_bool s_running;
+static atomic_bool s_connected;
 static char s_line[EVENTS_BUF];
 static size_t s_line_len;
 
@@ -91,19 +93,6 @@ static void feed_bytes(const char *data, int len)
     }
 }
 
-static esp_err_t http_event(esp_http_client_event_t *evt)
-{
-    if (evt->event_id == HTTP_EVENT_ON_DATA) {
-        feed_bytes((const char *)evt->data, evt->data_len);
-    } else if (evt->event_id == HTTP_EVENT_ON_CONNECTED) {
-        s_connected = true;
-        ESP_LOGI(TAG, "stream connected");
-    } else if (evt->event_id == HTTP_EVENT_DISCONNECTED) {
-        s_connected = false;
-    }
-    return ESP_OK;
-}
-
 /* 连一次，直到流结束或出错。返回后由任务决定重连。 */
 static void subscribe_once(void)
 {
@@ -114,20 +103,44 @@ static void subscribe_once(void)
     esp_http_client_config_t cfg = {
         .url = url,
         .method = HTTP_METHOD_GET,
-        .timeout_ms = 120000, /* 服务端每 20 秒有心跳 */
+        .timeout_ms = 1000, /* Bounded reads so stop can join before resource release. */
         .buffer_size = 1024,
-        .event_handler = http_event,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (client == NULL) return;
 
     esp_http_client_set_header(client, "Accept", "text/event-stream");
     s_line_len = 0;
-    if (esp_http_client_perform(client) != ESP_OK) {
-        ESP_LOGW(TAG, "stream ended");
+    if (s_running && esp_http_client_open(client, 0) == ESP_OK &&
+        esp_http_client_fetch_headers(client) >= 0 &&
+        esp_http_client_get_status_code(client) == 200) {
+        s_connected = true;
+        char bytes[256];
+        unsigned idle_reads = 0;
+        while (s_running) {
+            errno = 0;
+            int n = esp_http_client_read(client, bytes, sizeof(bytes));
+            if (n > 0) {
+                feed_bytes(bytes, n);
+                idle_reads = 0;
+            } else if (n == -ESP_ERR_HTTP_EAGAIN || n == ESP_ERR_HTTP_EAGAIN ||
+                       errno == EAGAIN || errno == ETIMEDOUT) {
+                if (++idle_reads >= 60) break;
+            } else break;
+        }
     }
+    esp_http_client_close(client);
     esp_http_client_cleanup(client);
     s_connected = false;
+}
+
+static void interruptible_delay(uint32_t ms)
+{
+    while (s_running && ms > 0) {
+        const uint32_t slice = ms > 100 ? 100 : ms;
+        vTaskDelay(pdMS_TO_TICKS(slice));
+        ms -= slice;
+    }
 }
 
 static void events_task(void *arg)
@@ -136,20 +149,18 @@ static void events_task(void *arg)
 
     while (s_running) {
         if (!memo_net_has_ip()) {
-            vTaskDelay(pdMS_TO_TICKS(EVENTS_IDLE_MS));
+            interruptible_delay(EVENTS_IDLE_MS);
             continue;
         }
         if (memo_discovery_state() != MEMO_DISCOVERY_FOUND) {
-            if (memo_discovery_search(3000) != ESP_OK) {
-                vTaskDelay(pdMS_TO_TICKS(EVENTS_RECONNECT_MS));
-                continue;
-            }
+            interruptible_delay(EVENTS_IDLE_MS);
+            continue;
         }
 
         subscribe_once();
 
         if (!s_running) break;
-        vTaskDelay(pdMS_TO_TICKS(EVENTS_RECONNECT_MS));
+        interruptible_delay(EVENTS_RECONNECT_MS);
     }
 
     s_connected = false;
@@ -160,6 +171,12 @@ static void events_task(void *arg)
 esp_err_t memo_events_start(void)
 {
     if (s_running) return ESP_OK;
+    if (s_task != NULL) {
+        /* A previous timeout may now have completed. Join non-blockingly before
+         * allowing a new worker; never discard an unacknowledged handle. */
+        if (s_done == NULL || xSemaphoreTake(s_done, 0) != pdTRUE) return ESP_ERR_INVALID_STATE;
+        s_task = NULL;
+    }
 
     if (s_done == NULL) {
         s_done = xSemaphoreCreateBinary();
@@ -177,14 +194,16 @@ esp_err_t memo_events_start(void)
     return ESP_OK;
 }
 
-void memo_events_stop(void)
+esp_err_t memo_events_stop(void)
 {
-    if (!s_running) return;
+    if (s_task == NULL) return ESP_OK;
     s_running = false;
     if (s_done != NULL && xSemaphoreTake(s_done, pdMS_TO_TICKS(3000)) != pdTRUE) {
         ESP_LOGW(TAG, "subscriber did not stop in time");
+        return ESP_ERR_TIMEOUT;
     }
     s_task = NULL;
+    return ESP_OK;
 }
 
 bool memo_events_connected(void)

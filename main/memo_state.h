@@ -20,6 +20,7 @@ typedef enum {
     MEMO_STATE_SUB_PAGE,
     MEMO_STATE_PROVISIONING,
     MEMO_STATE_ERROR,
+    MEMO_STATE_UPLOAD_REJECTED,
     MEMO_STATE_COUNT,
 } memo_state_t;
 
@@ -70,6 +71,9 @@ typedef enum {
     MEMO_ACT_PREV_MEMO,
     MEMO_ACT_SCROLL_UP,
     MEMO_ACT_SCROLL_DOWN,
+    MEMO_ACT_REJECT_TOGGLE,
+    MEMO_ACT_REJECT_RETRY,
+    MEMO_ACT_REJECT_DELETE,
     MEMO_ACT_COUNT,
 } memo_action_t;
 
@@ -79,6 +83,7 @@ typedef struct {
     bool expanded;
     /* 录音结束后的选择条当前落在"保存"(true)还是"取消"(false)。 */
     bool confirm_save;
+    bool reject_delete; /* Destructive choice is never the default. */
 } memo_sm_t;
 
 /* 圆环从"按下"开始填，填满即开始录音；手指仍按着，所以这是一个动作。
@@ -90,6 +95,9 @@ typedef struct {
 #define MEMO_RECORD_WARN_MS (4 * 60 * 1000 + 30 * 1000)
 
 void memo_sm_init(memo_sm_t *sm);
+
+/* Show on the list or reset for the next rejected ID; never interrupt audio. */
+bool memo_sm_open_rejection(memo_sm_t *sm);
 
 /* Apply one input. Returns the single action the UI must perform. */
 memo_action_t memo_sm_handle(memo_sm_t *sm, memo_input_t input);

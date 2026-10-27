@@ -51,6 +51,26 @@ run_static_checks() {
         tests/test_memo_container.c main/memo_container.c \
         -o "${test_dir}/test_memo_container"
     "${test_dir}/test_memo_container"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror \
+        -Itests/upload_stubs -Itests/audio_stubs -Imain \
+        tests/test_memo_upload.c -o "${test_dir}/test_memo_upload"
+    "${test_dir}/test_memo_upload"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror \
+        -Itests/upload_stubs -Itests/audio_stubs -Imain \
+        tests/test_memo_spool.c main/memo_container.c -o "${test_dir}/test_memo_spool"
+    "${test_dir}/test_memo_spool"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror \
+        -Itests/recorder_stubs -Itests/upload_stubs -Itests/audio_stubs -Imain \
+        tests/test_memo_recorder.c main/memo_container.c -o "${test_dir}/test_memo_recorder"
+    "${test_dir}/test_memo_recorder"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror \
+        -Itests/events_stubs -Itests/upload_stubs -Itests/audio_stubs -Imain \
+        tests/test_memo_events.c -o "${test_dir}/test_memo_events"
+    "${test_dir}/test_memo_events"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_memo_rejection_layout.c -o "${test_dir}/test_memo_rejection_layout"
+    "${test_dir}/test_memo_rejection_layout"
+    PYTHONDONTWRITEBYTECODE=1 python3 tests/test_memo_rejection_font.py
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Icomponents/bsp/src \
         tests/test_bsp_display_rounding.c components/bsp/src/bsp_display_rounding.c \
         -o "${test_dir}/test_bsp_display_rounding"

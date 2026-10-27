@@ -10,8 +10,9 @@
 本仓库是 `FoloToy/ai-passport` 的派生仓库，保留了上游历史与 remote，方便继续合并基线更新。
 应用开发在 `feature/voice-memo` 分支进行，`main` 保持为干净的上游基线。
 
-当前状态：产品方案已确认，尚未开始实现。见
-[产品方案](docs/product/product-spec.zh_CN.md)。
+当前状态：录音、播放、服务器转写、浏览和联网模块已实现，应用尚未完整验收。
+交付状态及所有待完善工作统一在[里程碑](docs/project/milestones.zh_CN.md)跟踪；
+[产品方案](docs/product/product-spec.zh_CN.md)描述当前行为。
 
 ## 仓库构成
 
@@ -19,11 +20,14 @@
 | --- | --- | --- |
 | `main/` | 是 | 应用：页面、状态机、任务 |
 | `components/bsp/` | 是 | 板级支持：显示、音频、按键、电量 |
-| `docs/product/` | 是 | 产品方案，以及后续的技术方案与里程碑 |
+| `server/` | 是 | Go API、SQLite、转写任务、mDNS、SSE |
+| `docs/product/`、`docs/technical/`、`docs/design/` | 是 | 当前产品行为及实现 |
+| `docs/project/` | 是 | 里程碑、待完善项及验收 |
 | `scripts/` | 是 | 可复用的开发与校验脚本 |
 | `tools/` | 是 | 上游仓库门禁与固件校验 |
 | `bin/` | **否** | 本地 ESP-IDF、工具链与 Python 运行时 |
-| `.dsh/` | **否** | 本工作区已安装的 `passport-*` AI 技能 |
+| `.agents/skills/passport-*` | **否** | 指向 `skills/` 下五个必需技能的仓库本地链接 |
+| `.dsh/` | **否** | 旧的本地 AI 工具配置 |
 | `reference/` | **否** | 参考项目检出 |
 
 `bin/`、`.dsh/`、`reference/` 已写入 `.gitignore`：它们有几个 GB 的下载内容，不进版本库。
@@ -78,8 +82,8 @@ IDF_TAG=v6.1 IDF_DIR="$PWD/bin/esp-idf-v6.1" \
 
 ```bash
 source scripts/go-env.sh
-cd server && go build ./... && go test ./...
-./scripts/e2e-server.sh   # 起真实二进制 + 假转写，跑完整 HTTP 流程
+(cd server && go build ./... && go test ./...)
+./scripts/e2e-server.sh   # 真实进程 + 假 ASR；当前音频断言仍要求 WAV
 ```
 
 ## 构建与校验
@@ -92,7 +96,7 @@ source scripts/idf-env.sh
 ./tools/validate.sh              # 完整门禁
 ```
 
-macOS 上静态门禁无法原生通过：两个 demo 运行时测试用 `-Wl,--gc-sections` 链接，Apple 的
+macOS 上静态门禁无法原生通过：demo 运行时测试用 `-Wl,--gc-sections` 链接，Apple 的
 `ld` 不支持。请用 Linux 包装脚本，而不是改门禁本身：
 
 ```bash
@@ -106,9 +110,11 @@ macOS 上静态门禁无法原生通过：两个 demo 运行时测试用 `-Wl,--
 
 | 文档 | 内容 |
 | --- | --- |
-| [产品方案](docs/product/product-spec.zh_CN.md) | 界面、操作、行为规则、验收 |
+| [产品方案](docs/product/product-spec.zh_CN.md) | 当前界面、操作与行为 |
+| [设备端方案](docs/technical/client.zh_CN.md) | 固件模块、音频、存储与联网 |
+| [服务端方案](docs/technical/server.zh_CN.md) | 存储、ASR、HTTP API 与配置 |
 | [视觉设计语言](docs/design/visual-language.zh_CN.md) | 配色、卡片几何、页面构成、动效 |
-| [项目里程碑](docs/project/milestones.zh_CN.md) | 交付顺序、退出条件、工作量、风险 |
+| [项目里程碑](docs/project/milestones.zh_CN.md) | 交付状态、全部待完善项、历史证据与验收 |
 | [上游文档索引](docs/README.zh_CN.md) | 硬件、工程与贡献规范 |
 | [AGENTS.md](AGENTS.zh_CN.md) | 本仓库 AI 协作规则 |
 

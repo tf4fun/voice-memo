@@ -12,8 +12,10 @@ This repository is a derivative of `FoloToy/ai-passport` and keeps its history
 and upstream remote, so baseline updates can still be merged. Application work
 happens on `feature/voice-memo`; `main` stays a clean upstream baseline.
 
-Status: product design agreed, implementation not started. See
-[the product specification](docs/product/product-spec.md).
+Status: capture, playback, server transcription, browsing and network modules
+are implemented. The application is not fully accepted; current delivery status
+and all remaining work are tracked in the [milestones](docs/project/milestones.md).
+The [product specification](docs/product/product-spec.md) describes current behaviour.
 
 ## Repository layout
 
@@ -21,11 +23,14 @@ Status: product design agreed, implementation not started. See
 | --- | --- | --- |
 | `main/` | yes | Application: pages, state machines, tasks |
 | `components/bsp/` | yes | Board support: display, audio, buttons, battery |
-| `docs/product/` | yes | Product specification and, later, design and milestone documents |
+| `server/` | yes | Go API, SQLite, transcription jobs, mDNS and SSE |
+| `docs/product/`, `docs/technical/`, `docs/design/` | yes | Current product behaviour and implementation |
+| `docs/project/` | yes | Milestones, remaining work and acceptance |
 | `scripts/` | yes | Reusable development and validation scripts |
 | `tools/` | yes | Upstream repository gate and firmware verification |
 | `bin/` | **no** | Local ESP-IDF installations, toolchains and Python runtime |
-| `.dsh/` | **no** | Installed `passport-*` AI skills for this workspace |
+| `.agents/skills/passport-*` | **no** | Repository-local links to the five required skills under `skills/` |
+| `.dsh/` | **no** | Legacy local AI-tool configuration |
 | `reference/` | **no** | Checked-out reference projects |
 
 `bin/`, `.dsh/` and `reference/` are listed in `.gitignore`; they hold several
@@ -86,8 +91,8 @@ stays happy.
 
 ```bash
 source scripts/go-env.sh
-cd server && go build ./... && go test ./...
-./scripts/e2e-server.sh   # real binary, fake transcriber, full HTTP flow
+(cd server && go build ./... && go test ./...)
+./scripts/e2e-server.sh   # real process with fake ASR; current audio assertion expects WAV
 ```
 
 ## Build and validate
@@ -100,7 +105,7 @@ source scripts/idf-env.sh
 ./tools/validate.sh              # complete gate
 ```
 
-On macOS the static gate cannot pass natively: two demo runtime tests link with
+On macOS the static gate cannot pass natively: the demo runtime tests link with
 `-Wl,--gc-sections`, which Apple's `ld` rejects. Use the Linux wrapper instead
 of editing the gate:
 
@@ -116,9 +121,11 @@ explicitly approved step; report `Build`, `Host tests`, `Device tests` and
 
 | Document | Contents |
 | --- | --- |
-| [Product specification](docs/product/product-spec.md) | Screens, controls, behaviour rules, acceptance |
+| [Product specification](docs/product/product-spec.md) | Current screens, controls and behaviour |
+| [Client design](docs/technical/client.md) | Firmware modules, audio, storage and networking |
+| [Server design](docs/technical/server.md) | Storage, ASR, HTTP API and configuration |
 | [Visual language](docs/design/visual-language.md) | Palette, card geometry, page composition, motion |
-| [Milestones](docs/project/milestones.md) | Delivery order, exit criteria, effort, risks |
+| [Milestones](docs/project/milestones.md) | Delivery status, all remaining work, historical evidence and acceptance |
 | [Upstream documentation index](docs/README.md) | Hardware, engineering and contribution guides |
 | [AGENTS.md](AGENTS.md) | Rules for AI-assisted work in this repository |
 

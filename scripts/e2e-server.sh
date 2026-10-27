@@ -109,11 +109,21 @@ echo "== patch rejects unknown field (expect 400)"
 [[ "$(status_of PATCH "/memos/${MEMO_ID}" '{"titel":"typo"}' -H "Content-Type: application/json")" == "400" ]] \
     || fail "unknown field was accepted"
 
-echo "== audio (expect 200 + RIFF), range (expect 206)"
+echo "== audio (expect original MEMO bytes), range (expect 206)"
 [[ "$(status_of GET "/memos/${MEMO_ID}/audio" "")" == "200" ]] || fail "audio download failed"
-head -c 4 "${WORK_DIR}/body" | grep -q RIFF || fail "audio is not a wav"
-[[ "$(curl -sS -o /dev/null -w '%{http_code}' -H 'Range: bytes=0-99' "${BASE}/memos/${MEMO_ID}/audio")" == "206" ]] \
+cmp -s "${FIXTURE}" "${WORK_DIR}/body" || fail "audio differs from original container"
+[[ "$(curl -sS -D "${WORK_DIR}/headers" -o "${WORK_DIR}/range" -w '%{http_code}' \
+    -H 'Range: bytes=0-99' "${BASE}/memos/${MEMO_ID}/audio")" == "206" ]] \
     || fail "range request did not answer 206"
+python3 - "${FIXTURE}" "${WORK_DIR}/range" "${WORK_DIR}/headers" <<'PY_CHECK'
+from pathlib import Path
+import sys
+fixture, partial, headers = map(Path, sys.argv[1:])
+assert partial.read_bytes() == fixture.read_bytes()[:100], "range bytes differ"
+headers = headers.read_text().lower()
+assert "content-type: application/octet-stream" in headers
+assert "content-range: bytes 0-99/" in headers
+PY_CHECK
 
 echo "== re-transcribe (expect 202)"
 [[ "$(status_of POST "/memos/${MEMO_ID}/transcribe" "")" == "202" ]] || fail "transcribe: $(cat "${WORK_DIR}/body")"

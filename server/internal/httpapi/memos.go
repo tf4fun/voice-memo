@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"os"
@@ -18,6 +19,8 @@ import (
 	"github.com/tf4fun/voice-memo/server/internal/events"
 	"github.com/tf4fun/voice-memo/server/internal/store"
 )
+
+var deviceIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
 var memoIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
@@ -128,8 +131,8 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, _ *http.Request) {
 // handleUpload accepts one finished recording.
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	deviceID := strings.TrimSpace(r.Header.Get("X-Device-Id"))
-	if deviceID == "" {
-		writeError(w, http.StatusBadRequest, "missing_device", "X-Device-Id is required")
+	if !deviceIDPattern.MatchString(deviceID) {
+		writeError(w, http.StatusBadRequest, "missing_device", "X-Device-Id must contain 1-64 ASCII letters, digits, underscores or hyphens")
 		return
 	}
 	memoID := strings.TrimSpace(r.Header.Get("X-Memo-Id"))
@@ -138,8 +141,17 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	hash := fnv.New32a()
+	_, _ = hash.Write([]byte(memoID))
+	guard := &s.uploads[hash.Sum32()%uint32(len(s.uploads))]
+	guard.Lock()
+	defer guard.Unlock()
 	ctx := r.Context()
 	if existing, err := s.store.Memo(ctx, memoID); err == nil {
+		if existing.DeviceID != deviceID {
+			writeError(w, http.StatusConflict, "id_conflict", "memo belongs to another device")
+			return
+		}
 		// Idempotent replay: the device can retry bluntly after a timeout.
 		writeJSON(w, http.StatusOK, map[string]any{
 			"id":          existing.ID,
@@ -160,14 +172,15 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	body := http.MaxBytesReader(w, r.Body, s.cfg.MaxBytes)
-	partPath := filepath.Join(s.cfg.IncomingDir(), memoID+".part")
-	part, err := os.Create(partPath)
+	part, err := os.CreateTemp(s.cfg.IncomingDir(), memoID+"-*.part")
 	if err != nil {
 		s.log.Error("upload: create part file", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal", "storage unavailable")
 		return
 	}
+	partPath := part.Name()
 	written, copyErr := io.Copy(part, body)
+	syncErr := part.Sync()
 	closeErr := part.Close()
 	defer os.Remove(partPath)
 
@@ -181,7 +194,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_container", "upload was interrupted")
 		return
 	}
-	if closeErr != nil {
+	if closeErr != nil || syncErr != nil {
 		s.log.Error("upload: close part file", "error", closeErr)
 		writeError(w, http.StatusInternalServerError, "internal", "storage unavailable")
 		return
@@ -241,10 +254,26 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	/* 校验通过后把临时文件挪到正式位置，内容原样保留。 */
-	if err := os.Rename(partPath, audioPath); err != nil {
+	if stats.Duration.Milliseconds() > s.cfg.MaxMemoMS {
+		writeError(w, http.StatusBadRequest, "over_limit", "frame duration exceeds configured limit")
+		return
+	}
+	// Publish without replacing an existing recording, including orphan files
+	// from a previous process. Incoming and audio share the data filesystem.
+	if err := os.Link(partPath, audioPath); err != nil {
 		s.log.Error("upload: move audio into place", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal", "storage unavailable")
+		return
+	}
+
+	dir, dirErr := os.Open(filepath.Dir(audioPath))
+	if dirErr == nil {
+		dirErr = dir.Sync()
+		_ = dir.Close()
+	}
+	if dirErr != nil {
+		_ = os.Remove(audioPath)
+		writeError(w, http.StatusInternalServerError, "internal", "storage sync failed")
 		return
 	}
 
@@ -265,7 +294,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		AudioPath:  audioPath,
 		ClockSkew:  skew,
 	}
-	created, err := s.store.InsertMemo(ctx, memo)
+	created, err := s.store.InsertMemoAndEnqueue(ctx, memo)
 	if err != nil {
 		os.Remove(audioPath)
 		s.log.Error("upload: insert memo", "error", err)
@@ -283,10 +312,6 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 			"id": existing.ID, "status": existing.Status, "duration_ms": existing.DurationMS,
 		})
 		return
-	}
-
-	if err := s.store.EnqueueJob(ctx, memoID, now); err != nil {
-		s.log.Error("upload: enqueue job", "error", err)
 	}
 
 	s.events.Publish(events.Event{
@@ -430,7 +455,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleAudio streams the canonical WAV, with range support for resume.
+// handleAudio streams the original MEMO container, with byte range support.
 func (s *Server) handleAudio(w http.ResponseWriter, r *http.Request) {
 	memo, err := s.store.Memo(r.Context(), r.PathValue("id"))
 	if errors.Is(err, store.ErrNotFound) {
@@ -456,7 +481,6 @@ func (s *Server) handleAudio(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "audio/wav")
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("Content-Type", "application/octet-stream")
 	http.ServeContent(w, r, memo.ID+".memo", info.ModTime(), file)

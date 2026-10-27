@@ -39,7 +39,15 @@ func (s *Store) TouchDevice(ctx context.Context, id, name string, now int64) err
 // InsertMemo stores a new memo. It reports false when the id already exists,
 // which is how upload idempotency is enforced.
 func (s *Store) InsertMemo(ctx context.Context, m domain.Memo) (bool, error) {
-	res, err := s.db.ExecContext(ctx, `
+	return insertMemo(ctx, s.db, m)
+}
+
+type memoExecutor interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func insertMemo(ctx context.Context, db memoExecutor, m domain.Memo) (bool, error) {
+	res, err := db.ExecContext(ctx, `
 		INSERT INTO memos (id, device_id, recorded_at, uploaded_at, duration_ms,
 			frame_count, size_bytes, codec, status, transcript, lang, asr_provider,
 			asr_model, asr_trace_id, edited_at, error, audio_path, clock_skew, deleted_at)
@@ -58,6 +66,29 @@ func (s *Store) InsertMemo(ctx context.Context, m domain.Memo) (bool, error) {
 		return false, fmt.Errorf("insert memo rows: %w", err)
 	}
 	return affected == 1, nil
+}
+
+// InsertMemoAndEnqueue makes the accepted recording and its first job one
+// transaction. A failed enqueue must never leave a permanently unprocessed memo.
+func (s *Store) InsertMemoAndEnqueue(ctx context.Context, m domain.Memo) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	created, err := insertMemo(ctx, tx, m)
+	if err != nil {
+		return false, err
+	}
+	if created {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO jobs (memo_id, attempts, next_at) VALUES (?, 0, ?)`, m.ID, m.UploadedAt); err != nil {
+			return false, fmt.Errorf("enqueue accepted memo: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return created, nil
 }
 
 // Memo returns one live memo.
@@ -310,10 +341,10 @@ type scanner interface {
 
 func scanMemo(s scanner) (domain.Memo, error) {
 	var (
-		m                                     domain.Memo
-		transcript, lang                      sql.NullString
-		provider, model, traceID, errText     sql.NullString
-		editedAt, deletedAt                   sql.NullInt64
+		m                                 domain.Memo
+		transcript, lang                  sql.NullString
+		provider, model, traceID, errText sql.NullString
+		editedAt, deletedAt               sql.NullInt64
 	)
 	err := s.Scan(
 		&m.ID, &m.DeviceID, &m.RecordedAt, &m.UploadedAt, &m.DurationMS,

@@ -4,8 +4,11 @@
 #include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 #include "esp_log.h"
 #include "esp_spiffs.h"
@@ -14,12 +17,18 @@
 
 static const char *TAG = "memo_spool";
 static bool s_mounted;
+static atomic_bool s_recovery_blocked;
+
+bool memo_spool_recovery_blocked(void) { return s_recovery_blocked; }
 
 static const char *extension_of(memo_spool_state_t state)
 {
     switch (state) {
     case MEMO_SPOOL_SENT: return "sent";
     case MEMO_SPOOL_BAD: return "bad";
+    case MEMO_SPOOL_LEGACY_KEPT: return "keep";
+    case MEMO_SPOOL_RECORDING: return "rec";
+    case MEMO_SPOOL_DRAFT: return "draft";
     default: return "memo";
     }
 }
@@ -59,11 +68,11 @@ esp_err_t memo_spool_create(const char *id, const uint8_t header[80], void **fil
     if (!s_mounted) return ESP_ERR_INVALID_STATE;
 
     char path[64];
-    path_for(path, sizeof(path), id, MEMO_SPOOL_PENDING);
+    path_for(path, sizeof(path), id, MEMO_SPOOL_RECORDING);
 
     /* SPIFFS 的对象名上限由 CONFIG_SPIFFS_OBJ_NAME_LEN 决定，超了只会得到 ENAMETOOLONG。
        先自己判一次，日志里就能直接看出是名字太长还是别的原因。 */
-    const char *base = path + sizeof(MEMO_SPOOL_MOUNT_POINT);
+    const char *base = strrchr(path, '/') + 1;
     if (strlen(base) >= CONFIG_SPIFFS_OBJ_NAME_LEN) {
         ESP_LOGE(TAG, "file name too long for SPIFFS (%u >= %d): %s",
                  (unsigned)strlen(base), CONFIG_SPIFFS_OBJ_NAME_LEN, base);
@@ -72,12 +81,15 @@ esp_err_t memo_spool_create(const char *id, const uint8_t header[80], void **fil
 
     /* 必须是读写模式：收尾时要先读回头部再回填帧数与时长，只写模式会让
        fread 失败，表现为"录音存不下来"。 */
-    FILE *file = fopen(path, "w+b");
+    int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) return ESP_FAIL;
+    FILE *file = fdopen(fd, "w+b");
     if (file == NULL) {
+        close(fd);
         ESP_LOGE(TAG, "cannot create %s: errno=%d", path, errno);
         return ESP_FAIL;
     }
-    if (fwrite(header, 1, 80, file) != 80) {
+    if (fwrite(header, 1, 80, file) != 80 || fflush(file) != 0 || fsync(fileno(file)) != 0) {
         fclose(file);
         remove(path);
         return ESP_FAIL;
@@ -90,17 +102,17 @@ esp_err_t memo_spool_append(void *file, const void *data, size_t len)
 {
     if (file == NULL || data == NULL || len == 0) return ESP_ERR_INVALID_ARG;
     FILE *f = (FILE *)file;
-    if (fwrite(data, 1, len, f) != len) {
+    if (fwrite(data, 1, len, f) != len || fflush(f) != 0 || fsync(fileno(f)) != 0) {
         ESP_LOGE(TAG, "spool write failed (%u bytes)", (unsigned)len);
         return ESP_FAIL;
     }
     return ESP_OK;
 }
 
-esp_err_t memo_spool_finalize(void *file, uint32_t frame_count, uint32_t duration_ms,
+esp_err_t memo_spool_finalize(void *file, const char *id, uint32_t frame_count, uint32_t duration_ms,
                               uint32_t *size_out)
 {
-    if (file == NULL) return ESP_ERR_INVALID_ARG;
+    if (file == NULL || id == NULL) return ESP_ERR_INVALID_ARG;
     FILE *f = (FILE *)file;
 
     uint8_t header[80];
@@ -122,10 +134,11 @@ esp_err_t memo_spool_finalize(void *file, uint32_t frame_count, uint32_t duratio
         if (end > 0) size = (uint32_t)end;
     }
     if (size_out != NULL) *size_out = size;
-    if (fclose(f) != 0) return ESP_FAIL;
+    bool synced = fflush(f) == 0 && fsync(fileno(f)) == 0;
+    if (fclose(f) != 0 || !synced) return ESP_FAIL;
     ESP_LOGI(TAG, "saved %u frames, %u ms, %u bytes",
              (unsigned)frame_count, (unsigned)duration_ms, (unsigned)size);
-    return ESP_OK;
+    return memo_spool_move(id, MEMO_SPOOL_RECORDING, MEMO_SPOOL_DRAFT);
 }
 
 esp_err_t memo_spool_discard(void *file, const char *id)
@@ -133,7 +146,7 @@ esp_err_t memo_spool_discard(void *file, const char *id)
     if (file != NULL) fclose((FILE *)file);
     if (id != NULL) {
         char path[64];
-        path_for(path, sizeof(path), id, MEMO_SPOOL_PENDING);
+        path_for(path, sizeof(path), id, MEMO_SPOOL_RECORDING);
         remove(path);
     }
     return ESP_OK;
@@ -156,6 +169,12 @@ static bool parse_name(const char *name, memo_spool_entry_t *entry)
         entry->state = MEMO_SPOOL_SENT;
     } else if (strcmp(dot + 1, "bad") == 0) {
         entry->state = MEMO_SPOOL_BAD;
+    } else if (strcmp(dot + 1, "keep") == 0) {
+        entry->state = MEMO_SPOOL_LEGACY_KEPT;
+    } else if (strcmp(dot + 1, "rec") == 0) {
+        entry->state = MEMO_SPOOL_RECORDING;
+    } else if (strcmp(dot + 1, "draft") == 0) {
+        entry->state = MEMO_SPOOL_DRAFT;
     } else {
         return false;
     }
@@ -181,7 +200,7 @@ int memo_spool_scan(memo_spool_entry_t *out, size_t max_entries)
         entry.size = (stat(path, &info) == 0) ? (uint32_t)info.st_size : 0;
 
         /* 头部里有录音时刻与时长，列表直接用它，不必再解析一次。 */
-        if (entry.state == MEMO_SPOOL_PENDING && entry.size >= MEMO_CONTAINER_HEADER_SIZE) {
+        if (entry.state != MEMO_SPOOL_SENT && entry.size >= MEMO_CONTAINER_HEADER_SIZE) {
             FILE *file = fopen(path, "rb");
             if (file != NULL) {
                 uint8_t raw[MEMO_CONTAINER_HEADER_SIZE];
@@ -194,6 +213,7 @@ int memo_spool_scan(memo_spool_entry_t *out, size_t max_entries)
                                                 ? header.recorded_at
                                                 : 0;
                         entry.duration_ms = header.duration_ms;
+                        entry.frame_count = header.frame_count;
                     }
                 }
                 fclose(file);
@@ -209,48 +229,86 @@ int memo_spool_scan(memo_spool_entry_t *out, size_t max_entries)
     return count;
 }
 
-int memo_spool_drop_empty(void)
+int memo_spool_recover(void)
 {
     if (!s_mounted) return 0;
-
+    s_recovery_blocked = false;
     memo_spool_entry_t entries[MEMO_SPOOL_MAX_ENTRIES];
-    int total = memo_spool_scan(entries, MEMO_SPOOL_MAX_ENTRIES);
-    int dropped = 0;
-
-    for (int i = 0; i < total && i < MEMO_SPOOL_MAX_ENTRIES; i++) {
-        if (entries[i].state != MEMO_SPOOL_PENDING) continue;
-        if (entries[i].size <= MEMO_CONTAINER_HEADER_SIZE) {
-            /* 只有头部、没有任何帧：上一次录音在中途被打断。 */
-            ESP_LOGW(TAG, "dropping empty stub %s (%u bytes)",
-                     entries[i].id, (unsigned)entries[i].size);
-            if (memo_spool_remove(entries[i].id, MEMO_SPOOL_PENDING) == ESP_OK) dropped++;
+    int count = memo_spool_scan(entries, MEMO_SPOOL_MAX_ENTRIES), recovered = 0;
+    for (int i = 0; i < count && i < MEMO_SPOOL_MAX_ENTRIES; i++) {
+        memo_spool_entry_t *e = &entries[i];
+        if (e->state != MEMO_SPOOL_RECORDING && e->state != MEMO_SPOOL_DRAFT &&
+            e->state != MEMO_SPOOL_PENDING) continue;
+        char path[64]; path_for(path, sizeof(path), e->id, e->state);
+        FILE *file = fopen(path, "r+b");
+        if (file == NULL) { s_recovery_blocked = true; continue; }
+        uint8_t raw[80]; memo_container_header_t header;
+        bool valid = fread(raw, 1, sizeof(raw), file) == sizeof(raw) &&
+                     memo_container_decode(raw, &header) && header.frame_ms > 0 &&
+                     header.frame_ms <= 60 && header.sample_rate == 16000 && header.channels == 1;
+        uint32_t frames = 0, end = 80;
+        while (valid && end + 2 <= e->size) {
+            uint8_t length[2];
+            if (fread(length, 1, 2, file) != 2) break;
+            uint32_t len = length[0] | ((uint32_t)length[1] << 8);
+            if (len == 0 || len > e->size - end - 2) break;
+            if (fseek(file, len, SEEK_CUR) != 0) break;
+            end += 2 + len; frames++;
+        }
+        if (!valid || frames == 0) {
+            fclose(file);
+            if (memo_spool_move(e->id, e->state, MEMO_SPOOL_BAD) == ESP_OK) recovered++;
+            else s_recovery_blocked = true;
             continue;
         }
-
-        char path[64];
-        path_for(path, sizeof(path), entries[i].id, MEMO_SPOOL_PENDING);
-        FILE *file = fopen(path, "rb");
-        if (file == NULL) continue;
-        uint8_t header[MEMO_CONTAINER_HEADER_SIZE];
-        bool ok = fread(header, 1, sizeof(header), file) == sizeof(header);
-        fclose(file);
-
-        memo_container_header_t parsed;
-        if (ok && memo_container_decode(header, &parsed) && parsed.frame_count == 0) {
-            ESP_LOGW(TAG, "dropping zero-frame recording %s", entries[i].id);
-            if (memo_spool_remove(entries[i].id, MEMO_SPOOL_PENDING) == ESP_OK) dropped++;
+        bool damaged = end != e->size || header.frame_count != frames ||
+                       header.duration_ms != frames * header.frame_ms;
+        bool draft = e->state == MEMO_SPOOL_RECORDING || damaged;
+        if (draft) {
+            /* Revoke upload eligibility before touching a damaged confirmed
+             * file. If any recovery I/O fails, the uploader stays held. */
+            if (e->state == MEMO_SPOOL_PENDING) {
+                fclose(file);
+                if (memo_spool_move(e->id, e->state, MEMO_SPOOL_DRAFT) != ESP_OK) {
+                    s_recovery_blocked = true;
+                    continue;
+                }
+                e->state = MEMO_SPOOL_DRAFT;
+                path_for(path, sizeof(path), e->id, e->state);
+                file = fopen(path, "r+b");
+                if (file == NULL) { s_recovery_blocked = true; continue; }
+            }
+            memo_container_patch(raw, frames, frames * header.frame_ms);
+            bool ok = fseek(file, 0, SEEK_SET) == 0 && fwrite(raw, 1, 80, file) == 80 &&
+                      fflush(file) == 0 && ftruncate(fileno(file), end) == 0 &&
+                      fsync(fileno(file)) == 0;
+            if (fclose(file) != 0) ok = false;
+            if (ok && (e->state == MEMO_SPOOL_DRAFT ||
+                       memo_spool_move(e->id, e->state, MEMO_SPOOL_DRAFT) == ESP_OK)) recovered++;
+            else s_recovery_blocked = true;
+        } else {
+            fclose(file);
         }
     }
-    return dropped;
+    return recovered;
 }
 
+int memo_spool_drop_empty(void) { return memo_spool_recover(); }
+
 esp_err_t memo_spool_set_state(const char *id, memo_spool_state_t state)
+{
+    return memo_spool_move(id, MEMO_SPOOL_PENDING, state);
+}
+
+esp_err_t memo_spool_move(const char *id, memo_spool_state_t source, memo_spool_state_t state)
 {
     if (id == NULL) return ESP_ERR_INVALID_ARG;
 
     char from[64], to[64];
-    path_for(from, sizeof(from), id, MEMO_SPOOL_PENDING);
+    path_for(from, sizeof(from), id, source);
     path_for(to, sizeof(to), id, state);
+    struct stat existing;
+    if (stat(to, &existing) == 0 || errno != ENOENT) return ESP_FAIL;
     if (rename(from, to) != 0) {
         ESP_LOGW(TAG, "rename %s -> %s failed", from, to);
         return ESP_FAIL;

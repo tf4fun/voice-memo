@@ -11,7 +11,7 @@ typedef struct {
 } transition_t;
 
 /* 只列出有意义的迁移；表里没有的组合一律视为「忽略」，返回 MEMO_ACT_NONE。
-   ARMING 由调用方在 3 秒后投递 MEMO_IN_ARM_COMPLETE，或用 MEMO_IN_OK_RELEASE 取消。 */
+   ARMING uses MEMO_ARMING_MS, or MEMO_IN_OK_RELEASE to cancel. */
 static const transition_t TRANSITIONS[] = {
     /* 列表 */
     {MEMO_STATE_LIST, MEMO_IN_UP_CLICK, MEMO_STATE_LIST, MEMO_ACT_SELECT_PREV},
@@ -78,6 +78,11 @@ static const transition_t TRANSITIONS[] = {
     /* 错误页：任意确认都关掉 */
     {MEMO_STATE_ERROR, MEMO_IN_OK_CLICK, MEMO_STATE_LIST, MEMO_ACT_DISMISS_ERROR},
     {MEMO_STATE_ERROR, MEMO_IN_OK_HOLD, MEMO_STATE_LIST, MEMO_ACT_DISMISS_ERROR},
+
+    {MEMO_STATE_UPLOAD_REJECTED, MEMO_IN_UP_CLICK, MEMO_STATE_UPLOAD_REJECTED, MEMO_ACT_REJECT_TOGGLE},
+    {MEMO_STATE_UPLOAD_REJECTED, MEMO_IN_DOWN_CLICK, MEMO_STATE_UPLOAD_REJECTED, MEMO_ACT_REJECT_TOGGLE},
+    {MEMO_STATE_UPLOAD_REJECTED, MEMO_IN_OK_CLICK, MEMO_STATE_UPLOAD_REJECTED, MEMO_ACT_REJECT_RETRY},
+    {MEMO_STATE_UPLOAD_REJECTED, MEMO_IN_OK_HOLD, MEMO_STATE_UPLOAD_REJECTED, MEMO_ACT_REJECT_RETRY},
 };
 
 #define TRANSITION_COUNT (sizeof(TRANSITIONS) / sizeof(TRANSITIONS[0]))
@@ -88,6 +93,16 @@ void memo_sm_init(memo_sm_t *sm)
     sm->state = MEMO_STATE_LIST;
     sm->expanded = false;
     sm->confirm_save = true; /* 刚录完，默认"保存"更顺手 */
+    sm->reject_delete = false;
+}
+
+bool memo_sm_open_rejection(memo_sm_t *sm)
+{
+    if (sm == NULL || (sm->state != MEMO_STATE_LIST &&
+                       sm->state != MEMO_STATE_UPLOAD_REJECTED)) return false;
+    sm->state = MEMO_STATE_UPLOAD_REJECTED;
+    sm->reject_delete = false;
+    return true;
 }
 
 memo_action_t memo_sm_handle(memo_sm_t *sm, memo_input_t input)
@@ -99,6 +114,12 @@ memo_action_t memo_sm_handle(memo_sm_t *sm, memo_input_t input)
         if (t->from != sm->state || t->input != input) continue;
 
         sm->state = t->to;
+        if (t->action == MEMO_ACT_REJECT_TOGGLE) {
+            sm->reject_delete = !sm->reject_delete;
+        } else if (t->action == MEMO_ACT_REJECT_RETRY) {
+            if (input == MEMO_IN_OK_HOLD) sm->reject_delete = false;
+            return sm->reject_delete ? MEMO_ACT_REJECT_DELETE : MEMO_ACT_REJECT_RETRY;
+        }
         if (t->action == MEMO_ACT_STOP_AND_SAVE) {
             sm->confirm_save = true; /* 每次停录都回到默认项 */
         } else if (t->action == MEMO_ACT_CONFIRM_TOGGLE) {
@@ -138,6 +159,7 @@ const char *memo_state_name(memo_state_t state)
     case MEMO_STATE_SUB_PAGE: return "sub_page";
     case MEMO_STATE_PROVISIONING: return "provisioning";
     case MEMO_STATE_ERROR: return "error";
+    case MEMO_STATE_UPLOAD_REJECTED: return "upload_rejected";
     default: return "?";
     }
 }
@@ -177,6 +199,9 @@ const char *memo_action_name(memo_action_t action)
     case MEMO_ACT_PREV_MEMO: return "prev_memo";
     case MEMO_ACT_SCROLL_UP: return "scroll_up";
     case MEMO_ACT_SCROLL_DOWN: return "scroll_down";
+    case MEMO_ACT_REJECT_TOGGLE: return "reject_toggle";
+    case MEMO_ACT_REJECT_RETRY: return "reject_retry";
+    case MEMO_ACT_REJECT_DELETE: return "reject_delete";
     default: return "?";
     }
 }
@@ -202,7 +227,7 @@ bool memo_state_keeps_screen_on(memo_state_t state)
 {
     return state == MEMO_STATE_ARMING || state == MEMO_STATE_RECORDING ||
            state == MEMO_STATE_CONFIRM || state == MEMO_STATE_PLAYING ||
-           state == MEMO_STATE_PROVISIONING;
+           state == MEMO_STATE_PROVISIONING || state == MEMO_STATE_UPLOAD_REJECTED;
 }
 
 bool memo_state_is_recording(memo_state_t state)

@@ -178,6 +178,35 @@ static void test_every_state_handles_every_input(void)
     }
 }
 
+static void test_rejection_choice(void)
+{
+    memo_sm_t sm;
+    memo_sm_init(&sm);
+    assert(!memo_sm_open_rejection(NULL));
+    for (int state = 0; state < MEMO_STATE_COUNT; state++) {
+        sm.state = (memo_state_t)state;
+        assert(memo_sm_open_rejection(&sm) ==
+               (state == MEMO_STATE_LIST || state == MEMO_STATE_UPLOAD_REJECTED));
+    }
+    sm.state = MEMO_STATE_LIST;
+    assert(memo_sm_open_rejection(&sm));
+    assert(!sm.reject_delete);
+    assert(memo_sm_handle(&sm, MEMO_IN_OK_CLICK) == MEMO_ACT_REJECT_RETRY);
+    assert(sm.state == MEMO_STATE_UPLOAD_REJECTED); /* wait for worker ack */
+    assert(memo_sm_handle(&sm, MEMO_IN_DOWN_CLICK) == MEMO_ACT_REJECT_TOGGLE);
+    assert(sm.reject_delete);
+    assert(memo_sm_handle(&sm, MEMO_IN_OK_CLICK) == MEMO_ACT_REJECT_DELETE);
+    assert(memo_sm_open_rejection(&sm)); /* another file resets destructive selection */
+    assert(!sm.reject_delete);
+    memo_sm_handle(&sm, MEMO_IN_DOWN_CLICK);
+    assert(memo_sm_handle(&sm, MEMO_IN_OK_HOLD) == MEMO_ACT_REJECT_RETRY);
+    assert(!sm.reject_delete);
+    expect_ignored(MEMO_STATE_UPLOAD_REJECTED, MEMO_IN_OK_PRESS);
+    expect_ignored(MEMO_STATE_UPLOAD_REJECTED, MEMO_IN_OK_RELEASE);
+    expect_ignored(MEMO_STATE_UPLOAD_REJECTED, MEMO_IN_UP_HOLD);
+    assert(memo_state_keeps_screen_on(MEMO_STATE_UPLOAD_REJECTED));
+}
+
 int main(void)
 {
     test_list_navigation();
@@ -190,6 +219,7 @@ int main(void)
     test_ignored_inputs_are_explicit();
     test_screen_and_recording_flags();
     test_every_state_handles_every_input();
+    test_rejection_choice();
     puts("memo state machine: PASS");
     return 0;
 }

@@ -4,246 +4,182 @@
 
 # Voice Memo — Product Specification
 
-Status: draft, agreed with the product owner on 2026-10-26. Implementation details
-(font sizes, row density, copy) are deliberately left open and settled during
-development.
+Implementation snapshot: 2026-10-27, based on the current `feature/voice-memo`
+code. This document describes current behaviour. Delivery status, remaining
+work and acceptance checks are tracked in the [milestones](../project/milestones.md).
 
 ## 1. Positioning
 
-Voice Memo turns the FoloToy AI Passport into a **worn voice diary**: capture a
-thought in a few seconds, and read it back later as text.
+Voice Memo turns FoloToy AI Passport into a wearable voice diary: record a
+thought, send it to a server for transcription, read the text and replay the
+original voice. Entries have no titles, tags, folders or to-do states. The device
+has no editing or deletion interface for server history.
 
-It records and revisits; it does not manage. There is no to-do state, no
-checkbox, no completion, no inbox. An entry is a moment in time with an audio
-recording and a transcript.
+## 2. Deployment
 
-## 2. Core scenarios
+The device connects to a server on the same LAN. The server stores history and
+calls a hosted transcription service; a fake transcriber also supports local
+development. The device itself does no speech recognition.
 
-| Scenario | What the user does | What the product must guarantee |
-| --- | --- | --- |
-| Quick capture | Holds OK for three seconds while walking, speaks for twenty seconds, releases | Saved immediately, uploads later on its own, never lost |
-| Evening review | Scrolls the list back through today and yesterday, opens an entry, reads the text | Text is readable on a 240×320 screen, newest first |
-| Long entry | Records a five-minute meeting recap | Duration is visible, a cap prevents runaway recordings |
-| Listen again | Opens an entry and plays the original audio | Audio is the original recording, not a re-synthesis |
-| Setup | Configures Wi-Fi from a phone, checks that the server was found | No keyboard is needed on the device |
-
-## 3. Product form
-
-One device, one cloud service. The device only records, browses, reads, and
-listens; every text operation happens on the server, so the device never waits
-for transcription.
-
-Three screens, one settings area:
+## 3. Navigation
 
 ```text
-List (home) --OK click--> Detail (text / audio) --OK hold--> back to list
-    |
-    |--OK hold 3 s----> Recording --OK click--> saved, back to list
-    |
-    +--UP or DOWN hold-> Settings --OK click--> the item's own sub-page
+List --OK click--> Detail --OK hold--> List
+  |
+  +--hold OK for 1 s--> Record --release / 5-minute cap--> Save / cancel
+  |
+  +--UP or DOWN hold--> Settings --UP or DOWN hold--> List
 ```
 
 ## 4. Screens and controls
 
-### 4.1 List (home)
+### 4.1 List
 
-Newest first, grouped by day (Today / Yesterday / date). Entries that have not
-reached the server yet stay in time order and show a small status dot.
+The home page draws five fixed cards with time, text and duration. Local pending,
+rejected and legacy unresolved recordings come first, followed by up to 24 server entries. Server entries are
+ordered newest first; there are no date-group headings. The selection can move
+beyond the five drawn cards, but the visible window stays on the first five.
 
-| Input | Action |
+| Input | Behaviour |
 | --- | --- |
-| UP / DOWN | Move the selection |
-| OK click | Open the entry |
-| OK hold 3 s | Start recording |
-| UP hold or DOWN hold | Open settings |
+| UP / DOWN click | Move selection, stopping at either end |
+| OK click | Open the selected entry |
+| OK press and hold | Show a ring immediately; begin recording when it fills after one second |
+| UP or DOWN hold | Open settings |
 
-A short hint on the list states how to record and how to reach settings. Full
-text is truncated at a character boundary and never breaks a multi-byte
-character.
+Releasing OK before the ring fills abandons recording preparation; a short
+click can then open the selected entry. If an earlier recording is still pending
+upload or waiting for a rejection choice, a new recording is blocked and the page shows a short notice.
 
-Before the device has been provisioned, the list shows a single empty-state line
-pointing at settings instead of a blank screen.
+The footer shows the entry count or an empty-state message. Battery percentage
+appears on this page; an unavailable reading is shown as `--`. An unsynchronised
+time is shown as `--:--`.
 
-### 4.2 Detail
+Server rows show a transcript snippet when present, a no-transcript label for
+`ready` entries with empty text, and a transcribing label otherwise. This also
+means a failed transcription currently uses the transcribing label.
 
-Text on top, a playback bar below. A three-step cycle on OK, no focus
-switching:
+### 4.2 Detail and playback
 
-```text
-collapsed --OK--> expanded --OK--> playing --OK--> paused --OK--> playing ...
-     |
-     +------------ OK hold: back to list ------------+
-```
+Opening an entry immediately displays the expanded text panel and a playback
+bar. Remote text is fetched on entry with a 512-byte destination buffer. When
+text is absent or unavailable, the page displays a fixed message about the local
+recording and connecting to the server; this message is also used for remote
+entries without text.
 
-| State | OK click | UP / DOWN | OK hold |
-| --- | --- | --- | --- |
-| Collapsed (six lines, ends with an ellipsis) | Expand the full text | Previous / next entry | Back to list |
-| Expanded | Start playback | Scroll the text | Back to list |
-| Playing or paused | Pause or resume | Scroll the text | Back to list |
+| Input | Behaviour |
+| --- | --- |
+| First OK click | Play the original recording |
+| OK click while playing | Stop playback, entering the pause state |
+| OK click in the pause state | Play again from the beginning |
+| OK hold | Stop playback and return to the list |
+| UP / DOWN click | No visible scrolling in the current application |
 
-Expanding is a one-way action for the current visit; leaving the entry and
-returning restores the collapsed state.
-
-When **autoplay** is on (section 4.5), opening an entry starts playback
-immediately and the first OK press pauses instead of expanding.
+Local pending, rejected and legacy unresolved entries play from device storage. Server entries stream directly
+from the server without a local audio cache. Autoplay starts playback when an
+entry opens; it defaults to off. Playback completion returns to expanded detail.
 
 ### 4.3 Recording
 
-Large elapsed timer, a level bar, battery in the top-right corner. **Hold to
-record, release to stop**: one gesture covers the whole capture.
+Hold OK throughout capture. The page shows a large timer, twelve level bars and
+a recording indicator. Release OK to stop; at 4:30 the timer turns red, and at
+5:00 the application requests a stop automatically. Display timing and the cap use monotonic wall time, checked every 200 ms;
+the stored audio duration counts encoded samples.
 
-```text
-press OK ──ring fills (1 s)──► recording starts (finger still down)
-                                   │
-                              release OK
-                                   ▼
-                       stop and ask: save / cancel
-```
+### 4.4 Save/cancel confirmation
 
-| Phase | Input | Action |
-| --- | --- | --- |
-| Ring filling | release early | abandon, nothing recorded |
-| Recording | release OK | stop and show the choice sheet |
-| Choice sheet | UP / DOWN | move between save and cancel |
-| Choice sheet | OK click | confirm the highlighted item |
-| Choice sheet | OK hold | same as cancel |
+Stopping finalises the local file and opens a save/cancel sheet, with save
+selected initially. UP or DOWN switches choices; OK confirms; holding OK
+cancels. The five-minute cap opens the same sheet and does not auto-confirm it.
 
-The ring counts from the **press**, not from the long-press threshold, so
-touching the key and speaking are about a second apart. No navigation is
-accepted while recording.
+Save makes the local draft eligible for upload and returns to the list. Cancel
+removes only the draft. Failed file operations retain the choice and report an
+error. Capture and unconfirmed drafts block upload across reboot. After an
+interruption, complete stored frames return to save/cancel confirmation; invalid
+or empty data remains quarantined for a user decision. Unflushed audio cannot be
+recovered. Upload success deletes the local file. Every unresolved recording
+continues to occupy the single processing slot.
 
-### 4.4 Recording arming
+HTTP 4xx rejection is tried at most **three times total**, including the first
+request. After the third rejection, automatic upload stops and the list shows a
+retry/delete dialog with the recording time and duration. It waits until the
+user returns to the list rather than interrupting another page or action.
+UP/DOWN changes the choice and OK confirms. Retry is the default; holding OK
+also retries. Retry starts a fresh round of at most three rejected attempts for
+the same memo ID. Only an explicit delete choice removes the rejected recording;
+file-operation failure leaves the file and dialog intact for another choice.
 
-Pressing OK on the list immediately shows a ring that fills in one second;
-releasing early cancels. The ring is the only feedback that a hold is long enough, and it
-is what distinguishes "open this entry" from "start recording".
+Local storage is one processing slot, not an archive. Until the recording has
+uploaded successfully or been explicitly deleted, another recording is blocked,
+including after choosing retry and across reboot. Undecided rejected files reopen
+the choice even offline. The firmware creates no new kept-file archive. Legacy
+`.keep` files from the superseded build are treated as unresolved: they also
+block capture and offer retry/delete. If several legacy files already exist,
+they are preserved and drained one at a time before allowing a new recording.
 
 ### 4.5 Settings
 
-Up and down are both settings entries, so the gesture does not depend on which
-end of the list the user is looking at.
+UP and DOWN move between seven rows; holding either returns to the list.
 
-| Row | Shows | OK click |
+| Row | Display | OK click |
 | --- | --- | --- |
-| Network | `Connected <SSID>` or `Not connected` | Bluetooth provisioning (4.6) |
-| Server | `Found <name> · reachable` or `Not found` | Discover again (4.7) |
-| Volume | `40 / 60 / 80 / 100%` | Open the volume sub-page |
-| Screen timeout | `Always on / 30 s / 1 min / 3 min` | Open the timeout sub-page |
-| Sleep | `Never / 1 min / 5 min / 15 min` | Open the sleep sub-page |
-| Autoplay | `On / Off` | Toggle in place |
-| About | Firmware version, short device ID, pending uploads | Nothing |
+| Network | SSID, connecting, unconfigured or disconnected | Enter Bluetooth provisioning |
+| Server | Discovered `host:port`, searching or not found | No action |
+| Volume | 0 / 20 / 40 / 60 / 80 / 100%, default 80% | Open value overlay |
+| Screen timeout | Always on / 30 s / 1 min / 3 min, default 30 s | Open value overlay |
+| Sleep | Never / 1 min / 5 min / 15 min, default 5 min | Open value overlay |
+| Autoplay | On / Off, default off | Toggle immediately |
+| About | `v0.1` | No action |
 
-Inside the settings list, UP and DOWN only move the selection. Inside a
-sub-page the rule is uniform: **OK click saves and returns, OK hold cancels and
-returns**.
-
-- **Volume** is a single large number with an adjustment hint. Every step plays
-  a short confirmation tone at the new level, so the setting is judged by
-  listening rather than guessing.
-- **Screen timeout and sleep** are option lists: UP and DOWN choose, OK saves.
-  Defaults are 30 seconds and 5 minutes.
-- **Autoplay** defaults to off: opening a diary entry in public should not
-  suddenly speak.
-- **About** is read-only.
+Inside a value overlay, UP/DOWN cycle choices. Each adjustment takes effect and
+is written to storage immediately; persistence errors are not shown. Both OK click and OK hold close the overlay without
+rolling values back, despite the current save/cancel hint. Volume changes apply
+to playback without a preview tone. Timeout and sleep values are stored settings;
+they do not currently trigger backlight changes or automatic sleep.
 
 ### 4.6 Bluetooth provisioning
 
-Opened from the Network row. The device stops normal Wi-Fi use and advertises
-over Bluetooth; the phone supplies a 2.4 GHz network's SSID and password through
-the companion WeChat mini program identified by
-[the upstream provisioning guide](../development/engineering/wifi-provisioning.md#mini-program-name).
+The Network row enters BLUFI provisioning as `BLUFI_MEMO`. The companion WeChat
+mini program is identified by the [provisioning guide](../development/engineering/wifi-provisioning.md#mini-program-name).
+It supplies a 2.4 GHz SSID and password, with no server-address or token field.
+Normal network workers are asked to stop before this mode starts.
 
-```text
-┌──────────────────────────┐
-│ Bluetooth setup           │
-├──────────────────────────┤
-│ In the mini program pick: │
-│     BLUFI_MEMO            │
-│                          │
-│ ○ Waiting for phone…      │
-│                          │
-│ OK hold to cancel         │
-└──────────────────────────┘
-```
+The page shows Bluetooth/Wi-Fi states and, on success, SSID and IP. Success
+currently leaves the result page displayed. The footer advertises OK-hold exit,
+but that gesture has no effect; holding UP/DOWN changes internal state without
+performing page teardown or returning visibly to settings. A failed Wi-Fi
+connection reports failure to the phone and returns to a connection/waiting
+state; the device does not provide specific wrong-password or network-not-found
+copy.
 
-The advertised name must start with `BLUFI`, because the mini program lists only
-such devices. The screen shows the exact advertised name so the user can match
-it.
+## 5. Storage and connectivity behaviour
 
-States shown in order: waiting for phone, receiving credentials, connecting,
-success, or a failure reason (wrong password, network not found). On success the
-device returns to settings with the Network row updated.
+- A 1 MiB local partition holds transient recordings. Files use an 80-byte
+  container header followed by Opus frames. Stopping capture writes duration
+  and frame count into the header.
+- On boot, complete packets from interrupted files recover to an unconfirmed
+  draft; incomplete tails are truncated. Invalid or empty files are quarantined
+  without automatic deletion. RAM audio not yet flushed is lost.
+- With stored Wi-Fi credentials, the device reconnects automatically and starts
+  time synchronisation. No server address is entered or compiled in: discovery
+  uses mDNS on the local network.
+- Successful upload removes the local file. Three HTTP 4xx rejections (including
+  429) leave a visible `.bad` file waiting for retry/delete. Retry returns the same
+  file to `.memo` and resets its three-attempt budget; it does not free the slot.
+  Only upload success or explicit deletion frees it. Transport/discovery/5xx
+  failures retain the pending recording without consuming the rejection budget.
+- Rejection counting is in RAM for the current round/startup; `.bad` and legacy
+  `.keep` persist across reboot and open retry/delete without automatic deletion.
+- Server metadata is cached in RAM. A failed refresh keeps that cache, so some
+  earlier rows can remain visible offline, but their text/audio still need the
+  server. There is no persistent offline archive of server history.
+- SSE notifications update cached metadata, supplemented by polling. Firmware
+  browsing does not follow the server's pagination cursor.
 
-**The provisioning channel carries only the network name and password.** No
-server address, token, or any other free-form parameter can be sent this way,
-and the product does not pretend otherwise.
+## 6. Visual presentation
 
-### 4.7 Server discovery
-
-The server address is never typed on the device and never compiled in. The
-device finds the server on the same local network by itself.
-
-- The Server row is read-only: it shows the discovered name and whether the
-  server answers.
-- When nothing is found, the row reads `Not found`; OK click runs discovery
-  again.
-- Discovery failure is not an error state: the device keeps recording, keeps
-  entries queued, and retries on its own.
-
-## 5. Behaviour rules
-
-1. **Saved before uploaded.** A finished recording is kept on the device first
-   and uploaded afterwards, so a lost network connection never costs an entry.
-2. **Silence is not an error.** Transcription happens in the background. An
-   entry without text yet still opens, still plays, and says so.
-3. **Status stays quiet.** Pending upload and pending transcription are a dot
-   and, at most, one short label on the detail screen — not a task state.
-4. **Five-minute cap.** The timer turns red at 4:30 and the recording stops at
-   5:00 with the same save/cancel sheet, so one press cannot run forever.
-5. **One entry, one moment.** No titles, tags, folders, or edits on the device.
-6. **Battery is always visible.** If the gauge is unavailable, the corner shows
-   an icon without a number rather than a fake value.
-7. **Nothing sleeps mid-action.** Recording, playback, and Bluetooth setup keep
-   the screen on and block sleep.
-8. **Uploads outlive the screen.** With unsent entries the screen may turn off,
-   but the device does not sleep until the queue is drained.
-9. **Wake to the list.** Waking from sleep always returns to the list, never to
-   the recording screen.
-
-## 6. Not in this product
-
-- To-do, checkboxes, completion or reminder states
-- Editing, retitling, tagging, or deleting an entry on the device
-- Typing a Wi-Fi password or a server address on the device
-- A server address fixed at build time
-- Factory reset from the device
-- Search, favourites, export
-- Multiple users or shared diaries
-- Browsing server-side history while offline (only entries not yet uploaded
-  remain visible)
-
-## 7. Acceptance from the user's point of view
-
-1. Holding OK for three seconds from the list starts a recording; releasing
-   early cancels.
-2. Holding either UP or DOWN opens settings.
-3. In a settings sub-page, OK saves and returns; holding OK cancels and returns.
-4. Changing the volume is audible immediately, before leaving the sub-page.
-5. Screen timeout and sleep follow the chosen values, and neither happens while
-   recording or playing.
-6. Bluetooth provisioning works with the named mini program, and a wrong
-   password shows a reason rather than silently failing.
-7. The Server row shows the discovered server without any input, and recovers
-   after a re-discovery.
-8. A recorded entry appears at the top of the list before it has been uploaded
-   or transcribed.
-9. Pressing OK repeatedly on an entry walks collapsed → expanded → playing →
-   paused without any other key.
-10. Holding OK on an entry returns to the list from any state.
-11. A five-minute recording stops by itself and is saved.
-
-## 8. Deliberately undecided
-
-Row density (compact timeline versus two-line cards), exact font sizes, and
-wording of hints are implementation details. They will be decided against the
-real screen and adjusted by feedback, without changing the model above.
+The UI uses a warm paper background, white cards, dark outlines and solid offset
+shadows. Selection uses a yellow fill and a small upward offset. Generated 16 px
+and 20 px Chinese font subsets fall back to Montserrat. Recording controls and
+some hints use English. The [visual language](../design/visual-language.md)
+describes the implemented geometry and assets.

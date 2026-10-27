@@ -4,574 +4,254 @@
 
 # 语音日记服务端 — 技术方案
 
-状态：评审稿，2026-10-26。设备端方案另起一份，本文不涉及。
+实现快照：2026-10-27。本文描述当前 Go 服务端、存储和 HTTP 协议。
+固件见[设备端方案](client.zh_CN.md)，工作和验收只在
+[里程碑](../project/milestones.zh_CN.md)中跟踪。
 
-## 1. 范围
+## 1. 范围与运行时
 
-服务端接收 Passport 上传的录音，保存下来，调用托管的语音转写接口把每条录音变成文字，
-再把结果列表返回给设备。同时提供完整的日记管理接口，方便用别的工具整理。
+单个 Go 进程接收录音、保存原始 Opus 容器、后台转写，向局域网客户端提供元数据和音频。
+使用 Go 1.27.3、`net/http`、`modernc.org/sqlite` SQLite、`pion/opus` 解码及
+`grandcat/zeroconf` mDNS。无需外部数据库、消息代理、ffmpeg 或 cgo。
+没有网页 UI、认证或 TLS 监听器。
 
-范围内：上传校验、音频解码、转写、元数据查询、音频流、备忘录的完整增删改查、
-服务发现、部署。
+## 2. 包结构
 
-范围外：设备上的录音/播放/界面逻辑、用户账号体系、多租户、Web 界面。
+| `server/` 下路径 | 职责 |
+| --- | --- |
+| `cmd/memo-server` | `serve`、`gc`、`version`，配置及进程生命周期 |
+| `cmd/memogen` | 从 Ogg Opus 生成 MEMO 测试文件 |
+| `internal/config` | 环境变量解析与校验 |
+| `internal/domain` | 记录/状态类型、容器头和帧读取器 |
+| `internal/audio` | 结构校验、Opus 解码及 WAV 输出 |
+| `internal/store` | SQLite 表结构、查询及任务持久化 |
+| `internal/httpapi` | HTTP 路由、JSON、上传、音频、SSE |
+| `internal/asr` | 转写接口、SiliconFlow 和假实现 |
+| `internal/jobs` | 一个转写执行循环 |
+| `internal/events` | 内存事件广播中心 |
+| `internal/discovery` | 局域网服务广播 |
 
-几条塑造了整体设计的非目标：不要消息队列、不要反向代理、不要外部数据库、不要
-`ffmpeg`、不要 cgo、不要设备接入协议。一个进程、一个目录、一个二进制。
+## 3. 存储与生命周期
 
-这是一个可信局域网服务，**没有鉴权**；第 13 节把这个后果直说，不含糊过去。
+SQLite 使用 WAL，表结构版本为 1。`devices` 保存来源 ID 及首次/最近出现时间；
+`memos` 保存录音/上传时间、时长/帧数/字节数、编码、状态、转写/语言、ASR 身份/追踪、
+编辑/错误字段、音频路径、时钟偏差与软删除时间；`jobs` 保存唯一记录 ID、尝试次数及到期时间。
+列表索引按 `recorded_at DESC, id DESC` 排列未删除记录。
 
-## 2. 技术选型
-
-| 关注点 | 选择 | 理由 |
-| --- | --- | --- |
-| 语言 | Go 1.27.3 | 与开发机工具链一致；标准库自带方法路由、`log/slog`、`database/sql` |
-| HTTP | `net/http` + `http.ServeMux` | 方法与通配符路由能覆盖全部接口，不需要框架 |
-| 记录存储 | SQLite（`modernc.org/sqlite`） | 纯 Go、无 cgo、单文件、WAL |
-| 音频解码 | `github.com/pion/opus` | 纯 Go；16 kHz 单声道 SILK 流 bit-exact，正是设备的编码参数 |
-| 服务发现 | `github.com/grandcat/zeroconf` | 纯 Go 的 mDNS 发布 |
-| 语音转写 | SiliconFlow 转写接口 | 见第 4 节 |
-| 构建 | `CGO_ENABLED=0 go build -trimpath -ldflags="-s -w"` | 单个静态二进制，部署无运行时依赖 |
-
-选 `pion/opus` 而不是 cgo 包装，是为了把整个原生工具链从部署里删掉。如果设备将来改用
-CELT 或更高码率，`github.com/skrashevich/go-opus` 暴露同一套 API，只需在 `go.mod` 里
-加一行 `replace` 就能换；这也是为什么解码被我们自己的函数包了一层，而不是在 handler
-里直接调用。
-
-## 3. 进程与包结构
+文件位于 `MEMO_DATA_DIR` 下：
 
 ```text
-server/
-├── cmd/memo-server/main.go     参数、配置、装配、少量 CLI
-├── internal/config/            环境变量解析与校验
-├── internal/domain/            Memo、Device、Status、容器头
-├── internal/audio/             Opus 帧解码、WAV 封装
-├── internal/store/             SQLite 查询与文件布局
-├── internal/httpapi/           路由、JSON 错误、Range 处理
-├── internal/asr/               Transcriber 接口、siliconflow、fake
-├── internal/jobs/              单写者任务循环
-└── internal/discovery/         mDNS 发布
+memo.db
+incoming/<UUID>-<random>.part
+audio/<device_id>/<YYYYMM>/<UUID>.memo
+rejected/<UUID>.memo
 ```
 
-一个进程，三条长驻 goroutine：HTTP 服务、任务 worker、mDNS 广播。其余都是请求级。
+原始容器是权威音频。上传只做结构校验，不解码 Opus；发布音频时不覆盖已有文件，
+元数据与初始任务在同一 SQLite 事务提交。同 ID 请求用固定数量的锁串行处理，
+同设备重传返回已有结果，另一设备收到 409。临时文件使用唯一名称避免冲突，
+接收成功前同步临时文件和目标目录。
+请求体流式写入临时文件并限制字节数，普通失败通过延迟清理移除临时文件。
+到达 `keepRejected` 的结构校验失败会把容器保留在 `rejected/`，不是所有拒绝都会保留。
+启动没有遗留临时文件或孤立文件清扫。
 
-## 4. 外部依赖
+SiliconFlow 适配器仅在转写请求时把容器解为内存 WAV，不保存为权威音频文件。
+因此已经接收、但 Opus 载荷无法解码的容器仍可能在转写阶段失败。
+假提供商直接返回固定文字，不解码。
 
-### 4.1 SiliconFlow 转写
+`recorded_at` 来自容器。为零或与接收时间相差超过 600 秒时，使用服务器时间并在
+`clock_skew` 记录差值。列表排序和月份路径使用修正后的时间。
 
-| 项 | 值 |
-| --- | --- |
-| 端点 | `POST https://api.siliconflow.cn/v1/audio/transcriptions` |
-| 鉴权 | `Authorization: Bearer <API key>` |
-| 请求体 | `multipart/form-data`：`file`（音频）、`model`（必填） |
-| 模型 | `FunAudioLLM/SenseVoiceSmall`（默认）、`TeleAI/TeleSpeechASR`（备选） |
-| 限制 | 时长 ≤ 1 小时，文件 ≤ 50 MB |
-| 响应 | `{"text": "..."}`，响应头带 `x-siliconcloud-trace-id` |
-| 支持格式 | WAV、MP3、OGG、M4A、FLAC |
+## 4. 转写
 
-我们自己的限制比提供方更严：单条 5 分钟、32 MB，在上传处就拦。解码后的 5 分钟 16 kHz
-单声道 WAV 是 9.6 MB，两边都留有余量。
+`asr.Transcriber` 暴露 `Name()` 和
+`Transcribe(context.Context, asr.Input) (asr.Result, error)`。
+输入包含存储的容器路径、时长和语言；输出包含文字、语言、提供商、模型及追踪 ID。
+`ErrPermanent` 区分不可重试错误。
 
-API key 只从环境变量读取，绝不写进数据库、日志或响应体。适配器只做两件事：送一个文件，
-拿一个字符串；提供方的任何细节都不泄漏出 `asr` 包。
+SiliconFlow 使用 bearer key 向 `<MEMO_ASR_BASE_URL>/v1/audio/transcriptions`
+发送 multipart `file`（解码 WAV）和 `model`，读取 `text` 与
+`x-siliconcloud-trace-id`。适配器执行自身的 50 MiB/一小时限制，默认 HTTP 超时 120 秒。
+这些是代码常量，不代表提供商最新服务政策。
 
-### 4.2 服务发现
+提供商 400/401/403/413/415 及本地解码失败为永久错误，其余 HTTP 错误（包括提供商 429）
+可重试。一个执行循环每 2 秒轮询并串行处理到期任务，最多尝试三次：
+首次临时失败延迟 30 秒，第二次延迟 2 分钟，第三次永久失败。
+退避数组虽含 10 分钟，但三次尝试策略不会调度到它。
+`MEMO_ASR_CONCURRENCY` 会解析，但不创建更多执行循环。
 
-mDNS 服务类型 `_voicememo._tcp`，实例名可配置（默认取主机名），TXT 记录带
-`ver=1`、`path=/api/v1`、`caps=opus`，广播端口即 HTTP 端口。设备解析到记录后还会请求
-`GET /api/v1/ping` 确认可达，所以一条过期的记录不会被误判成可用服务器。
+状态为 `uploaded → transcribing → ready`，或重试回 `uploaded`，或最终 `failed`。
+启动在执行任务前调用 `RecoverJobs` 恢复中断转写。
+初始记录与任务入队在同一事务中；入队失败回滚记录，处理函数移除本次新发布的音频。
+重传不会重复入队。
 
-mDNS 依赖组播，过不了 Docker 默认 bridge 网络。部署要么是 systemd 跑原生二进制，
-要么容器加 `--network host`。
+## 5. 服务发现
 
-## 5. 组件接口
+mDNS 广播 `_voicememo._tcp`、可配置实例名（默认主机名）及 HTTP 端口。
+TXT 包含 `ver=1`、`path=/api/v1`、`caps=opus`，有非回环 IPv4 时附带 `ip=`。
+使用找到的第一个此类接口地址，没有按通往设备的路由显式选址。
+客户端可在 SRV/A 解析不完整时回退到 TXT。
 
-真正的抽象只有两处，其余都是具体实现。
+广播失败只记日志，不停止 HTTP。多播需要网络可见；本地进程或 host 网络容器提供直接
+局域网访问。固件没有手动输入服务器地址的入口。
 
-### 5.1 语音转写
+## 6. HTTP 路由
 
-```go
-package asr
+下表路径统一带 `/api/v1` 前缀。除上传、音频和 SSE 外使用 JSON。
+读取可访问全部设备，列表可选设备过滤。
 
-type Input struct {
-    AudioPath string        // 已解码的 16 kHz 单声道 WAV
-    Duration  time.Duration
-    Language  string        // "" 表示自动识别
-}
-
-type Result struct {
-    Text     string
-    Language string
-    Provider string
-    Model    string
-    TraceID  string
-}
-
-type Transcriber interface {
-    Name() string
-    Transcribe(ctx context.Context, in Input) (Result, error)
-}
-```
-
-错误按类型区分，而不是靠匹配字符串：
-
-```go
-var ErrPermanent = errors.New("permanent transcription failure") // 不重试
-// 包装方式：fmt.Errorf("%w: %v", ErrPermanent, cause)
-```
-
-实现：`siliconflow.go`、`fake.go`（返回固定文本，供测试与离线开发）、可选的
-`exec.go`（调用本地命令）用来证明这个接口是真接缝。由 `MEMO_ASR_PROVIDER` 选择。
-
-### 5.2 音频解码
-
-```go
-package audio
-
-// DecodeOpusToWAV 从 r 读一个 MEMO 容器，把每个 Opus 帧按 16 kHz 单声道解码，
-// 并把 RIFF/WAVE 写到 w。返回帧数与解码时长，供调用方与容器头交叉校验。
-func DecodeOpusToWAV(r io.Reader, w io.Writer) (Stats, error)
-```
-
-这里刻意用函数而不是接口：落盘格式只有一种，真要加第二种编码，容器版本号本来就要变。
-
-### 5.3 存储
-
-`internal/store` 是基于 `*sql.DB` 的具体类型，不是接口。测试直接用临时 SQLite 文件，
-比 mock 更快也更诚实。
-
-## 6. 数据模型
-
-```sql
-CREATE TABLE devices (
-    id          TEXT PRIMARY KEY,          -- 由 MAC 派生的 12 位十六进制
-    name        TEXT,
-    first_seen  INTEGER NOT NULL,
-    last_seen   INTEGER NOT NULL
-);
-
-CREATE TABLE memos (
-    id           TEXT PRIMARY KEY,         -- UUIDv4，由设备生成
-    device_id    TEXT NOT NULL,
-    recorded_at  INTEGER NOT NULL,         -- 设备时钟，Unix 秒
-    uploaded_at  INTEGER NOT NULL,
-    duration_ms  INTEGER NOT NULL,
-    frame_count  INTEGER NOT NULL,
-    size_bytes   INTEGER NOT NULL,
-    codec        TEXT NOT NULL,            -- opus
-    status       TEXT NOT NULL,            -- uploaded | transcribing | ready | failed
-    transcript   TEXT,
-    lang         TEXT,
-    asr_provider TEXT,
-    asr_model    TEXT,
-    asr_trace_id TEXT,
-    edited_at    INTEGER,                  -- 人工修正文本时写入
-    error        TEXT,
-    audio_path   TEXT NOT NULL,
-    clock_skew   INTEGER NOT NULL DEFAULT 0,
-    deleted_at   INTEGER                   -- 软删除，音频已移除
-);
-
-CREATE INDEX memos_order ON memos(recorded_at DESC, id DESC)
-    WHERE deleted_at IS NULL;
-
-CREATE TABLE jobs (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    memo_id   TEXT NOT NULL UNIQUE,
-    attempts  INTEGER NOT NULL DEFAULT 0,
-    next_at   INTEGER NOT NULL
-);
-```
-
-`devices` 没有 token、没有状态：它只用来标明一条记录的来源，第一次见到未知的
-`X-Device-Id` 时创建。
-
-文件：`data/audio/<device_id>/<YYYYMM>/<memo_id>.wav`。解码后的 WAV 是唯一的权威副本；
-解码成功后上传的 Opus 容器就删掉。解码失败时容器保留在 `data/rejected/` 供排查。
-
-## 7. HTTP API
-
-所有路径前缀 `/api/v1`。除上传体和音频流以外都是 JSON 进、JSON 出。没有鉴权，也没有
-按设备隔离：任何调用方都能看到全部备忘录。
-
-| 方法 | 路径 | 用途 |
+| 方法 | 路径 | 当前响应/行为 |
 | --- | --- | --- |
-| GET | `/ping` | 发现之后的连通性探测 |
-| GET | `/server` | 版本、下发的限制、服务器时间、提供方 |
-| POST | `/memos` | 上传一条录音 |
-| GET | `/memos` | keyset 分页列表，倒序 |
-| GET | `/memos/{id}` | 单条记录含转写文本 |
-| PATCH | `/memos/{id}` | 人工修正文本或语言 |
-| DELETE | `/memos/{id}` | 删除记录与音频 |
-| GET | `/memos/{id}/audio` | WAV 流，支持 `Range` |
-| POST | `/memos/{id}/transcribe` | 重新转写 |
-| GET | `/health` | 运维视图：队列深度、提供方、磁盘占用 |
+| GET | `/health` | 服务/版本、表版本、数据库状态、时间、运行时长；数据库 ping 失败为 503 |
+| GET | `/ping` | 200，`{"service":"memo","api":1}` |
+| GET | `/server` | 版本、API、时钟、提供商/模型、限值、队列深度 |
+| POST | `/memos` | 上传，新建 201，已有 UUID 200 |
+| GET | `/memos` | 游标列表，最新在前 |
+| GET | `/memos/{id}` | 详情、转写、ASR 和音频元数据 |
+| PATCH | `/memos/{id}` | 修改转写和/或 `lang`，记录编辑时间，设为 `ready` |
+| DELETE | `/memos/{id}` | 软删记录/移除任务并尝试删音频；204，未知 ID 404 |
+| GET | `/memos/{id}/audio` | 原始 MEMO 字节，`application/octet-stream`，支持 Range |
+| POST | `/memos/{id}/transcribe` | 设为 `uploaded`、清错误并入队；202 |
+| GET | `/events` | `text/event-stream` 订阅 |
 
-管理接口刻意做成 REST 完备：将来网页、脚本、手机快捷指令要做的任何管理动作都能走 HTTP，
-CLI 只是便利，不是唯一入口。
-
-### 7.1 设备识别
-
-不注册、不发 token、不审批。设备自带 id：
-
-```http
-X-Device-Id: A1B2C3D4E5F6
-```
-
-第一次见到未知 id 就建一行设备记录。id 写进每条备忘录并在响应里回显，足够区分两台设备。
-读接口允许缺省，上传必须带——没有来源的备忘录事后无法归属。
-
-### 7.2 服务器信息
-
-```http
-GET /api/v1/server
-```
-
-```json
-200 OK
-{"service":"memo-server","version":"0.1.0","api":1,
- "server_time":1761468200,
- "asr":{"provider":"siliconflow","model":"FunAudioLLM/SenseVoiceSmall"},
- "limits":{"max_memo_ms":300000,"max_bytes":33554432}}
-```
-
-`limits` 放在服务端，是为了让 5 分钟上限只在一处定义，而不是固件和服务各写一份慢慢漂移。
-
-### 7.3 上传
+### 上传
 
 ```http
 POST /api/v1/memos
 Content-Type: application/octet-stream
 X-Device-Id: A1B2C3D4E5F6
-X-Memo-Id: 9f1e5c7a-...
-X-Recorded-At: 1761468120
-Content-Length: 192044          （可选；接受 chunked 请求体）
+X-Memo-Id: 00000000-0000-4000-8000-000000000000
 
-<MEMO 容器字节>
+<MEMO container bytes>
 ```
+
+`X-Device-Id` 去除两端空白后必须匹配 `[A-Za-z0-9_-]{1,64}`；`X-Memo-Id` 必须符合带连字符 UUID 语法，并与容器一致。
+录音时间来自容器，不读取额外的 `X-Recorded-At` 头。
+已知、未删除的 UUID 返回原结果，不再创建任务。默认上限 32 MiB、300000 ms。
 
 ```json
-201 Created
-{"id":"9f1e5c7a-...","status":"uploaded","duration_ms":84000}
+{"id":"00000000-0000-4000-8000-000000000000","status":"uploaded","duration_ms":1000}
 ```
 
-用同一个 `X-Memo-Id` 重传会返回 `200` 与既有记录，不会产生第二个任务。幂等性正是设备
-在超时后可以放心重试的前提。
+### 列表与详情
 
-请求体边收边写到 `data/incoming/<memo_id>.part` 并施加上限，随后校验（第 8 节）、解码、
-移到正式位置。校验通过之前不写数据库，所以一次截断的上传只会留下临时文件，由启动清理。
+`GET /memos?limit=20&cursor=<opaque>&device=<optional>` 默认 20 条，上限 100，
+返回 `items` 与 `next_cursor`，游标编码 `recorded_at:id`。
+没有时间范围或转写搜索参数。每行包含 `id`、`device_id`、`recorded_at`、
+`uploaded_at`、`duration_ms`、`status`、可选 `lang` 及转写前 40 字的
+`snippet`（截断时加省略号）。
 
-### 7.4 列表
+详情增加非零/非空 `size_bytes`、`codec`、`transcript`、`edited_at`、`error`、
+ASR 元数据和音频路径/大小。可选空值省略，不输出 JSON null。
+`audio.bytes` 是原始容器大小。
 
-```http
-GET /api/v1/memos?limit=20&cursor=MTc2MTQ2MzAyMDpkMWYy&device=A1B2C3D4E5F6
-```
+`PATCH` 只接受 `transcript` 和/或 `lang`，拒绝未知字段。删除不能通过 API 撤销：
+记录隐藏并立即尝试删除音频；文件删除失败只记日志。音频端点使用 `http.ServeContent`，
+Range 的字节偏移指向容器，不是 PCM。固件当前每次都从头播放。
 
-```json
-200 OK
-{"items":[
-   {"id":"9f1e...","device_id":"A1B2...","recorded_at":1761468120,
-    "duration_ms":84000,"status":"ready","lang":"zh",
-    "snippet":"下午三点和张工对了下进度…"},
-   {"id":"a37b...","device_id":"A1B2...","recorded_at":1761463020,
-    "duration_ms":46000,"status":"transcribing"}
- ],
- "next_cursor":"MTc2MTQ2MzAyMDphMzdi"}
-```
+## 7. 错误与事件
 
-`limit` 默认 20、上限 100；`device` 是可选过滤。游标是 `recorded_at:id` 的不透明
-base64，因此翻页是 keyset 定位，浏览期间有新记录写入也不会错位。`snippet` 是转写文本的
-前 40 个字符（按 rune 边界截断），转写未完成时不返回该字段。
+错误格式为 `{"error":{"code":"...","message":"..."}}`。
 
-### 7.5 详情、修正与删除
-
-```json
-200 OK
-{"id":"9f1e...","device_id":"A1B2...","recorded_at":1761468120,
- "uploaded_at":1761468200,"duration_ms":84000,"size_bytes":192044,
- "codec":"opus","status":"ready","lang":"zh","edited_at":null,"error":null,
- "transcript":"下午三点和张工对了下进度，他说下周三之前把测试环境搭好……",
- "asr":{"provider":"siliconflow","model":"FunAudioLLM/SenseVoiceSmall","trace_id":"3f0a…"},
- "audio":{"path":"/api/v1/memos/9f1e.../audio","bytes":2688044}}
-```
-
-```http
-PATCH /api/v1/memos/9f1e...
-Content-Type: application/json
-
-{"transcript":"下午三点和张工对了进度，测试环境下周三前搭好。","lang":"zh"}
-```
-
-`PATCH` 接受 `transcript` 和/或 `lang`，写入 `edited_at`，状态保持 `ready`，不会触发转写。
-未知字段直接拒绝而不是静默忽略，管理脚本里的拼写错误才会当场暴露。
-
-`DELETE` 返回 `204`，不可撤销：行被软删除，音频文件立即移除。删除不存在的 id 返回 `404`。
-
-`POST /memos/{id}/transcribe` 返回 `202`，清空 `error`、把状态改回 `uploaded` 并重新入队。
-提供方故障之后，这就是那个手动补救入口。
-
-`GET /memos/{id}/audio` 返回 `audio/wav`，带 `Accept-Ranges: bytes`，支持单个 `Range`
-头。设备是从头播的，但 Range 让这个接口更诚实，也方便调试时反复听。
-
-### 7.6 错误
-
-```json
-{"error":{"code":"bad_container","message":"unexpected magic"}}
-```
-
-| code | 状态码 | 含义 |
+| 错误码 | HTTP 状态 | 含义 |
 | --- | --- | --- |
-| `not_found` | 404 | 未知 memo id |
-| `invalid_json` | 400 | 请求体格式错误或含未知字段 |
-| `missing_device` | 400 | 上传缺少 `X-Device-Id` |
-| `bad_container` | 400 | 魔数、版本或字段不匹配 |
-| `frame_mismatch` | 400 | 声明的帧数或时长与实际不符 |
-| `payload_too_large` | 413 | 超过 `MEMO_MAX_BYTES` |
-| `over_limit` | 400 | 时长超过 `max_memo_ms` |
-| `internal` | 500 | 未预期错误，细节只进日志 |
+| `not_found` | 404 | 记录未知/已删除或音频缺失 |
+| `invalid_json` | 400 | 请求体、未知字段、条数或游标非法 |
+| `missing_device` | 400 | 上传缺来源 ID |
+| `bad_container` | 400 | 容器/头部/ID 或结构校验错误 |
+| `frame_mismatch` | 400 | 包装为 `ErrFrameMismatch` 的错误 |
+| `payload_too_large` | 413 | 请求体超过字节上限 |
+| `id_conflict` | 409 | 已有 UUID 归属另一设备 |
+| `over_limit` | 400 | 头部时长超过配置上限 |
+| `internal` | 500 | 存储/查询或其它服务端错误 |
+
+SSE 先发送 `event: ready` 和 `data: {}`，随后发送 `event: memo` JSON，含
+`type`、`id`、`status` 及可选 `snippet`、`recorded_at`、`duration_ms`。
+每 20 秒发送注释心跳。上传和任务状态变化会发布事件；PATCH、DELETE 及手动重新入队
+没有独立管理通知。
+
+广播中心为每个订阅者缓冲八条，满时跳过投递，没有持久化事件日志、重放游标或必达保证，
+客户端靠列表读取对账。任务事件的 snippet 携带完整转写，列表摘要则限 40 字。
 
 ## 8. 上传容器
 
-在这里定义一次，两端各自实现。所有整数小端。
+版本 1，整数字段为小端：
 
-| 偏移 | 长度 | 字段 |
+| 偏移 | 大小 | 字段 |
 | --- | ---: | --- |
 | 0 | 4 | 魔数 `MEMO` |
-| 4 | 1 | 版本，当前 1 |
-| 5 | 1 | 编码，1 = Opus |
-| 6 | 2 | 采样率，16000 |
-| 8 | 1 | 声道数，1 |
-| 9 | 1 | 帧长（毫秒），60 |
-| 10 | 2 | 保留，0 |
-| 12 | 4 | 时长（毫秒） |
-| 16 | 8 | `recorded_at`，Unix 秒，0 表示从未对时 |
-| 24 | 36 | memo id，带连字符的 ASCII UUID，不足补 0 |
+| 4 | 1 | 版本 1 |
+| 5 | 1 | 编码 1，即 Opus |
+| 6 | 2 | 采样率，固件写 16000 |
+| 8 | 1 | 声道，固件写 1 |
+| 9 | 1 | 帧时长 ms，固件写 60 |
+| 10 | 2 | 保留 |
+| 12 | 4 | 时长 ms |
+| 16 | 8 | 录音 UTC 秒，未对时为零 |
+| 24 | 36 | 带连字符 ASCII UUID |
 | 60 | 4 | 帧数 |
-| 64 | 16 | 保留，0 |
-| 80 | … | 帧：先 `uint16` 长度，再负载，循环 |
+| 64 | 16 | 保留 |
+| 80 | 可变 | 重复 uint16 长度及 Opus 包 |
 
-以下情况拒绝上传：魔数、版本、编码、采样率或声道数与上表不符；声明的帧数与实际帧数不符；
-时长与 `frame_count × frame_ms` 相差超过 5%；请求体超过字节上限。这类拒绝都是永久性的，
-设备不应重试。
+头部解析接受采样率 8000–48000、声道 1 或 2、帧时长 1–60 ms；
+实际 Opus 解码还受解码器支持范围约束。上传遍历所有包边界，拒绝空录音、空包、
+截断包和任何声明/实际帧数不一致，包括声明零帧。帧数和时长不一致映射为 `frame_mismatch`。
 
-## 9. 处理流程
+声明时长必须与 `frame_count × frame_ms` 保持 5% 内的误差；声明时长和按帧计算的时长
+都不能超过配置上限。上传不解码载荷，无法解码的 Opus 仍可能在后续转写时被拒绝。
 
-```text
-上传 ──► 校验容器 ──► 解码帧 ──► 写 WAV ──► 建行(uploaded) + 任务
-                                                  │
-                            任务 worker 领取 ◄────┘
-                                     │
-                     status=transcribing ─┤
-                                          ▼
-                           asr.Transcribe(WAV) ── 成功 ──► status=ready + 文本
-                                          └── 失败 ──► 退避重试，超限则 failed
-```
+## 9. CLI 与配置
 
-解码放在上传请求里做：5 分钟文件解码是几十毫秒，换来的是状态机更小——只有音频确认可用，
-memo 行才存在。
+| 命令 | 当前行为 |
+| --- | --- |
+| `memo-server serve` | HTTP、任务执行与广播，默认命令 |
+| `memo-server serve -addr host:port` | 覆盖监听地址 |
+| `memo-server version` | 输出 `0.1.0` |
+| `memo-server gc` | 校验配置/打开存储并输出占位说明，不执行清扫 |
 
-转写是异步的。设备从不等它，只在下一次刷新列表前显示一个"转写中"圆点。
-
-### 9.1 任务循环
-
-由一个 goroutine 领取任务；`MEMO_ASR_CONCURRENCY` 可以在提供方允许并发时调大。
-
-```sql
-UPDATE jobs SET attempts = attempts + 1, next_at = ?
-WHERE id = (SELECT id FROM jobs WHERE next_at <= ? ORDER BY id LIMIT 1)
-RETURNING memo_id, attempts;
-```
-
-退避 30 秒、2 分钟、10 分钟，之后置 `failed`，把提供方给的原因写进 `memos.error`。
-`ErrPermanent` 直接跳过剩余尝试。启动时把停留在 `transcribing` 的行改回 `uploaded` 并
-重新入队——这就是崩溃恢复，不需要任何外部状态。
-
-### 9.2 时钟处理
-
-`recorded_at` 来自设备，从未对时成功的设备会送 `0`。当它为 0、或与服务器时间相差超过
-10 分钟时，服务器改用自己收到的时刻，并把差值记进 `clock_skew`。排序始终用
-`recorded_at`，所以时钟不准的设备只是退化成上传顺序，而不会把日记打乱。
-
-## 10. 交互时序图
-
-### 10.1 启动与发现
-
-```mermaid
-sequenceDiagram
-    participant D as 设备
-    participant S as memo-server
-    Note over S: 广播 _voicememo._tcp
-    D->>S: GET /ping
-    S-->>D: 200 {service: memo, api: 1}
-    D->>S: GET /server
-    S-->>D: 200 {limits, server_time, provider}
-```
-
-### 10.2 录音、上传、转写
-
-```mermaid
-sequenceDiagram
-    participant D as 设备
-    participant S as memo-server
-    participant W as 任务 worker
-    participant P as SiliconFlow
-    Note over D: 本地 spool 落盘
-    D->>S: POST /memos (容器, X-Memo-Id, X-Device-Id)
-    S->>S: 校验 + 解码为 WAV
-    S->>S: 建 memo(uploaded) + job
-    S-->>D: 201 {id, status: uploaded}
-    D->>D: 标记已同步，释放 spool 空间
-    W->>S: 领取任务
-    W->>S: status = transcribing
-    W->>P: POST /v1/audio/transcriptions (file=WAV)
-    P-->>W: {"text": "..."} + trace id
-    W->>S: status = ready, transcript, trace id
-    D->>S: GET /memos?limit=20
-    S-->>D: 200 [{status: ready, snippet}]
-```
-
-### 10.3 浏览与播放
-
-```mermaid
-sequenceDiagram
-    participant D as 设备
-    participant S as memo-server
-    D->>S: GET /memos/9f1e
-    S-->>D: 200 {transcript, duration_ms, audio.path}
-    D->>S: GET /memos/9f1e/audio
-    S-->>D: 200 audio/wav (chunked)
-    loop 播放期间
-        D->>D: PCM 写入 I2S
-    end
-    D->>S: GET /memos/9f1e/audio (Range: bytes=...) 续播时
-    S-->>D: 206 partial content
-```
-
-### 10.4 提供方失败
-
-```mermaid
-sequenceDiagram
-    participant W as 任务 worker
-    participant S as memo-server
-    participant P as SiliconFlow
-    W->>P: POST /transcriptions
-    P-->>W: 429 限流
-    W->>S: 重新排期（第 1 次，next_at +30 秒）
-    W->>P: POST /transcriptions
-    P-->>W: 500
-    W->>S: 重新排期（第 2 次，next_at +2 分钟）
-    W->>P: POST /transcriptions
-    P-->>W: 200 ok
-    W->>S: status = ready
-```
-
-### 10.5 从其它工具做管理
-
-```mermaid
-sequenceDiagram
-    participant C as curl 或未来的网页
-    participant S as memo-server
-    C->>S: GET /memos?limit=50
-    S-->>C: 200 {items, next_cursor}
-    C->>S: PATCH /memos/9f1e {"transcript": "..."}
-    S-->>C: 200 {id, edited_at}
-    C->>S: POST /memos/9f1e/transcribe
-    S-->>C: 202 {status: uploaded}
-    C->>S: DELETE /memos/a37b
-    S-->>C: 204
-```
-
-## 11. CLI
-
-```text
-memo-server serve     启动 HTTP、任务与发现
-memo-server gc        清理孤儿文件、过期临时文件、过期记录
-```
-
-管理动作放在 HTTP 接口里而不是 CLI 里：这样第二台机器、脚本、未来的网页，与坐在主机前的
-操作者权限完全一致。CLI 只保留 HTTP 做不到的事情（垃圾回收）。
-
-## 12. 配置
-
-| 变量 | 默认值 | 含义 |
+| 变量 | 默认值 | 当前用途 |
 | --- | --- | --- |
 | `MEMO_ADDR` | `:8080` | 监听地址 |
-| `MEMO_DATA_DIR` | `./data` | 数据库与音频根目录 |
+| `MEMO_DATA_DIR` | `./data` | 数据库/音频目录 |
 | `MEMO_MDNS_NAME` | 主机名 | 广播实例名 |
-| `MEMO_ASR_PROVIDER` | `siliconflow` | `siliconflow`、`fake`、`exec` |
-| `MEMO_ASR_API_KEY` | — | 提供方密钥，真实提供方必填 |
-| `MEMO_ASR_MODEL` | `FunAudioLLM/SenseVoiceSmall` | 提供方模型 |
-| `MEMO_ASR_BASE_URL` | `https://api.siliconflow.cn` | 便于测试时改指向 |
-| `MEMO_ASR_CONCURRENCY` | `1` | 并发转写任务数 |
-| `MEMO_MAX_BYTES` | `33554432` | 上传字节上限 |
-| `MEMO_MAX_MEMO_MS` | `300000` | 下发给设备的时长上限 |
-| `MEMO_RETENTION_DAYS` | `0` | `0` 表示永久保留 |
-| `MEMO_LOG_LEVEL` | `info` | `debug`、`info`、`warn`、`error` |
+| `MEMO_ASR_PROVIDER` | `siliconflow` | 仅 `siliconflow` 或 `fake` |
+| `MEMO_ASR_API_KEY` | 空 | SiliconFlow 启动时必需 |
+| `MEMO_ASR_MODEL` | `FunAudioLLM/SenseVoiceSmall` | multipart 模型 |
+| `MEMO_ASR_BASE_URL` | `https://api.siliconflow.cn` | 提供商 URL 前缀 |
+| `MEMO_ASR_CONCURRENCY` | `1` | 校验为正，执行循环仍只有一个 |
+| `MEMO_MAX_BYTES` | `33554432` | 流式上传字节限制 |
+| `MEMO_MAX_MEMO_MS` | `300000` | 声明及按帧计算的时长上限，告知客户端 |
+| `MEMO_RETENTION_DAYS` | `0` | 校验非负，没有保留期清扫 |
+| `MEMO_LOG_LEVEL` | `info` | debug/info/warn/error |
 
-提供方需要密钥而密钥缺失时，启动直接失败，而不是接受一批注定转写不了的上传。
+## 10. 安全与部署
 
-## 13. 安全定位
+服务面向可信单用户局域网。能访问端口的人可以读取、修改和删除录音；来源 ID 只作归属记录，
+不是身份验证。上传校验 UUID 语法及一致性，设备 ID 去除两端空白后限制为
+1–64 个 ASCII 字母、数字、下划线或连字符，再用于组成存储路径。
 
-没有鉴权。任何能连到这个端口的人都能读全部备忘录、下载全部录音、改写转写文本、删除条目。
-对一台单用户的家庭局域网服务器来说，这是被接受的取舍，但它应当写在文档里，而不是以后变成
-一个意外。
+ASR key 来自环境变量，以 bearer 头发送。提供商错误响应片段可能被存储或记日志，
+适配器没有对任意提供商文本做脱敏。没有内置 TLS、令牌或账号中间件。
 
-仍然保留的几项约束，因为它们不花成本：
-
-- 上传在流式收取过程中就施加上限，不是先缓冲整个请求体再判断。
-- memo id 在触碰文件系统前先校验为 UUID，因此路径穿越在构造上不可能发生。
-- 提供方密钥在启动时从环境读取，永不出现在日志、错误或 HTTP 响应里。
-- 上表之外的方法一律拒绝，避免一个误发的 `PUT` 把记录改成半新半旧。
-
-如果哪天要离开局域网：在前面加一层做 TLS 的反向代理加共享密钥或 mTLS，并在
-`POST /memos` 与读接口上要求设备 token。数据模型不会挡这条路。
-
-## 14. 部署
+从仓库根目录构建：
 
 ```bash
-CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o memo-server ./cmd/memo-server
+source scripts/go-env.sh
+cd server
+mkdir -p ../build
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o ../build/memo-server ./cmd/memo-server
+MEMO_ASR_PROVIDER=fake ../build/memo-server serve
 ```
 
-```ini
-# /etc/systemd/system/memo-server.service
-[Service]
-Environment=MEMO_DATA_DIR=/var/lib/memo
-Environment=MEMO_ASR_API_KEY=...
-ExecStart=/usr/local/bin/memo-server serve
-Restart=always
-```
+持久化并备份整个数据目录，包括 SQLite 和容器树。运行中的 SQLite 应做一致性数据库备份，
+不能在 WAL 仍有写入时只复制 `memo.db`。打开存储时执行迁移。
 
-备份就是 `data/`（SQLite 加音频）：运行中用 `sqlite3 memo.db ".backup"`，再复制音频目录。
-恢复是反向操作，除此之外没有别的状态。升级只需换二进制并重启；数据库迁移在启动时执行，
-且是幂等的。
+## 11. 验证入口
 
-容器镜像可选；如果用，需要 `--network host` 才能发布 mDNS。
+`cd server && go test ./...` 覆盖配置、头部/帧解析、测试音频解码、SQLite 操作、
+API 流程、提供商请求/错误处理及任务重试。使用临时存储、假转写和本地 HTTP 服务；
+首次运行可能需要下载模块/工具链。
 
-## 15. 测试
-
-| 层级 | 覆盖内容 |
-| --- | --- |
-| `internal/audio` | 容器解析、声明帧数与实际不符、WAV 头字段、一小段 SILK 素材的解码、时长换算 |
-| `internal/domain` | 容器头往返、时钟偏移规则、状态迁移 |
-| `internal/httpapi` | 上传幂等、游标分页、`PATCH` 字段校验、`DELETE` 幂等、`Range` 请求、错误码——全部走 `httptest` |
-| `internal/asr` | `fake` 全链路；提供方适配器对 `httptest` 服务器校验 multipart 形状、重试分类、trace id 捕获 |
-| `internal/jobs` | 退避时间表、永久错误的短路、`transcribing` 行的崩溃恢复 |
-| `internal/store` | 真实临时 SQLite，写入期间并发读，软删除过滤 |
-
-`go test ./...` 不需要网络即可全绿。素材文件
-`internal/audio/testdata/tone-1s.memo` 是一段 1 秒 16 kHz Opus 正弦音，已按容器格式封装
-并提交，让解码路径在没有真实提供方的情况下也有覆盖。`cmd/memogen` 可以按同样方式从任意
-Ogg Opus 文件重新生成素材：
-
-```bash
-go run ./cmd/memogen -in tone.ogg -out tone.memo -frame-ms 20
-```
-
-## 16. 待定
-
-1. **保留策略。** `MEMO_RETENTION_DAYS` 已存在，但还没有自动清理。删除日记条目属于产品
-   决策，所以默认永不删除，删除始终是显式动作。
-2. **提供方回退。** SiliconFlow 失败后要不要自动切到第二家，还是保持失败直到有人调用
-   `POST /memos/{id}/transcribe`。
-3. **搜索。** `GET /memos` 目前只按设备和时间过滤。要检索转写文本需要 SQLite FTS5，
-   暂时不需要，而且它会改变索引布局。
+`scripts/e2e-server.sh` 使用真实进程和假 ASR，当前音频断言仍要求 RIFF/WAV，
+但端点已返回 MEMO，因此该脚本不能证明当前协议端到端通过。
+实际结果及后续检查记录在[里程碑](../project/milestones.zh_CN.md)。

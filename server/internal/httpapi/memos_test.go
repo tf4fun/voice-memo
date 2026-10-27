@@ -2,12 +2,15 @@ package httpapi
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/tf4fun/voice-memo/server/internal/config"
@@ -341,4 +344,106 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func TestDeviceIDCannotBecomeAPath(t *testing.T) {
+	env := newEnv(t)
+	id := "77777777-7777-4777-8777-777777777777"
+	body := containerWithID(t, id)
+	for _, device := range []string{"../escape", "a/b", `a\b`, ".", "..", "你好", strings.Repeat("a", 65), "a b"} {
+		rec := env.do(t, http.MethodPost, "/api/v1/memos", body, map[string]string{"X-Device-Id": device, "X-Memo-Id": id})
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("device %q: %d", device, rec.Code)
+		}
+	}
+	for i, device := range []string{"A1B2C3D4E5F6", "test-device_1", strings.Repeat("x", 64)} {
+		validID := fmt.Sprintf("77777777-7777-4777-8777-%012d", i)
+		rec := env.do(t, http.MethodPost, "/api/v1/memos", containerWithID(t, validID), map[string]string{"X-Device-Id": device, "X-Memo-Id": validID})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("legitimate device %q: %d %s", device, rec.Code, rec.Body)
+		}
+	}
+}
+
+func TestConcurrentReplayPreservesAcceptedAudio(t *testing.T) {
+	env := newEnv(t)
+	id := "88888888-8888-4888-8888-888888888888"
+	body := containerWithID(t, id)
+	codes := make(chan int, 12)
+	for i := 0; i < cap(codes); i++ {
+		go func() {
+			rec := env.do(t, http.MethodPost, "/api/v1/memos", body, map[string]string{"X-Device-Id": "concurrent", "X-Memo-Id": id})
+			codes <- rec.Code
+		}()
+	}
+	created := 0
+	for i := 0; i < cap(codes); i++ {
+		switch code := <-codes; code {
+		case http.StatusCreated:
+			created++
+		case http.StatusOK:
+		default:
+			t.Fatalf("concurrent response %d", code)
+		}
+	}
+	if created != 1 {
+		t.Fatalf("created %d records", created)
+	}
+	rec := env.do(t, http.MethodGet, "/api/v1/memos/"+id+"/audio", nil, nil)
+	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), body) {
+		t.Fatal("accepted audio changed or disappeared")
+	}
+	if n, err := env.store.QueueDepth(t.Context()); err != nil || n != 1 {
+		t.Fatalf("queue: %d %v", n, err)
+	}
+	rec = env.do(t, http.MethodPost, "/api/v1/memos", body, map[string]string{"X-Device-Id": "other", "X-Memo-Id": id})
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("cross-device replay: %d", rec.Code)
+	}
+}
+
+func TestUploadChecksDurationAndCount(t *testing.T) {
+	for _, which := range []string{"zero_count", "duration", "actual_limit", "empty"} {
+		t.Run(which, func(t *testing.T) {
+			env := newEnv(t)
+			id := "99999999-9999-4999-8999-999999999999"
+			body := containerWithID(t, id)
+			switch which {
+			case "zero_count":
+				binary.LittleEndian.PutUint32(body[60:64], 0)
+			case "duration":
+				binary.LittleEndian.PutUint32(body[12:16], 0)
+			case "actual_limit":
+				// Header lies just under the cap, within the old 5% tolerance;
+				// actual packet duration still exceeds the server's limit.
+				frame := body[80:]
+				body = append(body[:80:80], bytes.Repeat(frame, 300)...)
+				frames := binary.LittleEndian.Uint32(body[60:64]) * 300
+				binary.LittleEndian.PutUint32(body[60:64], frames)
+				binary.LittleEndian.PutUint32(body[12:16], 300000)
+			case "empty":
+				body = body[:80]
+				binary.LittleEndian.PutUint32(body[60:64], 0)
+				binary.LittleEndian.PutUint32(body[12:16], 0)
+			}
+			rec := env.do(t, http.MethodPost, "/api/v1/memos", body, map[string]string{"X-Device-Id": "test", "X-Memo-Id": id})
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status %d: %s", rec.Code, rec.Body)
+			}
+			if which == "actual_limit" {
+				var result struct {
+					Error struct {
+						Code string `json:"code"`
+					} `json:"error"`
+				}
+				decodeBody(t, rec, &result)
+				if result.Error.Code != "over_limit" {
+					t.Fatalf("wrong rejection: %s", rec.Body)
+				}
+			}
+			if n, err := env.store.QueueDepth(t.Context()); err != nil || n != 0 {
+				t.Fatalf("queue: %d %v", n, err)
+			}
+		})
+	}
 }

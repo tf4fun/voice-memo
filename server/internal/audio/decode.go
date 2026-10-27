@@ -201,8 +201,14 @@ func ValidateContainer(r io.Reader) (Stats, error) {
 		bytes_ += int64(len(packet))
 	}
 
-	if header.FrameCount != 0 && header.FrameCount != count {
-		return Stats{}, fmt.Errorf("frame count: header says %d, found %d", header.FrameCount, count)
+	if count == 0 {
+		return Stats{}, fmt.Errorf("%w: empty recording", domain.ErrBadContainer)
+	}
+	if header.FrameCount != count {
+		return Stats{}, fmt.Errorf("%w: header says %d frames, found %d", domain.ErrFrameMismatch, header.FrameCount, count)
+	}
+	if !header.MatchesDuration() {
+		return Stats{}, fmt.Errorf("%w: declared duration disagrees with frames", domain.ErrFrameMismatch)
 	}
 
 	perFrame := int(header.FrameMS) * int(header.SampleRate) / 1000

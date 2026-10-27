@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/tf4fun/voice-memo/server/internal/config"
@@ -23,6 +24,7 @@ type Server struct {
 	log     *slog.Logger
 	started time.Time
 	events  *events.Hub
+	uploads [64]sync.Mutex
 }
 
 // New builds the handler tree. Later milestones add routes here; the shape stays
