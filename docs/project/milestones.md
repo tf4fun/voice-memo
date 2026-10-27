@@ -212,3 +212,29 @@ Deletion and editing on the device, offline browsing of server history, search,
 OTA, device authentication or TLS, multi-device accounts, a web UI. Each is noted
 in the design documents where it would attach, so it does not get rediscovered
 as a surprise.
+
+## 5. Current status
+
+Snapshot taken while M4 is being closed out. "Verified" means seen on the
+device with these logs, not merely compiled.
+
+| Area | State | Evidence |
+| --- | --- | --- |
+| Record → spool → reboot | verified | 170 frames, 10.2 s, file survives a power cycle |
+| Playback of a local memo | verified | decoded from the spool, audible |
+| Bluetooth provisioning | verified | BLUFI handshake, WPA2 association, 192.168.31.116 lease |
+| mDNS discovery | verified | PTR then `ip=` TXT, server reached on port 8080 |
+| Upload | verified | 201, server row reaches `ready` with a transcript |
+| List, detail, transcript | verified | rows and transcript pulled from the server |
+| SSE updates | verified | uploaded → transcribing → ready within two seconds |
+| Server limits adopted | verified | `max_memo_ms=300000` read at startup and enforced before upload |
+| Recording with the network up | flashed, not yet confirmed on the screen | 28 KB stack + 24.6 KB encoder against a 73 KB largest block |
+| Arming ring animation | fixed, not yet confirmed on the screen | value range was 0..100 while the animation fed it milliseconds |
+| Upload rejected → `.bad` | code exists, not exercised | needs a deliberate 4xx |
+| Recording while offline | not exercised | needs the access point switched off mid-session |
+| Streaming playback | not implemented | the container is downloaded first, then played |
+
+Heap, measured on this device: 231 KB free after boot, 100 KB once Wi-Fi is up,
+84 KB with the uploader and the SSE subscriber running, largest contiguous
+block 73 KB. The Opus encoder takes 24.6 KB, not the 40 KB assumed earlier.
+
