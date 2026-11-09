@@ -13,7 +13,7 @@
 - **push tag**：当向仓库推送 tag（如 `v1.0.0`、`v0.1.0-feature/xxx`）时触发自动构建，并在构建成功后自动创建 Release（带固件产物）。
 - **workflow_dispatch**：可在 GitHub Actions 页面手动触发（用于调试/预发布验证）。
 
-> 平时 push 到分支（非 tag）**不会**触发构建；只有打 tag 才会。
+> 普通分支 push 不会触发 `build-firmware.yml`；该工作流仅支持 tag 与手动触发。
 
 ## 流水线做了什么
 
@@ -28,6 +28,26 @@
 ## 产物
 
 - `FoloToy-AI-Passport-full.bin`：合并后的完整固件，可直接烧录（唯一产物）。
+
+## 服务端二进制
+
+`.github/workflows/server-checks.yml` 先测试 Go 服务端，再构建 Linux AMD64（`x86_64`）
+与 ARM64（`aarch64`）可执行文件。在 Pull Request、推送到 `main` 和手动触发时运行。
+这些产物作为 Actions artifact 保留 7 天；上面的标签发布工作流仍然只发布固件。
+
+在 GitHub 打开 **Actions → Server checks and binaries → 一次成功运行 → Artifacts**，
+下载 `memo-server-linux-amd64` 或 `memo-server-linux-arm64`。每个 ZIP 包含按架构命名的
+二进制与 `SHA256SUMS`。在 Linux 上解压对应架构的包后，校验并恢复可执行权限：
+
+```bash
+sha256sum -c SHA256SUMS
+chmod +x memo-server-linux-amd64
+./memo-server-linux-amd64 version
+```
+
+ARM64 使用 `memo-server-linux-arm64` 替换。二进制关闭 CGO，采用静态链接。
+环境变量与持久化存储按[服务端部署说明](../../technical/server.zh_CN.md#10-安全与部署)配置。
+本地构建和具体检查见 [CI 验证](CI-validation.zh_CN.md)。
 
 ## 在线烧录
 

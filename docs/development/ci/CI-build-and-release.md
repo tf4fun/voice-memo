@@ -10,6 +10,29 @@ The build job restores ccache, runs `./tools/validate.sh --firmware` with ESP-ID
 
 All Actions are pinned to full commit SHAs. The build job has `contents: read`; only the tag release job receives `contents: write`.
 
+## Server binaries
+
+`.github/workflows/server-checks.yml` tests the Go server, then builds Linux
+executables for AMD64 (`x86_64`) and ARM64 (`aarch64`). It runs on pull requests,
+pushes to `main`, and manual dispatch. These are Actions artifacts retained for
+seven days; the tag release workflow above still publishes firmware only.
+
+In GitHub, open **Actions → Server checks and binaries → a successful run →
+Artifacts**, then download `memo-server-linux-amd64` or `memo-server-linux-arm64`.
+Each ZIP contains the architecture-named binary and `SHA256SUMS`. After extracting
+the matching archive on Linux, verify it and restore executable permissions:
+
+```bash
+sha256sum -c SHA256SUMS
+chmod +x memo-server-linux-amd64
+./memo-server-linux-amd64 version
+```
+
+For ARM64, substitute `memo-server-linux-arm64`. The binaries are statically
+linked with CGO disabled. Configure environment variables and persistent storage
+as described in the [server deployment guide](../../technical/server.md#10-security-and-deployment).
+For local builds and the exact checks, see [CI validation](CI-validation.md).
+
 ## Browser flashing
 
 Open `https://ai-passport.folotoy.cn/tools/web-flasher/`, connect the USB JTAG/serial device, select the release's merged `FoloToy-AI-Passport-full.bin`, choose a baud rate such as 460800, and write it from `0x0`. The browser performs local writing and verification; it does not upload the firmware file.

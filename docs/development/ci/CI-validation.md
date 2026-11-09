@@ -4,9 +4,10 @@
 
 # Pull Request Validation
 
-Two workflows validate pull requests: `.github/workflows/static-checks.yml` and
-`.github/workflows/firmware-checks.yml`. Both run for pull requests, pushes to
-`main`, and manual dispatch; local development and CI share `tools/validate.sh`.
+Three workflows validate pull requests: `.github/workflows/static-checks.yml`,
+`.github/workflows/firmware-checks.yml`, and `.github/workflows/server-checks.yml`.
+All run for pull requests, pushes to `main`, and manual dispatch. Firmware and
+host checks share `tools/validate.sh` with local development.
 
 ## Workflows
 
@@ -18,6 +19,14 @@ Two workflows validate pull requests: `.github/workflows/static-checks.yml` and
   `./tools/validate.sh --firmware` for ESP32-C3 in a fresh isolated
   build/configuration directory, verifies the build and the merged `0x0` image
   contents/offsets, and retains the artifact for seven days.
+- **Server checks and binaries** (`server-checks.yml`): reads the Go version from
+  `server/go.mod`, runs `go vet ./...`, `go test -race ./...`, and
+  `scripts/e2e-server.sh` with fake ASR and temporary storage. After these pass,
+  a matrix builds static Linux AMD64 and ARM64 executables through
+  `tools/build-server.sh`. Each architecture has a separate downloadable artifact
+  containing its binary and `SHA256SUMS`, retained for seven days. The AMD64
+  executable also runs its `version` command on the runner; ARM64 is cross-built,
+  without a native ARM runtime test. No ASR API key or production data is used.
 
 ## Path filtering
 
@@ -37,7 +46,7 @@ block merging. Keep this in mind before marking the firmware job required; if it
 is required, the path filter must be revisited (for example, split the job into a
 documentation-only pass/fail stub, or use a single unconditional workflow).
 
-Both workflows have only `contents: read` and use no repository secrets, so they
+All three workflows have only `contents: read` and use no repository secrets, so they
 can validate fork pull requests. Every GitHub Action is pinned to a full commit
 SHA.
 
@@ -47,6 +56,11 @@ SHA.
 ./tools/validate.sh --static
 source <path-to-esp-idf-v5.5.3>/export.sh
 ./tools/validate.sh --firmware
+source scripts/go-env.sh
+(cd server && go vet ./... && go test -race ./...)
+./scripts/e2e-server.sh
+./tools/build-server.sh amd64
+./tools/build-server.sh arm64
 ```
 
 Follow the [environment bootstrap](../engineering/environment-setup.md) if ESP-IDF 5.5.3 is

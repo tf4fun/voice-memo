@@ -4,9 +4,10 @@
 
 # PR 自动验证（CI Validation）
 
-两个工作流验证 PR：`.github/workflows/static-checks.yml` 与
-`.github/workflows/firmware-checks.yml`。两者都在 Pull Request、`main` push 和手动触发时运行，
-与本地共用 `tools/validate.sh`。
+三个工作流验证 PR：`.github/workflows/static-checks.yml`、
+`.github/workflows/firmware-checks.yml` 与 `.github/workflows/server-checks.yml`。
+三者都在 Pull Request、`main` push 和手动触发时运行；固件及 host 检查与本地共用
+`tools/validate.sh`。
 
 ## 工作流
 
@@ -16,6 +17,12 @@
 - **Firmware checks**（`firmware-checks.yml`）：在全新隔离的构建/配置目录中，使用 ESP-IDF 5.5.3 /
   ESP32-C3 运行 `./tools/validate.sh --firmware`，验证编译、0x0 合并固件的偏移与内容，并保留 7 天
   Actions artifact。
+- **Server checks and binaries**（`server-checks.yml`）：从 `server/go.mod` 读取 Go 版本，
+  运行 `go vet ./...`、`go test -race ./...`，以及使用假 ASR 和临时存储的
+  `scripts/e2e-server.sh`。通过后，构建矩阵调用 `tools/build-server.sh`，生成静态链接的
+  Linux AMD64 和 ARM64 可执行文件。每种架构有独立的下载产物，包含二进制与 `SHA256SUMS`，
+  保留 7 天。AMD64 产物还会在 runner 上执行 `version` 命令；ARM64 为交叉编译，
+  不执行原生 ARM 运行测试。无需 ASR API Key，也不使用生产数据。
 
 ## 路径过滤
 
@@ -30,7 +37,7 @@
 设为 required 之前请谨记这一点；若确需 required，必须重新审视路径过滤（例如把 job 拆出一个
 文档专用的 pass/fail 桩，或改用单一无条件 workflow）。
 
-两个工作流都只有 `contents: read` 权限、不使用仓库 secrets，因此可以安全验证来自 fork 的 PR。
+三个工作流都只有 `contents: read` 权限、不使用仓库 secrets，因此可以安全验证来自 fork 的 PR。
 所有 GitHub Actions 固定到完整 commit SHA；升级时必须核对官方版本、更新 SHA 注释并运行 `actionlint`。
 
 ## 本地复现
@@ -39,6 +46,11 @@
 ./tools/validate.sh --static
 source <ESP-IDF-v5.5.3-路径>/export.sh
 ./tools/validate.sh --firmware
+source scripts/go-env.sh
+(cd server && go vet ./... && go test -race ./...)
+./scripts/e2e-server.sh
+./tools/build-server.sh amd64
+./tools/build-server.sh arm64
 ```
 
 未安装 ESP-IDF 5.5.3 时先按[环境引导](../engineering/environment-setup.zh_CN.md)搭建。CI
