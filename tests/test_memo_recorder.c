@@ -23,11 +23,25 @@ static int semaphores;
 SemaphoreHandle_t xSemaphoreCreateBinary(void) { return (void *)(size_t)++semaphores; }
 void vSemaphoreDelete(SemaphoreHandle_t sem) { (void)sem; }
 int xSemaphoreTake(SemaphoreHandle_t sem, unsigned ticks)
-{ (void)ticks; int *signal=sem==s_start ? &signal_start : &signal_done;
-  if (!*signal) return 0; *signal=0; return pdTRUE; }
+{
+    (void)ticks;
+    int *signal = sem == s_start ? &signal_start : &signal_done;
+    if (!*signal) {
+        return 0;
+    }
+    *signal = 0;
+    return pdTRUE;
+}
 int xSemaphoreGive(SemaphoreHandle_t sem)
-{ if(sem==s_start){assert(worker_live && encoder_live && live_buffers==2 && s_rec.file && s_rec.active);signal_start=1;}
-  else signal_done=1;return pdTRUE; }
+{
+    if (sem == s_start) {
+        assert(worker_live && encoder_live && live_buffers == 2 && s_rec.file && s_rec.active);
+        signal_start = 1;
+    } else {
+        signal_done = 1;
+    }
+    return pdTRUE;
+}
 int xTaskCreate(void (*fn)(void *), const char *name, unsigned stack, void *arg,
                 unsigned priority, TaskHandle_t *task)
 { (void)fn; (void)name; (void)arg;
