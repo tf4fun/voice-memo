@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -174,5 +175,61 @@ func TestDeletedMemoDropsItsJob(t *testing.T) {
 	}
 	if depth, _ := st.QueueDepth(context.Background()); depth != 0 {
 		t.Errorf("queue depth = %d, want 0", depth)
+	}
+}
+
+type poolTranscriber struct {
+	started chan bool
+	active  atomic.Int32
+}
+
+func (p *poolTranscriber) Name() string { return "pool-test" }
+func (p *poolTranscriber) Transcribe(ctx context.Context, in asr.Input) (asr.Result, error) {
+	p.active.Add(1)
+	defer p.active.Add(-1)
+	deadline, ok := ctx.Deadline()
+	p.started <- ok && time.Until(deadline) > 0 && time.Until(deadline) <= AttemptTimeout
+	<-ctx.Done()
+	return asr.Result{}, ctx.Err()
+}
+func TestPoolStartsConfiguredWorkersAndJoinsOnCancel(t *testing.T) {
+	provider := &poolTranscriber{started: make(chan bool, 4)}
+	runner, st, now := newRunner(t, provider)
+	for _, id := range []string{"p1", "p2", "p3"} {
+		queueMemo(t, st, id, now.Unix())
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { runner.RunPool(ctx, 2); close(done) }()
+	for i := 0; i < 2; i++ {
+		select {
+		case valid := <-provider.started:
+			if !valid {
+				t.Fatal("missing attempt deadline")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("configured worker did not start")
+		}
+	}
+	if provider.active.Load() != 2 {
+		t.Fatal("pool count ignored")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("workers not joined")
+	}
+	if provider.active.Load() != 0 {
+		t.Fatal("provider survived pool shutdown")
+	}
+	select {
+	case <-provider.started:
+		t.Fatal("job started after shutdown")
+	default:
+	}
+	if depth, err := st.QueueDepth(t.Context()); err != nil || depth != 3 {
+		t.Fatalf("cancelled jobs lost: %d %v", depth, err)
 	}
 }

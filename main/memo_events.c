@@ -6,7 +6,6 @@
 #include <stdatomic.h>
 #include <string.h>
 
-#include "cJSON.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -14,6 +13,7 @@
 #include "freertos/task.h"
 
 #include "memo_api.h"
+#include "memo_sse.h"
 #include "memo_discovery.h"
 #include "memo_net.h"
 
@@ -28,77 +28,30 @@ static TaskHandle_t s_task;
 static SemaphoreHandle_t s_done;
 static atomic_bool s_running;
 static atomic_bool s_connected;
-static char s_line[EVENTS_BUF];
-static size_t s_line_len;
+static memo_sse_t s_parser;
 
-/* 把一条 data: 中的 JSON 合并进缓存。 */
-static void apply_event(const char *json)
+static void apply_event(const char *json, void *ctx)
 {
-    cJSON *root = cJSON_Parse(json);
-    if (root == NULL) return;
-
-    const cJSON *id = cJSON_GetObjectItem(root, "id");
-    if (cJSON_IsString(id) && strlen(id->valuestring) == 36) {
-        const cJSON *status = cJSON_GetObjectItem(root, "status");
-        const cJSON *snippet = cJSON_GetObjectItem(root, "snippet");
-        const cJSON *rec = cJSON_GetObjectItem(root, "recorded_at");
-        const cJSON *dur = cJSON_GetObjectItem(root, "duration_ms");
-
-        memo_api_upsert(id->valuestring,
-                        cJSON_IsNumber(rec) ? (int64_t)rec->valuedouble : 0,
-                        cJSON_IsNumber(dur) ? (uint32_t)dur->valuedouble : 0,
-                        cJSON_IsString(status) ? status->valuestring : NULL,
-                        cJSON_IsString(snippet) ? snippet->valuestring : NULL);
-        ESP_LOGI(TAG, "event %s -> %s", id->valuestring,
-                 cJSON_IsString(status) ? status->valuestring : "?");
-    }
-    cJSON_Delete(root);
+    (void)json; (void)ctx;
+    // The uploader owns cache writes. Re-read the authoritative list for every
+    // mutation, including deletion/empty transcript; do not merge partial events.
+    memo_api_request_refresh();
 }
 
-/* 按行处理：空行表示一条事件结束，data: 行携带 JSON。 */
 static void feed_bytes(const char *data, int len)
 {
-    static char payload[EVENTS_BUF];
-    static size_t payload_len;
-
-    for (int i = 0; i < len; i++) {
-        const char c = data[i];
-        if (c == '\r') continue;
-
-        if (c == '\n') {
-            s_line[s_line_len] = '\0';
-            if (s_line_len == 0) {
-                /* 事件结束 */
-                if (payload_len > 0) {
-                    payload[payload_len] = '\0';
-                    apply_event(payload);
-                    payload_len = 0;
-                }
-            } else if (strncmp(s_line, "data:", 5) == 0) {
-                const char *value = s_line + 5;
-                while (*value == ' ') value++;
-                const size_t value_len = strlen(value);
-                if (payload_len + value_len + 1 < sizeof(payload)) {
-                    memcpy(payload + payload_len, value, value_len);
-                    payload_len += value_len;
-                }
-            }
-            s_line_len = 0;
-            continue;
-        }
-
-        if (s_line_len + 1 < sizeof(s_line)) {
-            s_line[s_line_len++] = c;
-        }
+    if (memo_sse_feed(&s_parser, data, (size_t)len, apply_event, NULL)) {
+        memo_api_request_refresh();
     }
 }
 
 /* 连一次，直到流结束或出错。返回后由任务决定重连。 */
 static void subscribe_once(void)
 {
+    memo_endpoint_t endpoint;
+    if (!memo_discovery_endpoint(&endpoint) || !endpoint.confirmed) return;
     char url[128];
-    snprintf(url, sizeof(url), "http://%s:%u/api/v1/events", memo_discovery_host(),
-             (unsigned)memo_discovery_port());
+    snprintf(url, sizeof(url), "http://%s:%u/api/v1/events", endpoint.host, (unsigned)endpoint.port);
 
     esp_http_client_config_t cfg = {
         .url = url,
@@ -110,11 +63,12 @@ static void subscribe_once(void)
     if (client == NULL) return;
 
     esp_http_client_set_header(client, "Accept", "text/event-stream");
-    s_line_len = 0;
+    memo_sse_reset(&s_parser);
     if (s_running && esp_http_client_open(client, 0) == ESP_OK &&
         esp_http_client_fetch_headers(client) >= 0 &&
         esp_http_client_get_status_code(client) == 200) {
         s_connected = true;
+        memo_api_request_refresh(); /* No replay: reconcile on every connection. */
         char bytes[256];
         unsigned idle_reads = 0;
         while (s_running) {
@@ -165,7 +119,9 @@ static void events_task(void *arg)
 
     s_connected = false;
     if (s_done != NULL) xSemaphoreGive(s_done);
-    vTaskDelete(NULL);
+    /* The joining owner deletes us, reclaiming the stack synchronously rather
+     * than leaving self-deletion cleanup pending on the idle task. */
+    vTaskSuspend(NULL);
 }
 
 esp_err_t memo_events_start(void)
@@ -175,6 +131,7 @@ esp_err_t memo_events_start(void)
         /* A previous timeout may now have completed. Join non-blockingly before
          * allowing a new worker; never discard an unacknowledged handle. */
         if (s_done == NULL || xSemaphoreTake(s_done, 0) != pdTRUE) return ESP_ERR_INVALID_STATE;
+        vTaskDelete(s_task);
         s_task = NULL;
     }
 
@@ -202,6 +159,7 @@ esp_err_t memo_events_stop(void)
         ESP_LOGW(TAG, "subscriber did not stop in time");
         return ESP_ERR_TIMEOUT;
     }
+    vTaskDelete(s_task);
     s_task = NULL;
     return ESP_OK;
 }

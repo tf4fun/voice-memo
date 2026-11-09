@@ -15,6 +15,7 @@ typedef enum {
     MEMO_DISCOVERY_IDLE = 0,
     MEMO_DISCOVERY_SEARCHING,
     MEMO_DISCOVERY_FOUND,
+    MEMO_DISCOVERY_CANDIDATE,
     MEMO_DISCOVERY_FAILED,
 } memo_discovery_state_t;
 
@@ -28,5 +29,13 @@ esp_err_t memo_discovery_search(uint32_t timeout_ms);
 void memo_discovery_stop(void);
 
 memo_discovery_state_t memo_discovery_state(void);
-const char *memo_discovery_host(void);
-uint16_t memo_discovery_port(void);
+typedef struct {
+    char host[64];
+    uint16_t port;
+    uint32_t generation;
+    bool confirmed;
+} memo_endpoint_t;
+/* Copy address/port together; no shared mutable string escapes the lock. */
+bool memo_discovery_endpoint(memo_endpoint_t *out);
+void memo_discovery_confirm(const memo_endpoint_t *endpoint);
+void memo_discovery_invalidate(const memo_endpoint_t *endpoint);

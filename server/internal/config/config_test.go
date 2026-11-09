@@ -55,6 +55,13 @@ func TestLoadFakeProviderNeedsNoKey(t *testing.T) {
 	}
 }
 
+func TestMDNSInterfaceCanBeSelected(t *testing.T) {
+	cfg, err := Load(env(map[string]string{"MEMO_ASR_PROVIDER": "fake", "MEMO_MDNS_INTERFACE": " en0 "}))
+	if err != nil || cfg.MDNSInterface != "en0" {
+		t.Fatalf("mDNS interface: %q %v", cfg.MDNSInterface, err)
+	}
+}
+
 func TestLoadRejectsBadValues(t *testing.T) {
 	cases := map[string]map[string]string{
 		"unknown provider": {"MEMO_ASR_PROVIDER": "whisper"},
@@ -85,5 +92,22 @@ func TestDerivedPaths(t *testing.T) {
 	}
 	if got, want := cfg.AudioDir(), "/tmp/memo-test/audio"; got != want {
 		t.Errorf("AudioDir = %q, want %q", got, want)
+	}
+}
+
+func TestOperationalOptionsAreEffectiveOrRejected(t *testing.T) {
+	for _, value := range []string{"1", "4"} {
+		cfg, err := Load(env(map[string]string{"MEMO_ASR_PROVIDER": "fake", "MEMO_ASR_CONCURRENCY": value}))
+		if err != nil || cfg.ASR.Concurrency < 1 || cfg.ASR.Concurrency > 4 {
+			t.Fatalf("valid concurrency %s: %v", value, err)
+		}
+	}
+	for _, pairs := range []map[string]string{
+		{"MEMO_ASR_PROVIDER": "fake", "MEMO_ASR_CONCURRENCY": "5"},
+		{"MEMO_ASR_PROVIDER": "fake", "MEMO_RETENTION_DAYS": "7"},
+	} {
+		if _, err := Load(env(pairs)); err == nil {
+			t.Fatal("inactive or unsupported option accepted", pairs)
+		}
 	}
 }

@@ -33,9 +33,13 @@ func TestSiliconFlowSendsFileAndModel(t *testing.T) {
 		gotAuth  string
 		gotModel string
 		gotFile  int
+		gotWAV   bool
 	)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/audio/transcriptions" {
+			t.Errorf("provider request = %s %s", r.Method, r.URL.Path)
+		}
 		gotAuth = r.Header.Get("Authorization")
 		if err := r.ParseMultipartForm(1 << 20); err != nil {
 			t.Errorf("parse multipart: %v", err)
@@ -46,6 +50,7 @@ func TestSiliconFlowSendsFileAndModel(t *testing.T) {
 		if file, _, err := r.FormFile("file"); err == nil {
 			data, _ := io.ReadAll(file)
 			gotFile = len(data)
+			gotWAV = len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WAVE"
 			file.Close()
 		}
 		w.Header().Set("x-siliconcloud-trace-id", "trace-123")
@@ -69,7 +74,7 @@ func TestSiliconFlowSendsFileAndModel(t *testing.T) {
 		t.Errorf("model = %q", gotModel)
 	}
 	/* 上传给服务商的是解码后的 WAV：应以 RIFF 开头且明显大于 Opus 原件。 */
-	if gotFile < 44 {
+	if gotFile < 44 || !gotWAV {
 		t.Errorf("uploaded bytes = %d, want a wav payload", gotFile)
 	}
 	if result.Text != "下午三点对进度" || result.TraceID != "trace-123" {

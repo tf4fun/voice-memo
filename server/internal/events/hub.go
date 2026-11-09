@@ -6,7 +6,10 @@
 // the upload path.
 package events
 
-import "sync"
+import (
+	"github.com/tf4fun/voice-memo/server/internal/domain"
+	"sync"
+)
 
 // Event is one change worth pushing to connected devices.
 type Event struct {
@@ -52,14 +55,19 @@ func (h *Hub) Subscribe() (<-chan Event, func()) {
 }
 
 // Publish delivers an event without blocking. A subscriber whose buffer is
-// full is skipped: the device re-reads the list anyway when it reconnects.
+// full is closed: the device re-reads the list when it reconnects.
 func (h *Hub) Publish(ev Event) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+	ev.Snippet = (domain.Memo{Transcript: ev.Snippet}).Snippet(40)
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	for ch := range h.subs {
 		select {
 		case ch <- ev:
 		default:
+			// Force reconnect/reconciliation rather than silently losing the
+			// last update on an otherwise healthy long-lived stream.
+			delete(h.subs, ch)
+			close(ch)
 		}
 	}
 }

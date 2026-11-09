@@ -39,6 +39,9 @@ type siliconflowResponse struct {
 
 // Transcribe uploads one file and returns its transcript.
 func (s *SiliconFlow) Transcribe(ctx context.Context, in Input) (Result, error) {
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
 	if s.APIKey == "" {
 		return Result{}, fmt.Errorf("%w: missing API key", ErrPermanent)
 	}
@@ -54,8 +57,11 @@ func (s *SiliconFlow) Transcribe(ctx context.Context, in Input) (Result, error) 
 
 	/* 存储的是 Opus 容器，服务商只吃 PCM WAV：这里在内存里解一次，
 	   解码结果不落盘，请求结束即释放。 */
-	wav, stats, err := audio.DecodeOpusToWAVBytes(file)
+	wav, stats, err := audio.DecodeOpusToWAVBytes(contextReader{ctx: ctx, reader: file})
 	if err != nil {
+		if ctx.Err() != nil {
+			return Result{}, ctx.Err()
+		}
 		return Result{}, fmt.Errorf("%w: decode container: %w", ErrPermanent, err)
 	}
 	if int64(len(wav)) > siliconflowMaxBytes {
@@ -142,4 +148,17 @@ func classifyStatus(status int, body []byte) error {
 	default:
 		return fmt.Errorf("provider error %d: %s", status, snippet)
 	}
+}
+
+// Check cancellation between container reads as well as during HTTP transport.
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
 }

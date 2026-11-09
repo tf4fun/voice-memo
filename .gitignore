@@ -16,3 +16,7 @@ managed_components/
 /bin/
 /.dsh/
 /reference/
+
+/server/.env.local
+
+/server/data/

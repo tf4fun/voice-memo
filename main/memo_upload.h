@@ -52,3 +52,10 @@ esp_err_t memo_upload_choose(const char *id, bool delete_recording);
 
 /* Keep the upload worker away from an active/unconfirmed capture. */
 void memo_upload_set_capture_busy(bool busy);
+
+/* Hold a local playback source until its player has acknowledged completion. */
+void memo_upload_set_playback_busy(bool busy);
+
+/* Queue manual rediscovery for the worker; retained while offline/busy. */
+void memo_upload_request_discovery(void);
+bool memo_upload_discovery_pending(void);

@@ -10,3 +10,5 @@ typedef struct {
 } esp_vfs_spiffs_conf_t;
 esp_err_t esp_vfs_spiffs_register(const esp_vfs_spiffs_conf_t *conf);
 esp_err_t esp_spiffs_info(const char *label, size_t *total, size_t *used);
+
+esp_err_t esp_spiffs_format(const char *label);

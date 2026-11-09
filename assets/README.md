@@ -17,6 +17,43 @@ Store reusable font files and generated font sources in `fonts/`.
 - Check Flash and internal-RAM impact before adding a font; the ESP32-C3 has no PSRAM.
 - Do not commit fonts whose license does not permit redistribution.
 
+### Voice Memo fonts
+
+The application embeds `fonts/memo_font_16.c` (Bold, 16 px) and
+`fonts/memo_font_20.c` (Regular, 20 px), derived from
+[Noto Sans SC 2.004](https://github.com/notofonts/noto-cjk/tree/Sans2.004).
+Copyright 2014–2021 Adobe. The font software uses SIL OFL 1.1; retain
+[OFL.txt](fonts/OFL.txt) and [NOTICE.txt](fonts/NOTICE.txt) with redistributed font
+assets. This license is separate from application code licensing.
+
+[manifest.json](fonts/manifest.json) pins official source URLs/SHA-256, converter
+`lv_font_conv` 1.5.2, output metrics and generated C payload hashes.
+[charset.txt](fonts/charset.txt) records the original 4013 requested code points:
+GB2312 level-one Han (3755), ASCII and punctuation/full-width forms. Both emitted
+cmaps contain 4012 code points; unassigned U+FF00 has no source glyph and is not
+part of the supported text set. Generated line heights are 31 and 38 px, not the
+nominal glyph sizes. These metrics drive UI layout tests.
+
+From the repository root, with Node/npm and Python available:
+
+```bash
+npm install --prefix bin/lvfont --no-audit --no-fund lv_font_conv@1.5.2
+python3 tools/generate_memo_fonts.py --fetch --check
+```
+
+The source-font cache is ignored under `bin/fonts`; downloads are hash-checked
+and existing mismatched files are preserved. `--check` writes temporary files
+and reproduces bitmap/metrics/cmap payloads byte for byte, excluding the leading
+CLI comment containing local paths. `--write` explicitly replaces generated C
+files. Both use 4 bpp, uncompressed LVGL output. The maintained bitmap assets are
+compiled through `main/CMakeLists.txt`; no OTF is loaded into device RAM.
+
+All static UI literals are checked against both cmaps. Dynamic text uses the
+selected size and Montserrat fallback; unsupported Unicode or invalid byte
+sequences display `?`, preserving supported text and UTF-8 boundaries. Server
+text and byte offsets remain unchanged. This host coverage policy does not
+establish device rendering or peak RAM use.
+
 ## Images
 
 Store reusable source images and generated display assets in `images/`.
@@ -59,3 +96,23 @@ Decoded 80-byte SHA-256:
 `fa7365671093ef449c5bdcfb4adb279e3d275f888109f50b6b2f21e9b96220d5`.
 This is a fuel-gauge profile, not a charging configuration or a generic profile
 for every 500 mAh cell; see the [hardware guide](../docs/hardware-design/AI_HARDWARE_DEVELOPMENT_GUIDE.md#9-cw2017-fuel-gauge).
+
+
+## Terminal ASCII font
+
+`fonts/memo_font_terminal.c` provides a real 8 px fixed advance and an 18 px line
+height. It vertically doubles the bitmap rows of LVGL's Unscii-8, preserving
+horizontal pixels and spacing. The bundled Unscii-16 has a 16 px advance and
+cannot serve as an 8 px column font. ASCII U+0020..U+007F is included; Chinese
+continues to use the existing Noto subsets.
+
+Pinned input: `fonts/source/lvgl_unscii_8.c`, copied unchanged from the project's
+LVGL component; SHA-256
+`bd95b245eaea139aa7c4d9efbc130cc8eda4c11dc7a22b42048a7f0d814e29bf`.
+The bundled LVGL source and derivative retain the MIT notice in
+[`fonts/LICENSE.lvgl.txt`](fonts/LICENSE.lvgl.txt), separately from Noto's OFL.
+The original source is LVGL `src/font/lv_font_unscii_8.c`; the component version
+is pinned in `dependencies.lock`. Reproduce offline with
+`python3 tools/generate_memo_terminal.py`; verify with `--check`. CMake compiles
+only the derived font. Width checks read the actual generated advances; host
+object tests do not establish on-device raster quality.

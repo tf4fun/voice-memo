@@ -21,7 +21,7 @@ typedef enum {
     MEMO_SPOOL_BAD,         /* .bad */
     MEMO_SPOOL_LEGACY_KEPT,        /* .keep: legacy input only; no new retained archive */
     MEMO_SPOOL_RECORDING,         /* .rec: never eligible for upload */
-    MEMO_SPOOL_DRAFT,             /* .draft: durable, awaiting explicit save */
+    MEMO_SPOOL_DRAFT,             /* .draft: durable, awaiting confirmation or autosave undo expiry */
 } memo_spool_state_t;
 
 typedef struct {
@@ -33,7 +33,8 @@ typedef struct {
     uint32_t frame_count;
 } memo_spool_entry_t;
 
-/* 挂载分区（首次挂载自动格式化）。幂等。 */
+/* Mount without erasing existing data. Only a fully erased partition may
+ * be formatted automatically on first use. Mount failure blocks capture/upload. */
 esp_err_t memo_spool_mount(void);
 
 /* 新建一个待录文件，写入 80 字节占位头，返回文件句柄。 */
@@ -49,7 +50,10 @@ esp_err_t memo_spool_finalize(void *file, const char *id, uint32_t frame_count, 
 /* 放弃这次录音：关闭并删除文件。 */
 esp_err_t memo_spool_discard(void *file, const char *id);
 
-/* 扫描目录，返回条目数；out 可为 NULL 只做计数。 */
+/* Return the total recognised count; copy at most max_entries, prioritising
+ * capture/draft, pending, rejected/legacy, then acknowledged compatibility files.
+ * Stable within each priority. No file is changed or deleted by scanning.
+ * out may be NULL for count only. */
 int memo_spool_scan(memo_spool_entry_t *out, size_t max_entries);
 
 /* 改变状态（重命名）。上传成功后调用。 */

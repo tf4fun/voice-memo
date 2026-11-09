@@ -19,17 +19,26 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ch, cancel := s.events.Subscribe()
+	defer cancel()
+	controller := http.NewResponseController(w)
+	write := func(text string) bool {
+		_ = controller.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if _, err := fmt.Fprint(w, text); err != nil {
+			return false
+		}
+		flusher.Flush()
+		return true
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 
 	// Start the client with a hint so it knows the stream is live.
-	fmt.Fprint(w, "event: ready\ndata: {}\n\n")
-	flusher.Flush()
-
-	ch, cancel := s.events.Subscribe()
-	defer cancel()
+	if !write("event: ready\ndata: {}\n\n") {
+		return
+	}
 
 	heartbeat := time.NewTicker(20 * time.Second)
 	defer heartbeat.Stop()
@@ -40,8 +49,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case <-heartbeat.C:
-			fmt.Fprint(w, ": keepalive\n\n")
-			flusher.Flush()
+			if !write(": keepalive\n\n") {
+				return
+			}
 		case ev, open := <-ch:
 			if !open {
 				return
@@ -50,8 +60,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				continue
 			}
-			fmt.Fprintf(w, "event: memo\ndata: %s\n\n", body)
-			flusher.Flush()
+			if !write(fmt.Sprintf("event: memo\ndata: %s\n\n", body)) {
+				return
+			}
 		}
 	}
 }

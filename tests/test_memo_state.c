@@ -7,7 +7,7 @@
 
 static void expect(memo_state_t from, memo_input_t input, memo_state_t to, memo_action_t action)
 {
-    memo_sm_t sm = {.state = from, .expanded = false, .confirm_save = true};
+    memo_sm_t sm = {.state = from, .confirm_save = true};
     memo_action_t got = memo_sm_handle(&sm, input);
     if (sm.state != to || got != action) {
         printf("FAIL %s + %s: got state=%s action=%s, want state=%s action=%s\n",
@@ -27,8 +27,8 @@ static void test_list_navigation(void)
 {
     expect(MEMO_STATE_LIST, MEMO_IN_UP_CLICK, MEMO_STATE_LIST, MEMO_ACT_SELECT_PREV);
     expect(MEMO_STATE_LIST, MEMO_IN_DOWN_CLICK, MEMO_STATE_LIST, MEMO_ACT_SELECT_NEXT);
-    expect(MEMO_STATE_LIST, MEMO_IN_OK_CLICK, MEMO_STATE_DETAIL_COLLAPSED, MEMO_ACT_OPEN_DETAIL);
-    /* 圆环从"按下"就开始，不再等长按判定；这样总时长只有圆环本身。 */
+    expect(MEMO_STATE_LIST, MEMO_IN_OK_CLICK, MEMO_STATE_DETAIL, MEMO_ACT_OPEN_DETAIL);
+    /* 逻辑待发从按下开始；短按不切页，准备动画使用一秒周期的剩余时间。 */
     expect(MEMO_STATE_LIST, MEMO_IN_OK_PRESS, MEMO_STATE_ARMING, MEMO_ACT_START_ARMING);
     expect_ignored(MEMO_STATE_LIST, MEMO_IN_OK_HOLD);
     expect(MEMO_STATE_LIST, MEMO_IN_UP_HOLD, MEMO_STATE_SETTINGS, MEMO_ACT_OPEN_SETTINGS);
@@ -85,23 +85,16 @@ static void test_confirm_sheet(void)
 
 static void test_detail_cycle(void)
 {
-    expect(MEMO_STATE_DETAIL_COLLAPSED, MEMO_IN_OK_CLICK, MEMO_STATE_DETAIL_EXPANDED, MEMO_ACT_EXPAND);
-    expect(MEMO_STATE_DETAIL_EXPANDED, MEMO_IN_OK_CLICK, MEMO_STATE_PLAYING, MEMO_ACT_PLAY);
+    expect(MEMO_STATE_DETAIL, MEMO_IN_OK_CLICK, MEMO_STATE_PLAYING, MEMO_ACT_PLAY);
     expect(MEMO_STATE_PLAYING, MEMO_IN_OK_CLICK, MEMO_STATE_PAUSED, MEMO_ACT_PAUSE);
     expect(MEMO_STATE_PAUSED, MEMO_IN_OK_CLICK, MEMO_STATE_PLAYING, MEMO_ACT_RESUME);
-
-    /* 长按永远回列表，从任何详情子状态。 */
-    expect(MEMO_STATE_DETAIL_COLLAPSED, MEMO_IN_OK_HOLD, MEMO_STATE_LIST, MEMO_ACT_BACK_TO_LIST);
-    expect(MEMO_STATE_DETAIL_EXPANDED, MEMO_IN_OK_HOLD, MEMO_STATE_LIST, MEMO_ACT_BACK_TO_LIST);
-    expect(MEMO_STATE_PLAYING, MEMO_IN_OK_HOLD, MEMO_STATE_LIST, MEMO_ACT_BACK_TO_LIST);
-    expect(MEMO_STATE_PAUSED, MEMO_IN_OK_HOLD, MEMO_STATE_LIST, MEMO_ACT_BACK_TO_LIST);
-
-    /* 展开后上下键是滚动，不是换条目。 */
-    expect(MEMO_STATE_DETAIL_EXPANDED, MEMO_IN_UP_CLICK, MEMO_STATE_DETAIL_EXPANDED, MEMO_ACT_SCROLL_UP);
-    expect(MEMO_STATE_PLAYING, MEMO_IN_DOWN_CLICK, MEMO_STATE_PLAYING, MEMO_ACT_SCROLL_DOWN);
-    /* 折叠时上下键是换条目。 */
-    expect(MEMO_STATE_DETAIL_COLLAPSED, MEMO_IN_UP_CLICK, MEMO_STATE_DETAIL_COLLAPSED, MEMO_ACT_PREV_MEMO);
-    expect(MEMO_STATE_DETAIL_COLLAPSED, MEMO_IN_DOWN_CLICK, MEMO_STATE_DETAIL_COLLAPSED, MEMO_ACT_NEXT_MEMO);
+    for (int state=MEMO_STATE_DETAIL; state<=MEMO_STATE_PAUSED; state++) {
+        expect(state, MEMO_IN_UP_CLICK, state, MEMO_ACT_VOLUME_UP);
+        expect(state, MEMO_IN_DOWN_CLICK, state, MEMO_ACT_VOLUME_DOWN);
+        expect(state, MEMO_IN_UP_HOLD, state, MEMO_ACT_DETAIL_PREV);
+        expect(state, MEMO_IN_DOWN_HOLD, state, MEMO_ACT_DETAIL_NEXT);
+        expect(state, MEMO_IN_OK_HOLD, MEMO_STATE_LIST, MEMO_ACT_BACK_TO_LIST);
+    }
 }
 
 static void test_settings_and_subpage(void)
@@ -119,28 +112,6 @@ static void test_settings_and_subpage(void)
     expect(MEMO_STATE_SUB_PAGE, MEMO_IN_UP_CLICK, MEMO_STATE_SUB_PAGE, MEMO_ACT_SUB_PAGE_PREV);
 }
 
-static void test_expanded_latch(void)
-{
-    memo_sm_t sm;
-    memo_sm_init(&sm);
-    assert(sm.state == MEMO_STATE_LIST);
-    assert(!sm.expanded);
-
-    memo_sm_handle(&sm, MEMO_IN_OK_CLICK);
-    assert(sm.state == MEMO_STATE_DETAIL_COLLAPSED);
-    assert(!sm.expanded);
-
-    memo_sm_handle(&sm, MEMO_IN_OK_CLICK);
-    assert(sm.expanded);
-
-    /* 回到列表再进来，恢复折叠。 */
-    memo_sm_handle(&sm, MEMO_IN_OK_HOLD);
-    assert(sm.state == MEMO_STATE_LIST);
-    assert(!sm.expanded);
-    memo_sm_handle(&sm, MEMO_IN_OK_CLICK);
-    assert(!sm.expanded);
-}
-
 static void test_ignored_inputs_are_explicit(void)
 {
     /* 列表里短按之外的取消类输入不应有动作。 */
@@ -148,7 +119,7 @@ static void test_ignored_inputs_are_explicit(void)
     expect_ignored(MEMO_STATE_LIST, MEMO_IN_ARM_COMPLETE);
     expect_ignored(MEMO_STATE_LIST, MEMO_IN_RECORD_LIMIT);
     /* 详情里没有「开始录音」。 */
-    expect_ignored(MEMO_STATE_DETAIL_COLLAPSED, MEMO_IN_ARM_COMPLETE);
+    expect_ignored(MEMO_STATE_DETAIL, MEMO_IN_ARM_COMPLETE);
 }
 
 static void test_screen_and_recording_flags(void)
@@ -168,7 +139,7 @@ static void test_every_state_handles_every_input(void)
     /* 没有崩溃、没有越界，且 ACTION/state 名字都能取到。 */
     for (int s = 0; s < MEMO_STATE_COUNT; s++) {
         for (int i = 0; i < MEMO_IN_COUNT; i++) {
-            memo_sm_t sm = {.state = (memo_state_t)s, .expanded = false};
+            memo_sm_t sm = {.state = (memo_state_t)s};
             memo_action_t a = memo_sm_handle(&sm, (memo_input_t)i);
             assert(a >= MEMO_ACT_NONE && a < MEMO_ACT_COUNT);
             assert(sm.state >= 0 && sm.state < MEMO_STATE_COUNT);
@@ -213,9 +184,11 @@ int main(void)
     test_arming_fills_then_records();
     test_recording_ends_on_release();
     test_confirm_sheet();
+    expect(MEMO_STATE_AUTOSAVE, MEMO_IN_OK_CLICK, MEMO_STATE_LIST, MEMO_ACT_CONFIRM_CANCEL);
+    expect_ignored(MEMO_STATE_AUTOSAVE, MEMO_IN_OK_HOLD);
+    assert(memo_state_keeps_screen_on(MEMO_STATE_AUTOSAVE));
     test_detail_cycle();
     test_settings_and_subpage();
-    test_expanded_latch();
     test_ignored_inputs_are_explicit();
     test_screen_and_recording_flags();
     test_every_state_handles_every_input();

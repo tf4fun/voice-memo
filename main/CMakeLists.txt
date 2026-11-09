@@ -26,12 +26,13 @@ idf_component_register(
          "memo_ui_provision.c"
     INCLUDE_DIRS "."
     REQUIRES bsp bt esp_audio_codec esp_event esp_netif esp_timer esp_wifi
-             json mbedtls mdns nvs_flash spiffs esp_http_client
+             json mbedtls mdns nvs_flash spiffs esp_http_client esp_partition
 )
 
 # Generated CJK subsets live outside main/ so they stay next to the fonts they
-# were produced from; see assets/fonts/README.md for the exact command.
+# were produced from; see assets/README.md for the pinned reproduction command.
 target_sources(${COMPONENT_LIB} PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/../assets/fonts/memo_font_16.c"
     "${CMAKE_CURRENT_LIST_DIR}/../assets/fonts/memo_font_20.c"
+    "${CMAKE_CURRENT_LIST_DIR}/../assets/fonts/memo_font_terminal.c"
 )

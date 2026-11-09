@@ -10,15 +10,18 @@ int xSemaphoreGive(SemaphoreHandle_t sem) { (void)sem; done = true; return pdTRU
 int xTaskCreate(void (*fn)(void *), const char *name, unsigned stack, void *arg,
                 unsigned priority, TaskHandle_t *out)
 { (void)fn; (void)name; (void)stack; (void)arg; (void)priority; *out = (void *)2; return pdPASS; }
-void vTaskDelete(TaskHandle_t task) { (void)task; }
+void vTaskDelete(TaskHandle_t task) { assert(task!=NULL); }
+void vTaskSuspend(TaskHandle_t task) { assert(task==NULL && done); }
 void vTaskDelay(unsigned ticks)
 { assert(ticks <= 100); if (++delays == 3) s_running = false; }
 bool memo_net_has_ip(void) { return online; }
 memo_discovery_state_t memo_discovery_state(void) { return MEMO_DISCOVERY_FOUND; }
-const char *memo_discovery_host(void) { return "127.0.0.1"; }
-uint16_t memo_discovery_port(void) { return 8080; }
-void memo_api_upsert(const char *id, int64_t time, uint32_t duration, const char *status, const char *snippet)
-{ (void)id; (void)time; (void)duration; (void)status; (void)snippet; assert(false); }
+bool memo_discovery_endpoint(memo_endpoint_t *out)
+{ *out = (memo_endpoint_t){.host="127.0.0.1", .port=8080, .confirmed=true}; return true; }
+void memo_discovery_invalidate(const memo_endpoint_t *endpoint) { (void)endpoint; }
+
+static int refreshes;
+void memo_api_request_refresh(void) { refreshes++; }
 esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *cfg)
 { assert(cfg->timeout_ms == 1000 && cfg->method == HTTP_METHOD_GET); return (void *)3; }
 esp_err_t esp_http_client_set_header(esp_http_client_handle_t client, const char *name, const char *value)
@@ -47,6 +50,7 @@ int main(void)
     assert(memo_events_start() == ESP_OK);
     code = 200;
     subscribe_once();
+    assert(refreshes == 1);
     assert(reads == 3 && closes == 1 && cleanups == 1 && !memo_events_connected());
     assert(!s_running); /* Idle SSE reads honour stop, not a 120-second perform. */
     s_running = true; code = 404;

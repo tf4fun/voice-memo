@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Run the repository static gate on Linux through Docker.
 #
-# Apple's ld does not accept the -Wl,--gc-sections flag used by two demo runtime
-# tests, so `./tools/validate.sh --static` cannot pass natively on macOS. This
-# wrapper reproduces the CI environment instead of modifying the gate.
+# The gate supports native macOS and Linux linkers. This optional wrapper runs
+# the same host suites using Linux/GCC to reproduce the CI environment.
 #
 #   ./scripts/static-gate-linux.sh
 #

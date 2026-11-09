@@ -161,6 +161,33 @@ func TestTranscriptLifecycle(t *testing.T) {
 	}
 }
 
+func TestSoftDeleteRollsBackWhenDroppingJobFails(t *testing.T) {
+	st := newStore(t)
+	ctx := t.Context()
+	memo := sampleMemo("delete-atomic", 1000)
+	if created, err := st.InsertMemoAndEnqueue(ctx, memo); err != nil || !created {
+		t.Fatalf("insert: created=%v err=%v", created, err)
+	}
+	if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER reject_delete BEFORE DELETE ON jobs BEGIN SELECT RAISE(ABORT, 'injected queue failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if path, err := st.SoftDelete(ctx, memo.ID, 2000); err == nil || path != "" {
+		t.Fatalf("delete failure: path=%q err=%v", path, err)
+	}
+	if _, err := st.Memo(ctx, memo.ID); err != nil {
+		t.Fatalf("failed deletion must retain visible memo: %v", err)
+	}
+	if depth, err := st.QueueDepth(ctx); err != nil || depth != 1 {
+		t.Fatalf("queue after rollback: %d %v", depth, err)
+	}
+	if _, err := st.db.ExecContext(ctx, `DROP TRIGGER reject_delete`); err != nil {
+		t.Fatal(err)
+	}
+	if path, err := st.SoftDelete(ctx, memo.ID, 2001); err != nil || path != memo.AudioPath {
+		t.Fatalf("delete retry: path=%q err=%v", path, err)
+	}
+}
+
 func TestSoftDeleteHidesMemoAndDropsJob(t *testing.T) {
 	st := newStore(t)
 	ctx := context.Background()
@@ -190,6 +217,13 @@ func TestSoftDeleteHidesMemoAndDropsJob(t *testing.T) {
 	}
 	if depth, err := st.QueueDepth(ctx); err != nil || depth != 0 {
 		t.Errorf("queue depth = %d, err = %v", depth, err)
+	}
+	if again, err := st.SoftDelete(ctx, "m1", 3000); err != nil || again != path {
+		t.Fatalf("cleanup retry: path=%q err=%v", again, err)
+	}
+	var deletedAt int64
+	if err := st.db.QueryRowContext(ctx, `SELECT deleted_at FROM memos WHERE id='m1'`).Scan(&deletedAt); err != nil || deletedAt != 2000 {
+		t.Fatalf("retry changed deletion time: %d %v", deletedAt, err)
 	}
 }
 
@@ -273,5 +307,58 @@ func TestAcceptedMemoAndJobCommitTogether(t *testing.T) {
 	}
 	if count, err := st.QueueDepth(ctx); err != nil || count != 1 {
 		t.Fatalf("jobs: %d %v", count, err)
+	}
+}
+
+func TestLateASRResultCannotOverwriteEditDeleteOrRequeue(t *testing.T) {
+	for _, mutation := range []string{"edit", "delete", "requeue", "lease"} {
+		t.Run(mutation, func(t *testing.T) {
+			st := newStore(t)
+			ctx := t.Context()
+			memo := sampleMemo("owned", 1000)
+			if _, err := st.InsertMemoAndEnqueue(ctx, memo); err != nil {
+				t.Fatal(err)
+			}
+			claim, ok, err := st.ClaimJobWithToken(ctx, 1010)
+			if err != nil || !ok {
+				t.Fatal(claim, ok, err)
+			}
+			if applied, err := st.ApplyClaim(ctx, claim, domain.StatusTranscribing, "", nil, nil); err != nil || !applied {
+				t.Fatal(applied, err)
+			}
+			switch mutation {
+			case "edit":
+				if err := st.UpdateTranscript(ctx, memo.ID, "manual", "zh", 1020); err != nil {
+					t.Fatal(err)
+				}
+			case "delete":
+				if _, err := st.SoftDelete(ctx, memo.ID, 1020); err != nil {
+					t.Fatal(err)
+				}
+			case "requeue":
+				if err := st.RequeueMemo(ctx, memo.ID, 1020); err != nil {
+					t.Fatal(err)
+				}
+			case "lease":
+				if _, ok, err := st.ClaimJobWithToken(ctx, 1200); err != nil || !ok {
+					t.Fatal(ok, err)
+				}
+			}
+			oldResult := domain.Memo{Transcript: "stale"}
+			if applied, err := st.ApplyClaim(ctx, claim, domain.StatusReady, "", &oldResult, nil); err != nil || applied {
+				t.Fatalf("stale write: %v %v", applied, err)
+			}
+			if mutation == "edit" {
+				current, err := st.Memo(ctx, memo.ID)
+				if err != nil || current.Transcript != "manual" || current.Status != domain.StatusReady {
+					t.Fatal(current, err)
+				}
+			}
+			if mutation == "requeue" || mutation == "lease" {
+				if n, err := st.QueueDepth(ctx); err != nil || n != 1 {
+					t.Fatal("replacement job lost", n, err)
+				}
+			}
+		})
 	}
 }

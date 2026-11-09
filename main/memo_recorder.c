@@ -20,6 +20,8 @@
 #include "memo_container.h"
 #include "memo_net.h"
 #include "memo_spool.h"
+#include "memo_state.h"
+#include "memo_signal.h"
 
 #include "esp_opus_enc.h"
 
@@ -44,18 +46,22 @@ typedef struct {
     void *file;
     uint32_t frames;
     uint64_t samples;
-    atomic_uchar level;
+    atomic_uchar level, signal_hint;
     uint8_t batch[REC_BATCH_BYTES];
     size_t batch_len;
 } recorder_state_t;
 
 static recorder_state_t s_rec;
 static SemaphoreHandle_t s_stopped;
+static SemaphoreHandle_t s_start;
 static TaskHandle_t s_task;
 static void *s_encoder;
+static int16_t *s_pcm;
+static uint8_t *s_encoded;
 static int s_in_frame_bytes;
 static int s_out_frame_bytes;
 static bool s_ready;
+static bool s_prepared;
 
 static uint32_t elapsed_ms(void)
 {
@@ -108,6 +114,12 @@ esp_err_t memo_recorder_init(void)
     if (err != ESP_OK) return err;
     s_stopped = xSemaphoreCreateBinary();
     if (s_stopped == NULL) return ESP_ERR_NO_MEM;
+    s_start = xSemaphoreCreateBinary();
+    if (s_start == NULL) {
+        vSemaphoreDelete(s_stopped);
+        s_stopped = NULL;
+        return ESP_ERR_NO_MEM;
+    }
     s_ready = true;
     return ESP_OK;
 }
@@ -136,53 +148,19 @@ static bool append_frame(const uint8_t *frame, size_t len)
     return true;
 }
 
-static uint8_t level_from_pcm(const int16_t *pcm, size_t samples)
-{
-    if (samples == 0) return 0;
-
-    int64_t sum = 0;
-    for (size_t i = 0; i < samples; i++) {
-        sum += (int64_t)pcm[i] * pcm[i];
-    }
-    int64_t rms = 0;
-    /* 整数平方根，避免引入 math.h 的浮点。 */
-    int64_t value = sum / (int64_t)samples;
-    int64_t root = 0, bit = (int64_t)1 << 30;
-    while (bit > value) bit >>= 2;
-    while (bit != 0) {
-        if (value >= root + bit) {
-            value -= root + bit;
-            root = (root >> 1) + bit;
-        } else {
-            root >>= 1;
-        }
-        bit >>= 2;
-    }
-    /* 3000 的 RMS 大致对应满格，按比例压到 0..100。 */
-    rms = root;
-    int level = (int)(rms * 100 / 3000);
-    if (level > 100) level = 100;
-    return (uint8_t)level;
-}
-
 static void recorder_task(void *arg)
 {
     (void)arg;
+    /* Allocate the largest contiguous block (this stack) before the encoder.
+     * The higher-priority worker must not touch resources until start commits. */
+    xSemaphoreTake(s_start, portMAX_DELAY);
+    int16_t *pcm = s_pcm;
+    uint8_t *encoded = s_encoded;
 
-    int16_t *pcm = malloc(REC_FRAME_SAMPLES * sizeof(int16_t));
-    uint8_t *encoded = malloc((size_t)s_out_frame_bytes);
-    if (pcm == NULL || encoded == NULL) {
-        ESP_LOGE(TAG, "recorder buffers: out of memory");
-        free(pcm);
-        free(encoded);
-        s_rec.error = ESP_ERR_NO_MEM;
-        s_rec.active = false;
-        xSemaphoreGive(s_stopped);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    while (s_rec.active) {
+    memo_signal_t signal = {0};
+    /* The input heartbeat is sampled every 200 ms. Bound encoded frames too,
+     * so the last interval can never exceed the server's five-minute cap. */
+    while (s_rec.active && s_rec.frames < MEMO_RECORD_LIMIT_MS / REC_FRAME_MS) {
         size_t want = (size_t)REC_FRAME_SAMPLES * sizeof(int16_t);
         esp_err_t err = bsp_audio_read(pcm, want);
         if (err != ESP_OK) {
@@ -191,7 +169,9 @@ static void recorder_task(void *arg)
             break;
         }
 
-        s_rec.level = level_from_pcm(pcm, REC_FRAME_SAMPLES);
+        const memo_signal_reading_t reading = memo_signal_read(&signal, pcm, REC_FRAME_SAMPLES, REC_FRAME_MS);
+        s_rec.level = reading.level;
+        s_rec.signal_hint = reading.hint;
 
         esp_audio_enc_in_frame_t in = {
             .buffer = (uint8_t *)pcm,
@@ -230,17 +210,21 @@ static void recorder_task(void *arg)
 
     free(pcm);
     free(encoded);
+    s_pcm = NULL;
+    s_encoded = NULL;
     s_rec.level = 0;
+    s_rec.signal_hint = MEMO_SIGNAL_NORMAL;
     xSemaphoreGive(s_stopped);
-    vTaskDelete(NULL);
+    vTaskSuspend(NULL); // Stop owner reclaims this large stack immediately.
 }
 
-esp_err_t memo_recorder_start(const char *id)
+esp_err_t memo_recorder_prepare(const char *id)
 {
     if (!s_ready) return ESP_ERR_INVALID_STATE;
     if (id == NULL || strlen(id) != 36) return ESP_ERR_INVALID_ARG;
     if (s_rec.active || s_task != NULL) return ESP_ERR_INVALID_STATE;
     while (xSemaphoreTake(s_stopped, 0) == pdTRUE) {}
+    while (xSemaphoreTake(s_start, 0) == pdTRUE) {}
 
     esp_err_t err = bsp_audio_set_format(REC_SAMPLE_RATE, 16, REC_CHANNELS);
     if (err != ESP_OK) {
@@ -248,8 +232,23 @@ esp_err_t memo_recorder_start(const char *id)
         return err;
     }
 
+    /* A 28 KB stack cannot be assembled from smaller free blocks. Creating it
+     * after the 24.6 KB encoder failed even with 98 KB total heap available. */
+    if (xTaskCreate(recorder_task, "memo_rec", REC_TASK_STACK, NULL, 6, &s_task) != pdPASS) {
+        s_task = NULL;
+        ESP_LOGE(TAG, "recorder task: out of memory (free heap %u)",
+                 (unsigned)esp_get_free_heap_size());
+        return ESP_ERR_NO_MEM;
+    }
     err = open_encoder();
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) goto start_failed;
+    s_pcm = malloc(REC_FRAME_SAMPLES * sizeof(int16_t));
+    s_encoded = malloc((size_t)s_out_frame_bytes);
+    if (s_pcm == NULL || s_encoded == NULL) {
+        ESP_LOGE(TAG, "recorder buffers: out of memory");
+        err = ESP_ERR_NO_MEM;
+        goto start_failed;
+    }
 
     /* 没连过网、也没 SNTP，time() 会是 1970 年起步的值。这种时间写进容器只会
        让列表显示一个假日期，所以按协议约定记 0（"从未对时"），由服务端兜底。 */
@@ -273,38 +272,64 @@ esp_err_t memo_recorder_start(const char *id)
     s_rec.samples = 0;
     s_rec.batch_len = 0;
     s_rec.level = 0;
+    s_rec.signal_hint = MEMO_SIGNAL_NORMAL;
     memset(s_rec.id, 0, sizeof(s_rec.id));
     strncpy(s_rec.id, id, sizeof(s_rec.id) - 1);
     s_rec.file = NULL;
 
     err = memo_spool_create(id, raw, &s_rec.file);
-    if (err != ESP_OK) {
-        esp_opus_enc_close(s_encoder); s_encoder = NULL;
-        return err;
-    }
-
-    if (s_stopped == NULL) {
-        s_stopped = xSemaphoreCreateBinary();
-    }
+    if (err != ESP_OK) goto start_failed;
     s_rec.error = ESP_OK;
     s_rec.write_failed = false;
+    s_prepared = true;
+    return ESP_OK;
+
+start_failed:
+    /* Still parked at the start gate. Deleting from the owner releases its
+     * stack immediately, before a possible network stand-down/retry. */
+    vTaskDelete(s_task);
+    s_task = NULL;
+    if (s_encoder != NULL) esp_opus_enc_close(s_encoder);
+    s_encoder = NULL;
+    free(s_pcm); s_pcm = NULL;
+    free(s_encoded); s_encoded = NULL;
+    return err;
+}
+
+esp_err_t memo_recorder_begin(void)
+{
+    if (!s_prepared || s_task == NULL) return ESP_ERR_INVALID_STATE;
+    s_prepared = false;
     s_rec.started_at = esp_timer_get_time();
     s_rec.active = true;
-
-    if (xTaskCreate(recorder_task, "memo_rec", REC_TASK_STACK, NULL, 6, &s_task) != pdPASS) {
-        s_rec.active = false;
-        memo_spool_discard(s_rec.file, id);
-        s_rec.file = NULL;
-        esp_opus_enc_close(s_encoder); s_encoder = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-    ESP_LOGI(TAG, "recording %s", id);
+    xSemaphoreGive(s_start);
+    ESP_LOGI(TAG, "recording %s", s_rec.id);
     return ESP_OK;
+}
+
+esp_err_t memo_recorder_cancel_prepared(void)
+{
+    if (!s_prepared) return ESP_ERR_INVALID_STATE;
+    vTaskDelete(s_task); s_task = NULL;
+    esp_opus_enc_close(s_encoder); s_encoder = NULL;
+    free(s_pcm); s_pcm = NULL;
+    free(s_encoded); s_encoded = NULL;
+    const esp_err_t err = memo_spool_discard(s_rec.file, s_rec.id);
+    s_rec.file = NULL;
+    s_prepared = false;
+    return err;
+}
+
+esp_err_t memo_recorder_start(const char *id)
+{
+    const esp_err_t err = memo_recorder_prepare(id);
+    return err == ESP_OK ? memo_recorder_begin() : err;
 }
 
 esp_err_t memo_recorder_stop(bool keep, memo_recorder_result_t *result)
 {
     if (!s_ready) return ESP_ERR_INVALID_STATE;
+    if (s_prepared) return ESP_ERR_INVALID_STATE;
     if (!s_rec.active && s_task == NULL) return ESP_ERR_INVALID_STATE;
 
     s_rec.active = false;
@@ -314,6 +339,7 @@ esp_err_t memo_recorder_stop(bool keep, memo_recorder_result_t *result)
             return ESP_ERR_TIMEOUT;
         }
     }
+    vTaskDelete(s_task);
     s_task = NULL;
     esp_opus_enc_close(s_encoder); s_encoder = NULL;
 
@@ -321,10 +347,11 @@ esp_err_t memo_recorder_stop(bool keep, memo_recorder_result_t *result)
     uint32_t duration = elapsed_ms();
 
     if (!keep) {
-        memo_spool_discard(s_rec.file, s_rec.id);
+        const esp_err_t err = memo_spool_discard(s_rec.file, s_rec.id);
         s_rec.file = NULL;
-        ESP_LOGI(TAG, "recording discarded");
-        return ESP_OK;
+        if (err == ESP_OK) ESP_LOGI(TAG, "recording discarded");
+        else ESP_LOGE(TAG, "recording discard failed: %s", esp_err_to_name(err));
+        return err;
     }
 
     uint32_t size = 0;
@@ -354,10 +381,20 @@ uint8_t memo_recorder_level(void)
 
 uint32_t memo_recorder_elapsed_ms(void)
 {
-    return s_task != NULL ? (uint32_t)((esp_timer_get_time() - s_rec.started_at) / 1000) : 0;
+    return s_task != NULL && !s_prepared ? (uint32_t)((esp_timer_get_time() - s_rec.started_at) / 1000) : 0;
 }
 
 bool memo_recorder_is_active(void)
 {
     return s_rec.active;
+}
+
+bool memo_recorder_is_busy(void)
+{
+    return s_task != NULL;
+}
+
+uint8_t memo_recorder_signal_hint(void)
+{
+    return s_rec.signal_hint;
 }

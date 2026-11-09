@@ -106,14 +106,17 @@ size_t memo_text_ellipsis(char *dst, size_t cap, const char *text, size_t max_ch
 bool memo_text_is_valid_utf8(const char *text)
 {
     if (text == NULL) return true;
-
     const unsigned char *p = (const unsigned char *)text;
     while (*p != '\0') {
-        size_t len = sequence_length(*p);
-        if (len == 0) return false;
-        for (size_t i = 1; i < len; i++) {
-            if ((p[i] & 0xC0) != 0x80) return false;
-        }
+        if (*p < 0x80) { p++; continue; }
+        size_t len;
+        if (*p >= 0xC2 && *p <= 0xDF) len = 2;
+        else if (*p >= 0xE0 && *p <= 0xEF) len = 3;
+        else if (*p >= 0xF0 && *p <= 0xF4) len = 4;
+        else return false;
+        for (size_t i = 1; i < len; i++) if ((p[i] & 0xC0) != 0x80) return false;
+        if ((*p == 0xE0 && p[1] < 0xA0) || (*p == 0xED && p[1] >= 0xA0) ||
+            (*p == 0xF0 && p[1] < 0x90) || (*p == 0xF4 && p[1] > 0x8F)) return false;
         p += len;
     }
     return true;

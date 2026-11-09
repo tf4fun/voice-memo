@@ -5,6 +5,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include "memo_network_info.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -21,12 +22,14 @@ typedef enum {
 esp_err_t memo_net_start(void);
 
 /* 配网要接管 WiFi 时先挂起本模块；netif 会移交给配网，避免重复创建默认 STA。 */
-void memo_net_suspend(void);
+/* Failed stop/deinit retains driver ownership. No other Wi-Fi owner may start
+ * until this returns ESP_OK. A later start retries pending release first. */
+esp_err_t memo_net_suspend(void);
 
 
 memo_net_state_t memo_net_state(void);
-const char *memo_net_ssid(void);
-const char *memo_net_ip(void);
+/* Caller-owned copy; no mutable strings escape event callbacks. */
+void memo_net_info(memo_network_info_t *out);
 bool memo_net_has_ip(void);
 
 /* SNTP 是否已经同步过（决定 recorded_at 能不能用真实时间）。 */

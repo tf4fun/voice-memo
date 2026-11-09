@@ -4,7 +4,7 @@
 
 # 语音日记服务端 — 技术方案
 
-实现快照：2026-10-27。本文描述当前 Go 服务端、存储和 HTTP 协议。
+实现快照：2026-11-09。本文描述当前 Go 服务端、存储和 HTTP 协议。
 固件见[设备端方案](client.zh_CN.md)，工作和验收只在
 [里程碑](../project/milestones.zh_CN.md)中跟踪。
 
@@ -27,13 +27,13 @@
 | `internal/store` | SQLite 表结构、查询及任务持久化 |
 | `internal/httpapi` | HTTP 路由、JSON、上传、音频、SSE |
 | `internal/asr` | 转写接口、SiliconFlow 和假实现 |
-| `internal/jobs` | 一个转写执行循环 |
+| `internal/jobs` | 有界转写任务池与确认退出 |
 | `internal/events` | 内存事件广播中心 |
 | `internal/discovery` | 局域网服务广播 |
 
 ## 3. 存储与生命周期
 
-SQLite 使用 WAL，表结构版本为 1。`devices` 保存来源 ID 及首次/最近出现时间；
+SQLite 使用 WAL、`synchronous=FULL`，schema 版本为 1。`devices` 保存来源 ID 及首次/最近出现时间；
 `memos` 保存录音/上传时间、时长/帧数/字节数、编码、状态、转写/语言、ASR 身份/追踪、
 编辑/错误字段、音频路径、时钟偏差与软删除时间；`jobs` 保存唯一记录 ID、尝试次数及到期时间。
 列表索引按 `recorded_at DESC, id DESC` 排列未删除记录。
@@ -49,11 +49,13 @@ rejected/<UUID>.memo
 
 原始容器是权威音频。上传只做结构校验，不解码 Opus；发布音频时不覆盖已有文件，
 元数据与初始任务在同一 SQLite 事务提交。同 ID 请求用固定数量的锁串行处理，
-同设备重传返回已有结果，另一设备收到 409。临时文件使用唯一名称避免冲突，
-接收成功前同步临时文件和目标目录。
+同设备重传返回已有结果，另一设备收到 409；已明确删除的 UUID 重传返回 410，
+不重新创建音频或任务。临时文件使用唯一名称避免冲突，
+接收成功前同步临时文件和从目标目录到数据根目录的整条目录链。
 请求体流式写入临时文件并限制字节数，普通失败通过延迟清理移除临时文件。
 到达 `keepRejected` 的结构校验失败会把容器保留在 `rejected/`，不是所有拒绝都会保留。
-启动没有遗留临时文件或孤立文件清扫。
+没有自动清扫。显式 `gc` 预览旧临时/孤立文件，`gc --apply` 才删除符合条件的文件，
+不删除录音记录或被拒文件。
 
 SiliconFlow 适配器仅在转写请求时把容器解为内存 WAV，不保存为权威音频文件。
 因此已经接收、但 Opus 载荷无法解码的容器仍可能在转写阶段失败。
@@ -74,23 +76,30 @@ SiliconFlow 使用 bearer key 向 `<MEMO_ASR_BASE_URL>/v1/audio/transcriptions`
 `x-siliconcloud-trace-id`。适配器执行自身的 50 MiB/一小时限制，默认 HTTP 超时 120 秒。
 这些是代码常量，不代表提供商最新服务政策。
 
-提供商 400/401/403/413/415 及本地解码失败为永久错误，其余 HTTP 错误（包括提供商 429）
-可重试。一个执行循环每 2 秒轮询并串行处理到期任务，最多尝试三次：
-首次临时失败延迟 30 秒，第二次延迟 2 分钟，第三次永久失败。
-退避数组虽含 10 分钟，但三次尝试策略不会调度到它。
-`MEMO_ASR_CONCURRENCY` 会解析，但不创建更多执行循环。
+提供商 400/401/403/413/415 及本地解码失败为永久错误，其余 HTTP 错误（含提供商 429）可重试。配置的 1–4 个任务独立领取任务，每 2 秒轮询。
+每次尝试有 90 秒上下文时限，短于 120 秒领取租约；容器读取和 HTTP 均响应取消。
+最多三次尝试，暂时性失败分别延迟 30 秒、2 分钟。
 
-状态为 `uploaded → transcribing → ready`，或重试回 `uploaded`，或最终 `failed`。
-启动在执行任务前调用 `RecoverJobs` 恢复中断转写。
-初始记录与任务入队在同一事务中；入队失败回滚记录，处理函数移除本次新发布的音频。
-重传不会重复入队。
+领取身份含任务行 ID 和尝试次数。状态、结果和队列变更只有在同一领取身份仍持有录音时
+才一起提交。人工编辑设为 ready 并移除任务，删除移除任务，重新转写以事务新建自增任务 ID。
+旧结果或旧租约尝试不能覆盖这些变化，也不能删除替代任务。退出时取消并等待任务池全部结束，
+再关闭 SQLite；中断任务保留供恢复。
+
+状态流为 `uploaded → transcribing → ready`、重试回 `uploaded` 或终止 `failed`。
+启动恢复中断任务；初次录音/任务接收在一个事务内，重传不重复入队。
 
 ## 5. 服务发现
 
-mDNS 广播 `_voicememo._tcp`、可配置实例名（默认主机名）及 HTTP 端口。
-TXT 包含 `ver=1`、`path=/api/v1`、`caps=opus`，有非回环 IPv4 时附带 `ip=`。
-使用找到的第一个此类接口地址，没有按通往设备的路由显式选址。
+mDNS 在一个已启用的多播 IPv4 局域网接口上广播 `_voicememo._tcp`。实例名可配置，默认主机名，
+去除尾部 `.local`，将点号/其它标点规范为单个最多 63 字节的 UTF-8 标签。使用显式 ASCII
+`.local.` 主机名和该接口的 IPv4 注册，避免内置注册器在 macOS 上生成 `.local.local` 目标。
+TXT 包含 `ver=1`、`path=/api/v1`、`caps=opus`，`ip=` 与 A 记录使用同一个地址。
 客户端可在 SRV/A 解析不完整时回退到 TXT。
+
+选择时排除未启用、回环、不支持多播和点对点接口，以及不可用/链路本地 IPv4。默认使用首个
+合格接口，`MEMO_MDNS_INTERFACE` 可明确选择。指定接口不可用时报告广播失败，不悄悄切到其它
+网络。接口/地址变化后需重启。仅监听回环地址的 HTTP 服务不广播，防止本机测试覆盖真实局域网
+服务记录。
 
 广播失败只记日志，不停止 HTTP。多播需要网络可见；本地进程或 host 网络容器提供直接
 局域网访问。固件没有手动输入服务器地址的入口。
@@ -109,8 +118,9 @@ TXT 包含 `ver=1`、`path=/api/v1`、`caps=opus`，有非回环 IPv4 时附带 
 | GET | `/memos` | 游标列表，最新在前 |
 | GET | `/memos/{id}` | 详情、转写、ASR 和音频元数据 |
 | PATCH | `/memos/{id}` | 修改转写和/或 `lang`，记录编辑时间，设为 `ready` |
-| DELETE | `/memos/{id}` | 软删记录/移除任务并尝试删音频；204，未知 ID 404 |
+| DELETE | `/memos/{id}` | 事务内隐藏记录/移除任务，再删除音频；204（含已知 ID 重试），未知 ID 404，文件删除失败 500 |
 | GET | `/memos/{id}/audio` | 原始 MEMO 字节，`application/octet-stream`，支持 Range |
+| GET | `/memos/{id}/text` | 有界 UTF-8 显示窗口、字节偏移及内容版本 |
 | POST | `/memos/{id}/transcribe` | 设为 `uploaded`、清错误并入队；202 |
 | GET | `/events` | `text/event-stream` 订阅 |
 
@@ -136,7 +146,10 @@ X-Memo-Id: 00000000-0000-4000-8000-000000000000
 ### 列表与详情
 
 `GET /memos?limit=20&cursor=<opaque>&device=<optional>` 默认 20 条，上限 100，
-返回 `items` 与 `next_cursor`，游标编码 `recorded_at:id`。
+返回 `items`、`next_cursor` 和 `previous_cursor`，游标编码 `recorded_at:id`。
+默认 `direction=older` 继续读取锚点之后的旧记录；`direction=newer` 必须提供游标，选择最近的
+较新一页。两者均按最新在前返回并保持设备过滤。页面行与游标存在性检查使用同一 SQLite 事务。
+恰好填满的末页不再提供虚假的下一页；因删除而变空的页面仍提供返回方向的游标。
 没有时间范围或转写搜索参数。每行包含 `id`、`device_id`、`recorded_at`、
 `uploaded_at`、`duration_ms`、`status`、可选 `lang` 及转写前 40 字的
 `snippet`（截断时加省略号）。
@@ -145,8 +158,21 @@ X-Memo-Id: 00000000-0000-4000-8000-000000000000
 ASR 元数据和音频路径/大小。可选空值省略，不输出 JSON null。
 `audio.bytes` 是原始容器大小。
 
+`GET /memos/{id}/text?offset=0&limit=2048&direction=next&revision=<optional>`
+读取显示窗口，不发送整个转写。每窗 4–4096 字节，默认 2048，方向为 `next` 或 `previous`。
+偏移按 UTF-8 字节计，必须落在字符边界；向前窗口从偏移开始，向后窗口在该处结束。
+响应含 `id`、`status`、`text`、`offset`、`end`、`total` 及 64 字符 SHA-256 `revision`。
+下一窗使用 `end`，上一窗使用 `offset`，客户端始终只需保存一个窗口。
+
+显示表示将 NUL 和非法 UTF-8 替换为 U+FFFD，版本哈希基于该表示。提供的版本过旧时返回
+409 `transcript_changed`，要求重新读取。空文本仍返回状态和零边界；不存在或已删除条目返回
+404。原有完整详情接口未变，旧单向列表客户端可以忽略新增游标字段。
+
 `PATCH` 只接受 `transcript` 和/或 `lang`，拒绝未知字段。删除不能通过 API 撤销：
-记录隐藏并立即尝试删除音频；文件删除失败只记日志。音频端点使用 `http.ServeContent`，
+记录隐藏并立即尝试删除音频。隐藏记录与撤销任务在同一 SQLite 事务中，失败一起回滚。
+文件删除失败时记录日志、发布元数据删除事件并返回 500。
+对已知且已删除 ID 重复 DELETE 可重试删除文件，不改写最初删除时间；
+清理成功或文件已不存在返回 204，未知 ID 仍为 404。音频端点使用 `http.ServeContent`，
 Range 的字节偏移指向容器，不是 PCM。固件当前每次都从头播放。
 
 ## 7. 错误与事件
@@ -156,22 +182,23 @@ Range 的字节偏移指向容器，不是 PCM。固件当前每次都从头播�
 | 错误码 | HTTP 状态 | 含义 |
 | --- | --- | --- |
 | `not_found` | 404 | 记录未知/已删除或音频缺失 |
-| `invalid_json` | 400 | 请求体、未知字段、条数或游标非法 |
+| `invalid_json` | 400 | 请求体、未知字段、条数、游标、方向或正文边界非法 |
 | `missing_device` | 400 | 上传缺来源 ID |
 | `bad_container` | 400 | 容器/头部/ID 或结构校验错误 |
 | `frame_mismatch` | 400 | 包装为 `ErrFrameMismatch` 的错误 |
 | `payload_too_large` | 413 | 请求体超过字节上限 |
 | `id_conflict` | 409 | 已有 UUID 归属另一设备 |
-| `over_limit` | 400 | 头部时长超过配置上限 |
+| `transcript_changed` | 409 | 显示文本版本变化，需要重新读取窗口 |
+| `deleted` | 410 | 该 UUID 已被明确删除，重传不会重新创建 |
+| `over_limit` | 400 | 声明或按帧时长超过上限 |
 | `internal` | 500 | 存储/查询或其它服务端错误 |
 
-SSE 先发送 `event: ready` 和 `data: {}`，随后发送 `event: memo` JSON，含
-`type`、`id`、`status` 及可选 `snippet`、`recorded_at`、`duration_ms`。
-每 20 秒发送注释心跳。上传和任务状态变化会发布事件；PATCH、DELETE 及手动重新入队
-没有独立管理通知。
+SSE 先订阅，再发送 `event: ready` / `data: {}`。上传、任务、PATCH、DELETE 和手动
+重新转写均发变更事件，删除携带 `type=deleted`。客户端重新读取权威列表，不合并零散事件行。
+所有摘要集中限制为 40 字加省略号，即使 JSON 转义也符合固件 512 字节分帧界限。
 
-广播中心为每个订阅者缓冲八条，满时跳过投递，没有持久化事件日志、重放游标或必达保证，
-客户端靠列表读取对账。任务事件的 snippet 携带完整转写，列表摘要则限 40 字。
+每 20 秒发送注释心跳，写入时限 5 秒。每个订阅者缓冲八条，满时关闭订阅，强制重连及列表
+对账。没有持久化重放或恰好一次保证，重连刷新与周期轮询共同弥补遗漏。
 
 ## 8. 上传容器
 
@@ -207,22 +234,29 @@ SSE 先发送 `event: ready` 和 `data: {}`，随后发送 `event: memo` JSON，
 | `memo-server serve` | HTTP、任务执行与广播，默认命令 |
 | `memo-server serve -addr host:port` | 覆盖监听地址 |
 | `memo-server version` | 输出 `0.1.0` |
-| `memo-server gc` | 校验配置/打开存储并输出占位说明，不执行清扫 |
+| `memo-server gc` | 预览旧的无引用 `.part`/`.memo`，最小年龄 24 小时 |
+| `memo-server gc --apply` | 删除合格文件，保留被引用音频、被拒文件及全部数据库行 |
 
 | 变量 | 默认值 | 当前用途 |
 | --- | --- | --- |
 | `MEMO_ADDR` | `:8080` | 监听地址 |
 | `MEMO_DATA_DIR` | `./data` | 数据库/音频目录 |
-| `MEMO_MDNS_NAME` | 主机名 | 广播实例名 |
+| `MEMO_MDNS_NAME` | 主机名 | 规范为单标签的广播实例 |
+| `MEMO_MDNS_INTERFACE` | 自动 | 一个已启用的多播 IPv4 局域网接口，例如本机的 `en0` |
 | `MEMO_ASR_PROVIDER` | `siliconflow` | 仅 `siliconflow` 或 `fake` |
 | `MEMO_ASR_API_KEY` | 空 | SiliconFlow 启动时必需 |
 | `MEMO_ASR_MODEL` | `FunAudioLLM/SenseVoiceSmall` | multipart 模型 |
 | `MEMO_ASR_BASE_URL` | `https://api.siliconflow.cn` | 提供商 URL 前缀 |
-| `MEMO_ASR_CONCURRENCY` | `1` | 校验为正，执行循环仍只有一个 |
+| `MEMO_ASR_CONCURRENCY` | `1` | 实际任务数量，范围 1–4 |
 | `MEMO_MAX_BYTES` | `33554432` | 流式上传字节限制 |
 | `MEMO_MAX_MEMO_MS` | `300000` | 声明及按帧计算的时长上限，告知客户端 |
-| `MEMO_RETENTION_DAYS` | `0` | 校验非负，没有保留期清扫 |
+| `MEMO_RETENTION_DAYS` | `0` | 仅支持零，非零启动失败，无自动过期删除 |
 | `MEMO_LOG_LEVEL` | `info` | debug/info/warn/error |
+
+`gc` 只需 `MEMO_DATA_DIR`，不要求 ASR 凭据。`--older-than` 默认 24 小时并拒绝更短时间。
+跳过符号链接、新文件、未知类型、所有被引用路径（含软删除行）和 `rejected/`。
+执行前复查身份、修改时间和大小。HTTP 上传读取时限 120 秒，短于 GC 年龄下限。
+没有自动录音保留期删除。
 
 ## 10. 安全与部署
 
@@ -252,6 +286,31 @@ MEMO_ASR_PROVIDER=fake ../build/memo-server serve
 API 流程、提供商请求/错误处理及任务重试。使用临时存储、假转写和本地 HTTP 服务；
 首次运行可能需要下载模块/工具链。
 
-`scripts/e2e-server.sh` 使用真实进程和假 ASR，当前音频断言仍要求 RIFF/WAV，
-但端点已返回 MEMO，因此该脚本不能证明当前协议端到端通过。
+`scripts/e2e-server.sh` 使用真实进程、假 ASR 和临时存储，比较原始 MEMO 音频字节及精确 Range
+响应，覆盖上传/幂等、转写、双向历史、带版本正文、管理、重新转写和安全 GC，不调用真实提供商。
 实际结果及后续检查记录在[里程碑](../project/milestones.zh_CN.md)。
+
+
+### 本机硅基流动启动
+
+现有适配器向[硅基流动转写端点](https://docs.siliconflow.cn/docs/api/audio-transcriptions-post)
+发送解码后的 WAV 与所配置模型。`MEMO_ASR_BASE_URL` 使用根地址（例如
+`https://api.siliconflow.cn`），适配器追加 `/v1/audio/transcriptions`。
+模型由 `MEMO_ASR_MODEL` 决定，启动器不覆盖用户选择。
+
+本机使用时，仅在没有现有私密配置时从 `server/.env.example` 创建 `server/.env.local`，
+填写 API Key，并限制为仅所有者可读写（`chmod 600 server/.env.local`）。仓库根目录执行
+`./scripts/run-server.sh`：复用项目 Go 缓存配置，构建 `build/server/memo-server`，
+在 `server/` 内运行，因此默认数据目录为 `server/data/`。`MEMO_ENV_FILE` 可指定其它配置文件。
+私密文件、默认数据目录、生成二进制/日志均被 Git 忽略；密钥只在服务端使用，不进入设备固件。
+
+配置格式为字面量 `MEMO_NAME=value`，支持空行、独立注释行、CRLF 及可选配对外引号。
+不执行 shell 命令、不展开变量、不支持行尾注释。同名配置项覆盖继承的环境变量。
+未知名称/畸形行会失败，但不打印值。`./scripts/run-server.sh --check-env` 只检查文件语法，
+不验证凭据或调用 API。
+
+进程以前台方式运行，需要保持运行；修改配置后需重启，不安装登录/开机服务。
+同局域网设备通过 mDNS 发现已运行服务。默认端口下，本机健康/配置端点为
+`http://127.0.0.1:8080/api/v1/health` 及 `/api/v1/server`。提供商模拟测试检查精确 HTTP
+路径、multipart 字段和 RIFF/WAVE 载荷；真实提供商测试独立于模拟测试及设备人声验收。
+本机启动/解析测试只依赖 Python 和 Bash。

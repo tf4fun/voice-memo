@@ -4,6 +4,7 @@
 // memo_provision_security_security.c），保留其 Wi-Fi/NimBLE 生命周期与安全回调，只把 LCD
 // 页面换成由本模块对外暴露的状态查询，界面交给 memo_ui_provision 绘制。
 #include "memo_provision.h"
+#include "memo_network_info_store.h"
 
 #include "memo_provision_security.h"
 
@@ -25,6 +26,7 @@
 #include "nimble/nimble_port_freertos.h"
 #include "services/gap/ble_svc_gap.h"
 #include <string.h>
+#include <stdatomic.h>
 
 static const char *TAG = "memo_prov";
 // ESP Config 微信小程序默认只显示以 "BLUFI" 开头的设备。
@@ -38,25 +40,70 @@ static esp_netif_t *s_sta_netif;
 static esp_event_handler_instance_t s_wifi_handler;
 static esp_event_handler_instance_t s_ip_handler;
 static wifi_config_t s_sta_config;
-static volatile blufi_state_t s_state;
-static volatile esp_err_t s_error;
-static char s_ip[16];
-static bool s_wifi_initialized;
-static bool s_wifi_started;
-static bool s_wifi_handler_registered;
-static bool s_ip_handler_registered;
-static bool s_host_initialized;
-static bool s_host_running;
-static bool s_gatt_initialized;
-static bool s_btc_initialized;
-static bool s_profile_initialized;
-static bool s_ble_connected;
-static bool s_wifi_connecting;
-static bool s_wifi_got_ip;
-static bool s_reconnect_after_disconnect;
+static uint32_t s_config_revision;
+static _Atomic blufi_state_t s_state;
+static _Atomic esp_err_t s_error;
+static memo_network_info_store_t s_info = MEMO_NETWORK_INFO_STORE_INIT;
+static portMUX_TYPE s_config_lock = portMUX_INITIALIZER_UNLOCKED;
+static atomic_bool s_wifi_initialized;
+static atomic_bool s_wifi_started;
+static atomic_bool s_wifi_stop_needed;
+static atomic_bool s_wifi_handler_registered;
+static atomic_bool s_ip_handler_registered;
+static atomic_bool s_host_initialized;
+static bool s_port_initialized;
+static atomic_bool s_host_running;
+static atomic_bool s_gatt_initialized;
+static atomic_bool s_btc_initialized;
+static atomic_bool s_profile_initialized;
+static atomic_bool s_ble_connected;
+static atomic_bool s_wifi_connecting;
+static atomic_bool s_wifi_got_ip;
+static atomic_bool s_reconnect_after_disconnect;
 static SemaphoreHandle_t s_host_stopped;
+static SemaphoreHandle_t s_profile_stopped;
+static bool s_profile_stop_requested;
+static _Atomic esp_err_t s_profile_stop_error;
+static atomic_bool s_accept_callbacks;
+static bool s_host_stop_requested;
 
 static esp_err_t wifi_start(void);
+
+/* Only bounded copies under the critical section; driver/BLE calls stay outside. */
+static void config_copy(wifi_config_t *out, uint32_t *revision)
+{
+    portENTER_CRITICAL(&s_config_lock);
+    *out = s_sta_config;
+    if (revision != NULL) *revision = s_config_revision;
+    portEXIT_CRITICAL(&s_config_lock);
+}
+
+static bool config_store(const wifi_config_t *cfg, uint32_t revision, bool conditional)
+{
+    portENTER_CRITICAL(&s_config_lock);
+    if (conditional && s_config_revision != revision) {
+        portEXIT_CRITICAL(&s_config_lock);
+        return false;
+    }
+    s_sta_config = *cfg;
+    s_config_revision++;
+    // Consistent lock order: config -> display. Both contain bounded copies;
+    // publishing outside this lock could put an older SSID over a new one.
+    memo_network_info_ssid(&s_info, cfg->sta.ssid, sizeof(cfg->sta.ssid));
+    portEXIT_CRITICAL(&s_config_lock);
+    return true;
+}
+
+static void apply_config(const wifi_config_t *cfg)
+{
+    wifi_config_t local = *cfg;
+    const esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &local);
+    if (err == ESP_OK) config_store(cfg, 0, false);
+    else {
+        s_error = err;
+        s_state = MEMO_PROV_FAILED;
+    }
+}
 
 /* 收到凭据或要求扫描时才启动 WiFi 驱动。 */
 static esp_err_t ensure_wifi(void)
@@ -73,10 +120,11 @@ static void send_wifi_report(esp_blufi_sta_conn_state_t state)
     wifi_mode_t mode = WIFI_MODE_STA;
     esp_wifi_get_mode(&mode);
     esp_blufi_extra_info_t info = { 0 };
-    size_t ssid_len = strnlen((const char *)s_sta_config.sta.ssid,
-                              sizeof(s_sta_config.sta.ssid));
+    wifi_config_t cfg;
+    config_copy(&cfg, NULL);
+    size_t ssid_len = strnlen((const char *)cfg.sta.ssid, sizeof(cfg.sta.ssid));
     if (ssid_len > 0) {
-        info.sta_ssid = s_sta_config.sta.ssid;
+        info.sta_ssid = cfg.sta.ssid;
         info.sta_ssid_len = ssid_len;
     }
     esp_blufi_send_wifi_conn_report(mode, state, 0, &info);
@@ -122,13 +170,15 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg;
     (void)base;
+    if (!s_accept_callbacks) return;
     if (id == WIFI_EVENT_STA_START) {
-        esp_wifi_get_config(WIFI_IF_STA, &s_sta_config);
-        if (s_sta_config.sta.ssid[0] != '\0') {
-            s_wifi_connecting = true;
-            s_state = MEMO_PROV_WIFI_CONNECTING;
-            esp_wifi_connect();
-        }
+        wifi_config_t cfg;
+        uint32_t revision;
+        config_copy(&cfg, &revision);
+        const esp_err_t err = esp_wifi_get_config(WIFI_IF_STA, &cfg);
+        if (err != ESP_OK) { s_error = err; s_state = MEMO_PROV_FAILED; return; }
+        if (!config_store(&cfg, revision, true)) config_copy(&cfg, NULL);
+        if (cfg.sta.ssid[0] != '\0' && !s_wifi_connecting) request_wifi_connect();
     } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *event = data;
         ESP_LOGW(TAG, "Wi-Fi disconnected, reason=%u", event->reason);
@@ -143,7 +193,7 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         s_wifi_connecting = false;
         s_wifi_got_ip = false;
         s_state = s_ble_connected ? MEMO_PROV_BLE_CONNECTED : MEMO_PROV_ADVERTISING;
-        s_ip[0] = '\0';
+        memo_network_info_ip(&s_info, NULL);
     } else if (id == WIFI_EVENT_SCAN_DONE) {
         send_wifi_list();
     }
@@ -153,9 +203,12 @@ static void ip_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg;
     (void)base;
+    if (!s_accept_callbacks) return;
     if (id != IP_EVENT_STA_GOT_IP) return;
     ip_event_got_ip_t *event = data;
-    snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&event->ip_info.ip));
+    char ip[16];
+    snprintf(ip, sizeof(ip), IPSTR, IP2STR(&event->ip_info.ip));
+    memo_network_info_ip(&s_info, ip);
     s_wifi_connecting = false;
     s_wifi_got_ip = true;
     s_state = MEMO_PROV_WIFI_CONNECTED;
@@ -164,6 +217,7 @@ static void ip_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 
 static void blufi_reset(int reason)
 {
+    if (!s_accept_callbacks) return;
     ESP_LOGE(TAG, "NimBLE reset: %d", reason);
     s_error = ESP_FAIL;
     s_state = MEMO_PROV_FAILED;
@@ -171,6 +225,7 @@ static void blufi_reset(int reason)
 
 static void blufi_sync(void)
 {
+    if (!s_accept_callbacks) return;
     int rc = esp_blufi_profile_init();
     if (rc == 0) {
         s_profile_initialized = true;
@@ -190,6 +245,16 @@ static void host_task(void *arg)
 
 static void blufi_event(esp_blufi_cb_event_t event, esp_blufi_cb_param_t *param)
 {
+    /* Teardown acknowledgement must still reach the owner after ordinary
+     * provisioning callbacks have been disabled. Never free BTC before this. */
+    if (event == ESP_BLUFI_EVENT_DEINIT_FINISH) {
+        s_profile_stop_error = param->deinit_finish.state == ESP_BLUFI_DEINIT_OK ? ESP_OK : ESP_FAIL;
+        if (s_profile_stopped) xSemaphoreGive(s_profile_stopped);
+        return;
+    }
+    if (!s_accept_callbacks) return;
+    wifi_config_t cfg;
+    config_copy(&cfg, NULL);
     switch (event) {
     case ESP_BLUFI_EVENT_INIT_FINISH: {
         esp_blufi_adv_start_with_name(DEVICE_NAME);
@@ -227,41 +292,43 @@ static void blufi_event(esp_blufi_cb_event_t event, esp_blufi_cb_param_t *param)
         esp_wifi_set_mode(WIFI_MODE_STA);
         break;
     case ESP_BLUFI_EVENT_RECV_STA_BSSID:
-        memcpy(s_sta_config.sta.bssid, param->sta_bssid.bssid, 6);
-        s_sta_config.sta.bssid_set = true;
-        esp_wifi_set_config(WIFI_IF_STA, &s_sta_config);
+        memcpy(cfg.sta.bssid, param->sta_bssid.bssid, 6);
+        cfg.sta.bssid_set = true;
+        apply_config(&cfg);
         break;
     case ESP_BLUFI_EVENT_RECV_STA_SSID:
         if (ensure_wifi() != ESP_OK) {
             esp_blufi_send_error_info(ESP_BLUFI_WIFI_SCAN_FAIL);
             break;
         }
-        if (param->sta_ssid.ssid_len >= sizeof(s_sta_config.sta.ssid)) {
+        if (param->sta_ssid.ssid_len < 0 || (size_t)param->sta_ssid.ssid_len > sizeof(cfg.sta.ssid) ||
+            (param->sta_ssid.ssid_len > 0 && param->sta_ssid.ssid == NULL)) {
             esp_blufi_send_error_info(ESP_BLUFI_DATA_FORMAT_ERROR);
             break;
         }
-        memset(s_sta_config.sta.ssid, 0, sizeof(s_sta_config.sta.ssid));
-        memset(s_sta_config.sta.password, 0, sizeof(s_sta_config.sta.password));
-        memset(s_sta_config.sta.bssid, 0, sizeof(s_sta_config.sta.bssid));
-        s_sta_config.sta.bssid_set = false;
-        s_sta_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
-        memcpy(s_sta_config.sta.ssid, param->sta_ssid.ssid,
-               param->sta_ssid.ssid_len);
-        esp_wifi_set_config(WIFI_IF_STA, &s_sta_config);
+        memset(cfg.sta.ssid, 0, sizeof(cfg.sta.ssid));
+        memset(cfg.sta.password, 0, sizeof(cfg.sta.password));
+        memset(cfg.sta.bssid, 0, sizeof(cfg.sta.bssid));
+        cfg.sta.bssid_set = false;
+        cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+        if (param->sta_ssid.ssid_len > 0)
+            memcpy(cfg.sta.ssid, param->sta_ssid.ssid, (size_t)param->sta_ssid.ssid_len);
+        apply_config(&cfg);
         break;
     case ESP_BLUFI_EVENT_RECV_STA_PASSWD:
         if (ensure_wifi() != ESP_OK) {
             esp_blufi_send_error_info(ESP_BLUFI_WIFI_SCAN_FAIL);
             break;
         }
-        if (param->sta_passwd.passwd_len >= sizeof(s_sta_config.sta.password)) {
+        if (param->sta_passwd.passwd_len < 0 || (size_t)param->sta_passwd.passwd_len >= sizeof(cfg.sta.password) ||
+            (param->sta_passwd.passwd_len > 0 && param->sta_passwd.passwd == NULL)) {
             esp_blufi_send_error_info(ESP_BLUFI_DATA_FORMAT_ERROR);
             break;
         }
-        memset(s_sta_config.sta.password, 0, sizeof(s_sta_config.sta.password));
-        memcpy(s_sta_config.sta.password, param->sta_passwd.passwd,
-               param->sta_passwd.passwd_len);
-        esp_wifi_set_config(WIFI_IF_STA, &s_sta_config);
+        memset(cfg.sta.password, 0, sizeof(cfg.sta.password));
+        if (param->sta_passwd.passwd_len > 0)
+            memcpy(cfg.sta.password, param->sta_passwd.passwd, (size_t)param->sta_passwd.passwd_len);
+        apply_config(&cfg);
         break;
     case ESP_BLUFI_EVENT_REQ_CONNECT_TO_AP:
         request_wifi_connect();
@@ -342,7 +409,10 @@ static esp_err_t wifi_start(void)
     s_ip_handler_registered = true;
     err = esp_wifi_set_storage(WIFI_STORAGE_FLASH);
     if (err == ESP_OK) err = esp_wifi_set_mode(WIFI_MODE_STA);
-    if (err == ESP_OK) err = esp_wifi_start();
+    if (err == ESP_OK) {
+        s_wifi_stop_needed = true;
+        err = esp_wifi_start();
+    }
     if (err == ESP_OK) s_wifi_started = true;
     return err;
 }
@@ -354,8 +424,11 @@ static esp_err_t host_start(void)
     err = nimble_port_init();
     if (err != ESP_OK) return err;
     s_host_initialized = true;
+    s_port_initialized = true;
     s_host_stopped = xSemaphoreCreateBinary();
     if (!s_host_stopped) return ESP_ERR_NO_MEM;
+    s_profile_stopped = xSemaphoreCreateBinary();
+    if (!s_profile_stopped) return ESP_ERR_NO_MEM;
     ble_hs_cfg.reset_cb = blufi_reset;
     ble_hs_cfg.sync_cb = blufi_sync;
     ble_hs_cfg.gatts_register_cb = esp_blufi_gatt_svr_register_cb;
@@ -371,30 +444,48 @@ static esp_err_t host_start(void)
     return err;
 }
 
-static void provisioning_stop(void)
+static esp_err_t stop_failed(esp_err_t error)
 {
+    s_error = error;
+    s_state = MEMO_PROV_FAILED;
+    return error;
+}
+
+static esp_err_t provisioning_stop(void)
+{
+    s_accept_callbacks = false;
     s_ble_connected = false;
-    memo_provision_security_deinit();
     if (s_host_initialized) {
         if (s_profile_initialized) esp_blufi_adv_stop();
+        if (s_host_running) {
+            if (!s_host_stop_requested) {
+                int rc = nimble_port_stop();
+                if (rc != 0) { ESP_LOGE(TAG, "nimble_port_stop failed: %d", rc); return stop_failed(ESP_FAIL); }
+                s_host_stop_requested = true;
+            }
+            if (xSemaphoreTake(s_host_stopped, pdMS_TO_TICKS(3000)) != pdTRUE) return stop_failed(ESP_ERR_TIMEOUT);
+            s_host_running = false;
+            s_host_stop_requested = false;
+        }
         if (s_gatt_initialized) {
-            esp_blufi_gatt_svr_deinit();
+            if (esp_blufi_gatt_svr_deinit() != 0) return stop_failed(ESP_FAIL);
             s_gatt_initialized = false;
         }
-        bool host_stopped = !s_host_running;
-        if (s_host_running) {
-            int rc = nimble_port_stop();
-            if (rc == 0) {
-                xSemaphoreTake(s_host_stopped, portMAX_DELAY);
-                host_stopped = true;
-            } else {
-                ESP_LOGE(TAG, "nimble_port_stop failed: %d", rc);
-            }
+        if (s_port_initialized) {
+            const esp_err_t err = nimble_port_deinit();
+            if (err != ESP_OK) return stop_failed(err);
+            s_port_initialized = false;
         }
-        if (host_stopped) nimble_port_deinit();
-        s_host_running = false;
         if (s_profile_initialized) {
-            esp_blufi_profile_deinit();
+            if (!s_profile_stop_requested) {
+                const esp_err_t err = esp_blufi_profile_deinit();
+                if (err != ESP_OK) return stop_failed(err);
+                s_profile_stop_requested = true;
+            }
+            if (xSemaphoreTake(s_profile_stopped, pdMS_TO_TICKS(3000)) != pdTRUE)
+                return stop_failed(ESP_ERR_TIMEOUT);
+            s_profile_stop_requested = false;
+            if (s_profile_stop_error != ESP_OK) return stop_failed(s_profile_stop_error);
             s_profile_initialized = false;
         }
         if (s_btc_initialized) {
@@ -403,33 +494,45 @@ static void provisioning_stop(void)
         }
         s_host_initialized = false;
     }
+    memo_provision_security_deinit();
     if (s_host_stopped) {
         vSemaphoreDelete(s_host_stopped);
         s_host_stopped = NULL;
     }
-    if (s_wifi_started) {
+    if (s_profile_stopped) {
+        vSemaphoreDelete(s_profile_stopped);
+        s_profile_stopped = NULL;
+    }
+    if (s_wifi_stop_needed) {
+        // Scan cancellation is best effort; stop/deinit acknowledge ownership.
         esp_wifi_scan_stop();
-        esp_wifi_disconnect();
-        esp_wifi_stop();
+        const esp_err_t err = esp_wifi_stop();
+        if (err == ESP_ERR_WIFI_NOT_INIT) s_wifi_initialized = false;
+        else if (err != ESP_OK) return stop_failed(err);
+        s_wifi_stop_needed = false;
         s_wifi_started = false;
     }
     if (s_ip_handler_registered) {
-        esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                              s_ip_handler);
+        const esp_err_t err = esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                                   s_ip_handler);
+        if (err != ESP_OK) return stop_failed(err);
         s_ip_handler_registered = false;
     }
     if (s_wifi_handler_registered) {
-        esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                              s_wifi_handler);
+        const esp_err_t err = esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                                   s_wifi_handler);
+        if (err != ESP_OK) return stop_failed(err);
         s_wifi_handler_registered = false;
     }
     if (s_wifi_initialized) {
-        esp_wifi_deinit();
+        const esp_err_t err = esp_wifi_deinit();
+        if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_INIT) return stop_failed(err);
         s_wifi_initialized = false;
     }
     /* netif 归常驻联网所有，这里只放弃引用，不销毁。 */
     s_sta_netif = NULL;
     s_state = MEMO_PROV_IDLE;
+    return ESP_OK;
 }
 
 
@@ -438,7 +541,14 @@ static void provisioning_stop(void)
 
 esp_err_t memo_provision_start(void)
 {
-    s_ip[0] = '\0';
+    if (s_host_initialized || s_wifi_initialized || s_ip_handler_registered || s_wifi_handler_registered)
+        return ESP_ERR_INVALID_STATE;
+    s_accept_callbacks = true;
+    s_error = ESP_OK;
+    s_host_stop_requested = false;
+    s_profile_stop_requested = false;
+    s_profile_stop_error = ESP_OK;
+    memo_network_info_ssid(&s_info, NULL, 0);
     s_wifi_connecting = false;
     s_wifi_got_ip = false;
     s_reconnect_after_disconnect = false;
@@ -451,6 +561,8 @@ esp_err_t memo_provision_start(void)
     ESP_LOGI(TAG, "start: host_start done (%s), free heap %u", esp_err_to_name(err),
              (unsigned)esp_get_free_heap_size());
     if (err != ESP_OK) {
+        esp_err_t cleanup = provisioning_stop();
+        if (cleanup != ESP_OK) ESP_LOGE(TAG, "provisioning rollback retained ownership: %s", esp_err_to_name(cleanup));
         s_error = err;
         s_state = MEMO_PROV_FAILED;
         ESP_LOGE(TAG, "provisioning start failed: %s", esp_err_to_name(err));
@@ -459,9 +571,9 @@ esp_err_t memo_provision_start(void)
     return ESP_OK;
 }
 
-void memo_provision_stop(void)
+esp_err_t memo_provision_stop(void)
 {
-    provisioning_stop();
+    return provisioning_stop();
 }
 
 memo_provision_state_t memo_provision_state(void)
@@ -469,14 +581,9 @@ memo_provision_state_t memo_provision_state(void)
     return s_state;
 }
 
-const char *memo_provision_ssid(void)
+void memo_provision_info(memo_network_info_t *out)
 {
-    return (const char *)s_sta_config.sta.ssid;
-}
-
-const char *memo_provision_ip(void)
-{
-    return s_ip;
+    memo_network_info_copy(&s_info, out);
 }
 
 esp_err_t memo_provision_error(void)

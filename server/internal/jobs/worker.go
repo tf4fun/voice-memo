@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/tf4fun/voice-memo/server/internal/asr"
@@ -20,8 +21,11 @@ import (
 // MaxAttempts is how many times a memo is retried before it is marked failed.
 const MaxAttempts = 3
 
+// Leave time to persist the result before the 120-second database claim expires.
+const AttemptTimeout = 90 * time.Second
+
 // backoff is the delay before attempt n+1.
-var backoff = []time.Duration{30 * time.Second, 2 * time.Minute, 10 * time.Minute}
+var backoff = []time.Duration{30 * time.Second, 2 * time.Minute}
 
 // Runner drives the transcription loop.
 type Runner struct {
@@ -33,6 +37,19 @@ type Runner struct {
 	Now func() time.Time
 	// Events is optional; when set, status changes are pushed to subscribers.
 	Events *events.Hub
+}
+
+// RunPool starts the configured bounded workers and joins every worker on exit.
+func (r *Runner) RunPool(ctx context.Context, concurrency int) {
+	if concurrency < 1 || concurrency > 4 {
+		panic("worker concurrency outside 1..4")
+	}
+	var workers sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		workers.Add(1)
+		go func() { defer workers.Done(); r.Run(ctx) }()
+	}
+	workers.Wait()
 }
 
 // Run processes jobs until ctx is cancelled.
@@ -65,9 +82,13 @@ func (r *Runner) Run(ctx context.Context) {
 
 // RunOnce handles at most one due job. It reports whether work was done.
 func (r *Runner) RunOnce(ctx context.Context) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	now := r.now().Unix()
 
-	memoID, attempts, ok, err := r.Store.ClaimJob(ctx, now)
+	claim, ok, err := r.Store.ClaimJobWithToken(ctx, now)
+	memoID, attempts := claim.MemoID, claim.Attempts
 	if err != nil {
 		return false, err
 	}
@@ -78,33 +99,41 @@ func (r *Runner) RunOnce(ctx context.Context) (bool, error) {
 	memo, err := r.Store.Memo(ctx, memoID)
 	if errors.Is(err, store.ErrNotFound) {
 		// The memo was deleted while its job was queued.
-		return true, r.Store.FinishJob(ctx, memoID)
+		return true, r.Store.DiscardClaim(ctx, claim)
 	}
 	if err != nil {
 		return true, err
 	}
 
-	if err := r.Store.SetStatus(ctx, memoID, domain.StatusTranscribing, ""); err != nil {
+	if applied, err := r.Store.ApplyClaim(ctx, claim, domain.StatusTranscribing, "", nil, nil); err != nil || !applied {
 		return true, err
 	}
 	r.publish(memoID, domain.StatusTranscribing, "")
 
-	result, transcribeErr := r.Transcriber.Transcribe(ctx, asr.Input{
+	attemptCtx, cancel := context.WithTimeout(ctx, AttemptTimeout)
+	result, transcribeErr := r.Transcriber.Transcribe(attemptCtx, asr.Input{
 		AudioPath: memo.AudioPath,
 		Duration:  time.Duration(memo.DurationMS) * time.Millisecond,
 		Language:  memo.Lang,
 	})
 
+	if transcribeErr == nil {
+		transcribeErr = attemptCtx.Err()
+	}
+	cancel()
+	if ctx.Err() != nil {
+		return true, ctx.Err()
+	} // Restart recovery retains this job.
 	if transcribeErr != nil {
 		permanent := asr.IsPermanent(transcribeErr) || attempts >= MaxAttempts
 		if permanent {
 			r.log().Warn("giving up on transcription",
 				"memo", memoID, "attempts", attempts, "error", transcribeErr)
-			if err := r.Store.SetStatus(ctx, memoID, domain.StatusFailed, transcribeErr.Error()); err != nil {
-				return true, err
+			applied, err := r.Store.ApplyClaim(ctx, claim, domain.StatusFailed, transcribeErr.Error(), nil, nil)
+			if applied {
+				r.publish(memoID, domain.StatusFailed, "")
 			}
-			r.publish(memoID, domain.StatusFailed, "")
-			return true, r.Store.FinishJob(ctx, memoID)
+			return true, err
 		}
 
 		delay := backoff[len(backoff)-1]
@@ -113,20 +142,20 @@ func (r *Runner) RunOnce(ctx context.Context) (bool, error) {
 		}
 		r.log().Info("retrying transcription",
 			"memo", memoID, "attempt", attempts, "in", delay.String(), "error", transcribeErr)
-		if err := r.Store.SetStatus(ctx, memoID, domain.StatusUploaded, transcribeErr.Error()); err != nil {
-			return true, err
+		nextAt := r.now().Add(delay).Unix()
+		applied, err := r.Store.ApplyClaim(ctx, claim, domain.StatusUploaded, transcribeErr.Error(), nil, &nextAt)
+		if applied {
+			r.publish(memoID, domain.StatusUploaded, "")
 		}
-		return true, r.Store.RescheduleJob(ctx, memoID, r.now().Add(delay).Unix())
-	}
-
-	if err := r.Store.RecordTranscript(ctx, memoID, result.Text, result.Language,
-		result.Provider, result.Model, result.TraceID); err != nil {
 		return true, err
 	}
-	r.publish(memoID, domain.StatusReady, result.Text)
-	r.log().Info("transcription ready",
-		"memo", memoID, "provider", result.Provider, "chars", len(result.Text))
-	return true, r.Store.FinishJob(ctx, memoID)
+
+	resultMemo := domain.Memo{Transcript: result.Text, Lang: result.Language, ASRProvider: result.Provider, ASRModel: result.Model, ASRTraceID: result.TraceID}
+	applied, err := r.Store.ApplyClaim(ctx, claim, domain.StatusReady, "", &resultMemo, nil)
+	if applied {
+		r.publish(memoID, domain.StatusReady, result.Text)
+	}
+	return true, err
 }
 
 // publish pushes a status change when a hub is configured. It reports the
@@ -135,7 +164,11 @@ func (r *Runner) publish(memoID, status, snippet string) {
 	if r.Events == nil {
 		return
 	}
-	ev := events.Event{Type: "memo", ID: memoID, Status: status, Snippet: snippet}
+	ev := events.Event{Type: "memo", ID: memoID, Status: status, Snippet: (domain.Memo{Transcript: snippet}).Snippet(40)}
+	if memo, err := r.Store.Memo(context.Background(), memoID); err == nil {
+		ev.RecordedAt = memo.RecordedAt
+		ev.DurationMS = memo.DurationMS
+	}
 	r.Events.Publish(ev)
 }
 

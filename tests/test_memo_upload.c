@@ -10,13 +10,16 @@ static FILE *upload_file(const char *path, const char *mode);
 static const char *ID = "00000000-0000-4000-8000-000000000001";
 static bool file_exists, io_failure, rename_failure, transport_failure, online;
 static bool capture_during_probe;
-static bool stop_timeout, recovery_blocked;
+static bool playback_during_response;
+static bool stop_timeout, recovery_blocked, scan_failure;
 static bool extra_exists;
 static memo_spool_state_t extra_state;
 static const char *EXTRA_ID = "00000000-0000-4000-8000-000000000099";
 static memo_spool_state_t file_state;
 static int code, posts, deletes, moves, delays;
-static uint32_t max_ms;
+static int probes, invalidations;
+static bool request_during_probe, probe_failure;
+static uint32_t max_ms, max_bytes;
 
 SemaphoreHandle_t xSemaphoreCreateMutex(void) { return (void *)1; }
 SemaphoreHandle_t xSemaphoreCreateBinary(void) { return (void *)2; }
@@ -26,7 +29,8 @@ int xTaskCreate(void (*fn)(void *), const char *n, unsigned stack, void *arg,
                 unsigned prio, TaskHandle_t *out)
 { (void)fn; (void)n; (void)stack; (void)arg; (void)prio; *out = (void *)3; return pdPASS; }
 void vTaskDelay(unsigned t) { (void)t; if (++delays >= 3) s_running = false; }
-void vTaskDelete(TaskHandle_t t) { (void)t; }
+void vTaskDelete(TaskHandle_t t) { assert(t!=NULL); }
+void vTaskSuspend(TaskHandle_t t) { assert(t==NULL); }
 esp_err_t esp_read_mac(uint8_t *mac, int t) { (void)t; memset(mac, 0, 6); return ESP_OK; }
 esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *c)
 { assert(c->method == HTTP_METHOD_POST); return (void *)4; }
@@ -36,26 +40,38 @@ esp_err_t esp_http_client_open(esp_http_client_handle_t c, int n)
 { (void)c; assert(n == 80); posts++; return transport_failure ? ESP_FAIL : ESP_OK; }
 int esp_http_client_write(esp_http_client_handle_t c, const char *d, int n)
 { (void)c; (void)d; return n; }
-int esp_http_client_fetch_headers(esp_http_client_handle_t c) { (void)c; return 0; }
+int esp_http_client_fetch_headers(esp_http_client_handle_t c) { (void)c; if(playback_during_response)memo_upload_set_playback_busy(true); return 0; }
 int esp_http_client_get_status_code(esp_http_client_handle_t c) { (void)c; return code; }
 esp_err_t esp_http_client_close(esp_http_client_handle_t c) { (void)c; return ESP_OK; }
 esp_err_t esp_http_client_cleanup(esp_http_client_handle_t c) { (void)c; return ESP_OK; }
 bool memo_net_has_ip(void) { return online; }
 memo_discovery_state_t memo_discovery_state(void) { return MEMO_DISCOVERY_FOUND; }
 esp_err_t memo_discovery_search(uint32_t t) { (void)t; return ESP_OK; }
-const char *memo_discovery_host(void) { return "127.0.0.1"; }
-uint16_t memo_discovery_port(void) { return 8080; }
+bool memo_discovery_endpoint(memo_endpoint_t *out)
+{ *out = (memo_endpoint_t){.host="127.0.0.1", .port=8080, .confirmed=true}; return true; }
+void memo_discovery_invalidate(const memo_endpoint_t *endpoint) { (void)endpoint; invalidations++; }
+
 esp_err_t memo_api_probe(void)
 {
+    probes++;
     if (capture_during_probe) memo_upload_set_capture_busy(true);
-    return ESP_OK;
+    if (request_during_probe) {
+        request_during_probe = false;
+        memo_upload_request_discovery();
+    }
+    return probe_failure ? ESP_FAIL : ESP_OK;
 }
 esp_err_t memo_api_refresh(void) { return ESP_OK; }
+void memo_api_request_refresh(void) {}
+void memo_api_poll_text(void) {}
+bool memo_api_take_refresh_request(void) { return false; }
 bool memo_api_all_terminal(void) { return true; }
 uint32_t memo_api_max_memo_ms(void) { return max_ms; }
+uint32_t memo_api_max_bytes(void) { return max_bytes; }
 bool memo_spool_recovery_blocked(void) { return recovery_blocked; }
 int memo_spool_scan(memo_spool_entry_t *out, size_t cap)
 {
+    if(scan_failure){recovery_blocked=true;return 0;}
     int count = 0;
     if (file_exists) {
         if (out != NULL && cap > 0) {
@@ -126,15 +142,17 @@ static void reset(void)
     file_exists = online = true;
     file_state = MEMO_SPOOL_PENDING;
     io_failure = rename_failure = transport_failure = false;
-    capture_during_probe = false;
+    capture_during_probe = playback_during_response = false;
     extra_exists = false; extra_state = MEMO_SPOOL_LEGACY_KEPT;
     posts = deletes = moves = delays = 0;
-    max_ms = 0; code = 400;
+    probes = invalidations = 0;
+    s_rediscover_requested = request_during_probe = probe_failure = false;
+    max_ms = max_bytes = 0; code = 400;
     s_review = (memo_upload_rejection_t){0};
     s_attempt_id[0] = '\0';
     s_policy = (memo_upload_policy_t){0};
-    s_running = s_capture_busy = false;
-    s_review_lock = NULL; s_done = NULL; s_task = NULL; stop_timeout = false; recovery_blocked = false;
+    s_running = s_capture_busy = s_playback_busy = false;
+    s_review_lock = NULL; s_done = NULL; s_task = NULL; stop_timeout = false; recovery_blocked = scan_failure = false;
     assert(memo_upload_start() == ESP_OK);
 }
 static void exhaust(void)
@@ -259,6 +277,9 @@ static void test_local_limit_and_429_use_same_budget(void)
     memo_spool_entry_t e = entry();
     assert(!upload_once(&e)); assert(!upload_once(&e)); assert(upload_once(&e));
     assert(posts == 0 && file_state == MEMO_SPOOL_BAD && deletes == 0);
+    reset(); max_bytes = 40; e = entry();
+    assert(!upload_once(&e)); assert(!upload_once(&e)); assert(upload_once(&e));
+    assert(posts == 0 && file_state == MEMO_SPOOL_BAD);
     reset(); code = 429; exhaust();
 }
 
@@ -319,8 +340,61 @@ static void test_stop_timeout_retains_worker_ownership(void)
     assert(memo_upload_stop() == ESP_OK && s_task == NULL);
     assert(memo_upload_start() == ESP_OK);
 }
+static void test_local_playback_holds_accepted_upload_source(void)
+{
+    reset(); code=201;
+    memo_upload_set_playback_busy(true);
+    upload_task(NULL); assert(posts==0 && file_exists && deletes==0);
+    memo_upload_set_playback_busy(false); s_running=true;
+    memo_spool_entry_t e=entry(); playback_during_response=true;
+    assert(upload_once(&e) && posts==1 && deletes==0 && file_exists);
+    assert(memo_upload_pending());
+    playback_during_response=false; memo_upload_set_playback_busy(false);
+    assert(upload_once(&e) && posts==2 && deletes==1 && !file_exists);
+}
+
+static void test_manual_discovery_is_queued_and_coalesced(void)
+{
+    reset(); file_exists=false; online=false;
+    memo_upload_request_discovery(); memo_upload_request_discovery();
+    upload_task(NULL);
+    assert(memo_upload_discovery_pending() && probes==0 && invalidations==0);
+    online=true; s_running=true; delays=0;
+    upload_task(NULL);
+    assert(!memo_upload_discovery_pending() && probes==1 && invalidations==1);
+
+    reset(); file_exists=false; memo_upload_set_capture_busy(true);
+    memo_upload_request_discovery(); upload_task(NULL);
+    assert(memo_upload_discovery_pending() && probes==0 && invalidations==0);
+    memo_upload_set_capture_busy(false); s_running=true; delays=0;
+    request_during_probe=true;
+    upload_task(NULL);
+    assert(!memo_upload_discovery_pending() && probes==2 && invalidations==2);
+
+    reset(); file_exists=false; probe_failure=true;
+    memo_upload_request_discovery(); upload_task(NULL);
+    assert(!memo_upload_discovery_pending() && invalidations==1 && probes==1);
+    assert(posts==0 && deletes==0);
+
+    reset(); memo_upload_request_discovery();
+    interruptible_delay(120000); assert(delays==0); // manual retry wakes backoff
+    interruptible_delay(200); assert(delays==2); // busy wait must not spin
+}
+
+static void test_scan_failure_holds_capture_and_upload_immediately(void)
+{
+    reset();scan_failure=true;
+    assert(memo_upload_pending());
+    reset();scan_failure=true;
+    assert(capture_busy());
+    upload_task(NULL);assert(posts==0 && file_exists && deletes==0);
+}
+
 int main(void)
 {
+    test_scan_failure_holds_capture_and_upload_immediately();
+    test_manual_discovery_is_queued_and_coalesced();
+    test_local_playback_holds_accepted_upload_source();
     test_stop_timeout_retains_worker_ownership();
     test_three_rejections_wait_for_explicit_delete();
     test_retry_round_and_failed_choices();

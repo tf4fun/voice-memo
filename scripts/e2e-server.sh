@@ -69,11 +69,15 @@ MEMO_LOG_LEVEL=warn \
     "${WORK_DIR}/memo-server" serve >"${WORK_DIR}/server.log" 2>&1 &
 SERVER_PID=$!
 
-for _ in $(seq 1 50); do
+for _ in $(seq 1 150); do
     if curl -sS -o /dev/null "${BASE}/ping" 2>/dev/null; then break; fi
+    if ! kill -0 "${SERVER_PID}" 2>/dev/null; then break; fi
     sleep 0.1
 done
-curl -sS "${BASE}/ping" >/dev/null || fail "server did not come up"
+if ! curl -sS "${BASE}/ping" >/dev/null; then
+    sed -n '1,40p' "${WORK_DIR}/server.log" >&2
+    fail "server did not come up"
+fi
 
 echo "== upload (expect 201)"
 [[ "$(status_of POST /memos "" -H "X-Device-Id: ${DEVICE_ID}" -H "X-Memo-Id: ${MEMO_ID}" \
@@ -109,6 +113,80 @@ echo "== patch rejects unknown field (expect 400)"
 [[ "$(status_of PATCH "/memos/${MEMO_ID}" '{"titel":"typo"}' -H "Content-Type: application/json")" == "400" ]] \
     || fail "unknown field was accepted"
 
+echo "== history pages and bounded versioned text"
+python3 - "${BASE}" "${FIXTURE}" "${MEMO_ID}" "${DEVICE_ID}" <<'PY_PAGES'
+import json, sys, urllib.request, urllib.parse, urllib.error
+base, fixture, original_id, device = sys.argv[1:]
+def request(method, path, body=None, headers=None):
+    req=urllib.request.Request(base+path, data=body, method=method, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=10) as response:
+        data=response.read()
+        return response.status, json.loads(data) if data else None
+raw=bytearray(open(fixture,"rb").read())
+for i in range(1,51):
+    memo_id=f"{i:08x}-0000-4000-8000-000000000000"
+    raw[24:60]=memo_id.encode()
+    status,_=request("POST","/memos",bytes(raw),{"X-Device-Id":device,"X-Memo-Id":memo_id,"Content-Type":"application/octet-stream"})
+    assert status==201
+pages=[];cursor=""
+while True:
+    _,page=request("GET","/memos?limit=24&cursor="+urllib.parse.quote(cursor))
+    pages.append(page)
+    if not page["next_cursor"]: break
+    cursor=page["next_cursor"]
+    assert len(pages)<10
+ids=[m["id"] for page in pages for m in page["items"]]
+assert len(ids)==51 and len(set(ids))==51
+current=pages[-1]
+for expected in reversed(pages[:-1]):
+    _,current=request("GET","/memos?limit=24&direction=newer&cursor="+urllib.parse.quote(current["previous_cursor"]))
+    assert [m["id"] for m in current["items"]]==[m["id"] for m in expected["items"]]
+assert current["previous_cursor"]==""
+want=("\u4e2da\U0001f600\n"*4000)
+request("PATCH","/memos/"+original_id,json.dumps({"transcript":want}).encode(),{"Content-Type":"application/json"})
+text=[];offset=0;revision="";last=None
+while True:
+    _,last=request("GET","/memos/"+original_id+"/text?"+urllib.parse.urlencode({"offset":offset,"revision":revision,"limit":2048}))
+    assert last["offset"]==offset and len(last["text"].encode())<=2048
+    text.append(last["text"]);offset=last["end"];revision=last["revision"]
+    if offset==last["total"]: break
+assert "".join(text)==want
+reverse=[last["text"]]
+while last["offset"]:
+    _,last=request("GET","/memos/"+original_id+"/text?"+urllib.parse.urlencode({"offset":last["offset"],"revision":revision,"direction":"previous","limit":2048}))
+    reverse.append(last["text"])
+assert "".join(reversed(reverse))==want
+request("PATCH","/memos/"+original_id,b'{"transcript":"edited again"}',{"Content-Type":"application/json"})
+try:
+    request("GET","/memos/"+original_id+"/text?revision="+revision)
+    raise AssertionError("stale revision accepted")
+except urllib.error.HTTPError as error:
+    assert error.code==409
+PY_PAGES
+
+echo "== gc preview/apply (keep accepted audio and rejected files)"
+python3 - "${WORK_DIR}/data" <<'PY_GC'
+from pathlib import Path
+import os, sys, time
+root=Path(sys.argv[1])
+for name in ("incoming/gc-stale.part", "audio/gc-orphan.memo", "rejected/gc-diagnostic.memo"):
+    path=root/name
+    path.write_bytes(b"gc-test")
+    os.utime(path,(time.time()-172800,time.time()-172800))
+for path in root.glob("audio/*/*/*.memo"):
+    os.utime(path,(time.time()-172800,time.time()-172800))
+PY_GC
+MEMO_DATA_DIR="${WORK_DIR}/data" "${WORK_DIR}/memo-server" gc >"${WORK_DIR}/gc-preview"
+[[ -f "${WORK_DIR}/data/incoming/gc-stale.part" ]] || fail "dry-run removed a partial"
+[[ -f "${WORK_DIR}/data/audio/gc-orphan.memo" ]] || fail "dry-run removed an orphan"
+MEMO_DATA_DIR="${WORK_DIR}/data" "${WORK_DIR}/memo-server" gc --apply >"${WORK_DIR}/gc-apply"
+[[ ! -e "${WORK_DIR}/data/incoming/gc-stale.part" ]] || fail "stale partial survived gc"
+[[ ! -e "${WORK_DIR}/data/audio/gc-orphan.memo" ]] || fail "orphan survived gc"
+[[ -f "${WORK_DIR}/data/rejected/gc-diagnostic.memo" ]] || fail "gc removed a rejected recording"
+if MEMO_DATA_DIR="${WORK_DIR}/data" "${WORK_DIR}/memo-server" gc --apply --older-than 1h >/dev/null 2>&1; then
+    fail "gc accepted an unsafe age"
+fi
+
 echo "== audio (expect original MEMO bytes), range (expect 206)"
 [[ "$(status_of GET "/memos/${MEMO_ID}/audio" "")" == "200" ]] || fail "audio download failed"
 cmp -s "${FIXTURE}" "${WORK_DIR}/body" || fail "audio differs from original container"
@@ -131,6 +209,10 @@ echo "== re-transcribe (expect 202)"
 echo "== delete (expect 204), then 404"
 [[ "$(status_of DELETE "/memos/${MEMO_ID}" "")" == "204" ]] || fail "delete failed"
 [[ "$(status_of GET "/memos/${MEMO_ID}" "")" == "404" ]] || fail "deleted memo is still readable"
+[[ "$(status_of POST /memos "" -H "X-Device-Id: ${DEVICE_ID}" -H "X-Memo-Id: ${MEMO_ID}" \
+    -H "Content-Type: application/octet-stream" --data-binary "@${FIXTURE}")" == "410" ]] \
+    || fail "deleted memo replay was not terminal"
+
 
 echo
-echo "PASS: upload, idempotency, transcription, list, patch, audio range, retranscribe, delete"
+echo "PASS: upload, idempotency, transcription, bidirectional history, versioned long text, patch, safe gc, audio range, retranscribe, delete"

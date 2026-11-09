@@ -102,67 +102,28 @@ func (s *Store) Memo(ctx context.Context, id string) (domain.Memo, error) {
 	return m, err
 }
 
-// ListMemos returns live memos newest first. An empty cursor starts at the
-// newest; the returned cursor continues after the last item.
+// ListMemos is the forward-compatible newest-first listing helper.
 func (s *Store) ListMemos(ctx context.Context, limit int, cursor, deviceID string) ([]domain.Memo, string, error) {
-	if limit <= 0 {
-		limit = 20
-	}
-	if limit > 100 {
-		limit = 100
-	}
-
-	query := `SELECT ` + memoColumns + ` FROM memos WHERE deleted_at IS NULL`
-	args := []any{}
-
-	if deviceID != "" {
-		query += ` AND device_id = ?`
-		args = append(args, deviceID)
-	}
-	if cursor != "" {
-		recordedAt, id, err := DecodeCursor(cursor)
-		if err != nil {
-			return nil, "", err
-		}
-		query += ` AND (recorded_at < ? OR (recorded_at = ? AND id < ?))`
-		args = append(args, recordedAt, recordedAt, id)
-	}
-	query += ` ORDER BY recorded_at DESC, id DESC LIMIT ?`
-	args = append(args, limit)
-
-	rows, err := s.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, "", fmt.Errorf("list memos: %w", err)
-	}
-	defer rows.Close()
-
-	var memos []domain.Memo
-	for rows.Next() {
-		m, err := scanMemo(rows)
-		if err != nil {
-			return nil, "", err
-		}
-		memos = append(memos, m)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, "", fmt.Errorf("list memos: %w", err)
-	}
-
-	next := ""
-	if len(memos) == limit {
-		last := memos[len(memos)-1]
-		next = EncodeCursor(last.RecordedAt, last.ID)
-	}
-	return memos, next, nil
+	page, err := s.ListMemoPage(ctx, limit, cursor, deviceID, "older")
+	return page.Items, page.Next, err
 }
 
 // UpdateTranscript stores a manual or automatic transcript.
 func (s *Store) UpdateTranscript(ctx context.Context, id, transcript, lang string, editedAt int64) error {
-	res, err := s.db.ExecContext(ctx, `
-		UPDATE memos SET transcript = ?, lang = ?, edited_at = ?, error = NULL
-		WHERE id = ? AND deleted_at IS NULL`,
-		transcript, nullable(lang), nullInt(editedAt), id)
-	return affectedOne(res, err, "update transcript")
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE memos SET transcript=?, lang=?, edited_at=?, error=NULL, status=? WHERE id=? AND deleted_at IS NULL`,
+		transcript, nullable(lang), nullInt(editedAt), domain.StatusReady, id)
+	if err := affectedOne(res, err, "update transcript"); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM jobs WHERE memo_id=?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // SetStatus moves a memo through its lifecycle.
@@ -184,23 +145,32 @@ func (s *Store) RecordTranscript(ctx context.Context, id, transcript, lang, prov
 	return affectedOne(res, err, "record transcript")
 }
 
-// SoftDelete marks a memo deleted and returns the audio path to remove.
+// SoftDelete atomically hides a memo and revokes its job. A known deleted ID
+// still returns its audio path so failed filesystem cleanup can be retried.
 func (s *Store) SoftDelete(ctx context.Context, id string, now int64) (string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", fmt.Errorf("begin delete: %w", err)
+	}
+	defer tx.Rollback()
 	var path string
-	err := s.db.QueryRowContext(ctx,
-		`SELECT audio_path FROM memos WHERE id = ? AND deleted_at IS NULL`, id).Scan(&path)
+	err = tx.QueryRowContext(ctx,
+		`SELECT audio_path FROM memos WHERE id = ?`, id).Scan(&path)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrNotFound
 	}
 	if err != nil {
 		return "", fmt.Errorf("lookup memo: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx,
-		`UPDATE memos SET deleted_at = ? WHERE id = ?`, now, id); err != nil {
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE memos SET deleted_at = COALESCE(deleted_at, ?) WHERE id = ?`, now, id); err != nil {
 		return "", fmt.Errorf("soft delete: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM jobs WHERE memo_id = ?`, id); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM jobs WHERE memo_id = ?`, id); err != nil {
 		return "", fmt.Errorf("drop job: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return "", fmt.Errorf("commit delete: %w", err)
 	}
 	return path, nil
 }
@@ -223,20 +193,86 @@ const claimLease = 120
 
 // ClaimJob reserves the next due job. The third result is false when nothing is
 // due yet.
-func (s *Store) ClaimJob(ctx context.Context, now int64) (string, int, bool, error) {
-	var memoID string
-	var attempts int
-	err := s.db.QueryRowContext(ctx, `
-		UPDATE jobs SET attempts = attempts + 1, next_at = ?
-		WHERE id = (SELECT id FROM jobs WHERE next_at <= ? ORDER BY id LIMIT 1)
-		RETURNING memo_id, attempts`, now+claimLease, now).Scan(&memoID, &attempts)
+type JobClaim struct {
+	ID       int64
+	MemoID   string
+	Attempts int
+}
+
+func (s *Store) ClaimJobWithToken(ctx context.Context, now int64) (JobClaim, bool, error) {
+	var claim JobClaim
+	err := s.db.QueryRowContext(ctx, `UPDATE jobs SET attempts=attempts+1,next_at=?
+        WHERE id=(SELECT id FROM jobs WHERE next_at<=? ORDER BY id LIMIT 1)
+        RETURNING id,memo_id,attempts`, now+claimLease, now).Scan(&claim.ID, &claim.MemoID, &claim.Attempts)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", 0, false, nil
+		return claim, false, nil
+	}
+	return claim, err == nil, err
+}
+func (s *Store) ClaimJob(ctx context.Context, now int64) (string, int, bool, error) {
+	claim, ok, err := s.ClaimJobWithToken(ctx, now)
+	return claim.MemoID, claim.Attempts, ok, err
+}
+
+// ApplyClaim commits status/result and queue changes only while this exact
+// job/attempt still owns the memo. Edit/delete/requeue revoke old ownership.
+func (s *Store) ApplyClaim(ctx context.Context, claim JobClaim, status, message string, result *domain.Memo, nextAt *int64) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	query := `UPDATE memos SET status=?,error=?`
+	args := []any{status, nullable(message)}
+	if result != nil {
+		query += `,transcript=?,lang=?,asr_provider=?,asr_model=?,asr_trace_id=?`
+		args = append(args, result.Transcript, nullable(result.Lang), nullable(result.ASRProvider), nullable(result.ASRModel), nullable(result.ASRTraceID))
+	}
+	query += ` WHERE id=? AND deleted_at IS NULL AND EXISTS (SELECT 1 FROM jobs WHERE id=? AND memo_id=? AND attempts=?)`
+	args = append(args, claim.MemoID, claim.ID, claim.MemoID, claim.Attempts)
+	res, err := tx.ExecContext(ctx, query, args...)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if n == 0 {
+		return false, nil
+	}
+	if nextAt != nil {
+		_, err = tx.ExecContext(ctx, `UPDATE jobs SET next_at=? WHERE id=? AND attempts=?`, *nextAt, claim.ID, claim.Attempts)
+	} else if status != domain.StatusTranscribing {
+		_, err = tx.ExecContext(ctx, `DELETE FROM jobs WHERE id=? AND attempts=?`, claim.ID, claim.Attempts)
 	}
 	if err != nil {
-		return "", 0, false, fmt.Errorf("claim job: %w", err)
+		return false, err
 	}
-	return memoID, attempts, true, nil
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// RequeueMemo replaces the job row, giving future claims a fresh monotonic ID.
+func (s *Store) RequeueMemo(ctx context.Context, id string, now int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE memos SET status=?,error=NULL WHERE id=? AND deleted_at IS NULL`, domain.StatusUploaded, id)
+	if err := affectedOne(res, err, "requeue memo"); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM jobs WHERE memo_id=?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO jobs(memo_id,attempts,next_at) VALUES(?,0,?)`, id, now); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // RescheduleJob sets the next attempt time.
@@ -391,4 +427,20 @@ func affectedOne(res sql.Result, err error, action string) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// DiscardClaim only drops the obsolete row owned by this attempt.
+func (s *Store) DiscardClaim(ctx context.Context, claim JobClaim) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM jobs WHERE id=? AND attempts=?`, claim.ID, claim.Attempts)
+	return err
+}
+
+// MemoDeleted distinguishes a revoked ID from an ID never accepted.
+func (s *Store) MemoDeleted(ctx context.Context, id string) (bool, error) {
+	var deleted sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `SELECT deleted_at FROM memos WHERE id=?`, id).Scan(&deleted)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return deleted.Valid, err
 }

@@ -84,6 +84,13 @@ static void test_utf8_validity(void)
 {
     assert(memo_text_is_valid_utf8("下午三点"));
     assert(memo_text_is_valid_utf8(""));
+    assert(memo_text_is_valid_utf8("\xF4\x8F\xBF\xBF"));
+    assert(!memo_text_is_valid_utf8("\xC0\x80"));
+    assert(!memo_text_is_valid_utf8("\xE0\x80\x80"));
+    assert(!memo_text_is_valid_utf8("\xED\xA0\x80"));
+    assert(!memo_text_is_valid_utf8("\xF0\x80\x80\x80"));
+    assert(!memo_text_is_valid_utf8("\xF4\x90\x80\x80"));
+    assert(!memo_text_is_valid_utf8("\xF5\x80\x80\x80"));
     assert(!memo_text_is_valid_utf8("\xE4\xB8"));
     assert(!memo_text_is_valid_utf8("a\x80" "b"));
 }

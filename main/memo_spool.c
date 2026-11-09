@@ -12,6 +12,7 @@
 
 #include "esp_log.h"
 #include "esp_spiffs.h"
+#include "esp_partition.h"
 
 #include "memo_container.h"
 
@@ -38,6 +39,23 @@ static void path_for(char *dst, size_t cap, const char *id, memo_spool_state_t s
     snprintf(dst, cap, "%s/%s.%s", MEMO_SPOOL_MOUNT_POINT, id, extension_of(state));
 }
 
+/* Only an entirely erased partition may be initialised automatically. A failed
+ * mount with any existing bytes is a storage fault, never permission to erase. */
+static bool partition_erased(void)
+{
+    const esp_partition_t *partition = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "memo");
+    if (partition == NULL || partition->size == 0) return false;
+    uint8_t bytes[256];
+    for (size_t offset = 0; offset < partition->size; offset += sizeof(bytes)) {
+        size_t len = partition->size - offset;
+        if (len > sizeof(bytes)) len = sizeof(bytes);
+        if (esp_partition_read(partition, offset, bytes, len) != ESP_OK) return false;
+        for (size_t i = 0; i < len; i++) if (bytes[i] != 0xff) return false;
+    }
+    return true;
+}
+
 esp_err_t memo_spool_mount(void)
 {
     if (s_mounted) return ESP_OK;
@@ -46,14 +64,21 @@ esp_err_t memo_spool_mount(void)
         .base_path = MEMO_SPOOL_MOUNT_POINT,
         .partition_label = "memo",
         .max_files = 4,
-        .format_if_mount_failed = true,
+        .format_if_mount_failed = false,
     };
     esp_err_t err = esp_vfs_spiffs_register(&conf);
+    if (err == ESP_FAIL && partition_erased()) {
+        ESP_LOGI(TAG, "initialising verified erased spool partition");
+        err = esp_spiffs_format("memo");
+        if (err == ESP_OK) err = esp_vfs_spiffs_register(&conf);
+    }
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "spiffs mount failed: %s", esp_err_to_name(err));
+        s_recovery_blocked = true;
+        ESP_LOGE(TAG, "spiffs mount failed; existing data preserved: %s", esp_err_to_name(err));
         return err;
     }
     s_mounted = true;
+    s_recovery_blocked = false;
 
     size_t total = 0, used = 0;
     if (esp_spiffs_info(conf.partition_label, &total, &used) == ESP_OK) {
@@ -65,7 +90,7 @@ esp_err_t memo_spool_mount(void)
 esp_err_t memo_spool_create(const char *id, const uint8_t header[80], void **file_out)
 {
     if (id == NULL || file_out == NULL) return ESP_ERR_INVALID_ARG;
-    if (!s_mounted) return ESP_ERR_INVALID_STATE;
+    if (!s_mounted || s_recovery_blocked) return ESP_ERR_INVALID_STATE;
 
     char path[64];
     path_for(path, sizeof(path), id, MEMO_SPOOL_RECORDING);
@@ -83,10 +108,13 @@ esp_err_t memo_spool_create(const char *id, const uint8_t header[80], void **fil
        fread 失败，表现为"录音存不下来"。 */
     int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
     if (fd < 0) return ESP_FAIL;
-    FILE *file = fdopen(fd, "w+b");
+    /* ESP-IDF 的 SPIFFS VFS 没有 fcntl，fdopen 内部的 F_GETFL 会以 ENOSYS 失败；
+       独占创建之后关掉描述符，再用 fopen 以读写模式打开同一个文件。 */
+    close(fd);
+    FILE *file = fopen(path, "r+b");
     if (file == NULL) {
-        close(fd);
-        ESP_LOGE(TAG, "cannot create %s: errno=%d", path, errno);
+        ESP_LOGE(TAG, "cannot open %s: errno=%d", path, errno);
+        remove(path);
         return ESP_FAIL;
     }
     if (fwrite(header, 1, 80, file) != 80 || fflush(file) != 0 || fsync(fileno(file)) != 0) {
@@ -143,13 +171,14 @@ esp_err_t memo_spool_finalize(void *file, const char *id, uint32_t frame_count, 
 
 esp_err_t memo_spool_discard(void *file, const char *id)
 {
-    if (file != NULL) fclose((FILE *)file);
+    esp_err_t err = ESP_OK;
+    if (file != NULL && fclose((FILE *)file) != 0) err = ESP_FAIL;
     if (id != NULL) {
         char path[64];
         path_for(path, sizeof(path), id, MEMO_SPOOL_RECORDING);
-        remove(path);
+        if (remove(path) != 0 && errno != ENOENT) err = ESP_FAIL;
     }
-    return ESP_OK;
+    return err;
 }
 
 static bool parse_name(const char *name, memo_spool_entry_t *entry)
@@ -181,16 +210,32 @@ static bool parse_name(const char *name, memo_spool_entry_t *entry)
     return true;
 }
 
+static unsigned scan_priority(memo_spool_state_t state)
+{
+    // Bounded readers must always see an interrupted/unconfirmed capture or an
+    // active upload before compatibility archives, regardless of directory order.
+    if (state == MEMO_SPOOL_RECORDING || state == MEMO_SPOOL_DRAFT) return 0;
+    if (state == MEMO_SPOOL_PENDING) return 1;
+    if (state == MEMO_SPOOL_SENT) return 3;
+    return 2;
+}
+
 int memo_spool_scan(memo_spool_entry_t *out, size_t max_entries)
 {
     if (!s_mounted) return 0;
 
     DIR *dir = opendir(MEMO_SPOOL_MOUNT_POINT);
-    if (dir == NULL) return 0;
+    if (dir == NULL) { s_recovery_blocked = true; return 0; }
 
     int count = 0;
     struct dirent *item;
-    while ((item = readdir(dir)) != NULL) {
+    for (;;) {
+        errno = 0;
+        item = readdir(dir);
+        if (item == NULL) {
+            if (errno != 0) s_recovery_blocked = true;
+            break;
+        }
         memo_spool_entry_t entry = {0};
         if (!parse_name(item->d_name, &entry)) continue;
 
@@ -220,12 +265,19 @@ int memo_spool_scan(memo_spool_entry_t *out, size_t max_entries)
             }
         }
 
-        if (out != NULL && (size_t)count < max_entries) {
-            out[count] = entry;
+        if (out != NULL && max_entries > 0) {
+            const size_t used = (size_t)count < max_entries ? (size_t)count : max_entries;
+            size_t at = 0;
+            while (at < used && scan_priority(out[at].state) <= scan_priority(entry.state)) at++;
+            if (at < max_entries) {
+                const size_t end = used < max_entries ? used : max_entries-1;
+                memmove(out+at+1, out+at, (end-at)*sizeof(*out));
+                out[at] = entry;
+            }
         }
         count++;
     }
-    closedir(dir);
+    if (closedir(dir) != 0) s_recovery_blocked = true;
     return count;
 }
 

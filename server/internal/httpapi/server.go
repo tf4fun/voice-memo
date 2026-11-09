@@ -53,6 +53,7 @@ func NewWithEvents(st *store.Store, cfg config.Config, log *slog.Logger, hub *ev
 	mux.HandleFunc("PATCH /api/v1/memos/{id}", s.handlePatch)
 	mux.HandleFunc("DELETE /api/v1/memos/{id}", s.handleDelete)
 	mux.HandleFunc("GET /api/v1/memos/{id}/audio", s.handleAudio)
+	mux.HandleFunc("GET /api/v1/memos/{id}/text", s.handleText)
 	mux.HandleFunc("POST /api/v1/memos/{id}/transcribe", s.handleTranscribe)
 
 	return s.withRecovery(s.withLogging(mux))

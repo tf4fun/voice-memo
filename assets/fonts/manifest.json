@@ -1,0 +1,42 @@
+{
+  "family": "Noto Sans SC",
+  "release": "Sans2.004",
+  "copyright": "Copyright 2014-2021 Adobe (http://www.adobe.com/).",
+  "license": "OFL-1.1",
+  "license_file": "OFL.txt",
+  "upstream": "https://github.com/notofonts/noto-cjk/tree/Sans2.004",
+  "converter_version": "1.5.2",
+  "converter_upstream": "https://github.com/lvgl/lv_font_conv",
+  "charset_sha256": "f078cc2268815d968c6365bf07fc25b61096d7746b4800201a1e38c65d21ac9d",
+  "requested_codepoints": 4013,
+  "emitted_codepoints": 4012,
+  "omitted_unassigned_codepoints": [
+    "U+FF00"
+  ],
+  "sources": {
+    "NotoSansSC-Bold.otf": {
+      "url": "https://raw.githubusercontent.com/notofonts/noto-cjk/Sans2.004/Sans/SubsetOTF/SC/NotoSansSC-Bold.otf",
+      "sha256": "c6cb5a93abaa9edc8ee7463b7ebb7f42d618d40e6ed2f7a5371c97b0b64767c0"
+    },
+    "NotoSansSC-Regular.otf": {
+      "url": "https://raw.githubusercontent.com/notofonts/noto-cjk/Sans2.004/Sans/SubsetOTF/SC/NotoSansSC-Regular.otf",
+      "sha256": "faa6c9df652116dde789d351359f3d7e5d2285a2b2a1f04a2d7244df706d5ea9"
+    }
+  },
+  "outputs": {
+    "memo_font_16.c": {
+      "source": "NotoSansSC-Bold.otf",
+      "size": 16,
+      "bpp": 4,
+      "line_height": 31,
+      "payload_sha256": "e91fcdf783844e267e4e9f1f1934661a1da37a1f57fd0b61a269ee7412a25200"
+    },
+    "memo_font_20.c": {
+      "source": "NotoSansSC-Regular.otf",
+      "size": 20,
+      "bpp": 4,
+      "line_height": 38,
+      "payload_sha256": "e7ccc854e44094f7fa3e0c6594ef3178a0d79a8c39e78a462b41ddfac9b883dc"
+    }
+  }
+}

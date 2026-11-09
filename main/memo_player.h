@@ -1,6 +1,4 @@
-// main/memo_player.h —— 本地录音回放：spool 里的 Opus 帧解码成 PCM 送到 I2S。
-//
-// M2 用于验证录音质量；M3 的详情页复用同一条通路（M4 会再加服务端流式播放）。
+// Local MEMO playback and remote HTTP streaming, decoded to PCM/I2S.
 #pragma once
 
 #include "esp_err.h"
@@ -8,29 +6,34 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* 打开解码器（幂等）。 */
+/* Initialise the join semaphore; decoder opens per playback. */
 esp_err_t memo_player_init(void);
 
-/* 播放 spool 里的一条录音，返回后播放仍在后台进行。 */
-esp_err_t memo_player_play(const char *id);
-
-/* 播放任意路径上的容器文件（服务端下载的临时文件用）。 */
+/* Play a local spool container asynchronously. */
 esp_err_t memo_player_play_file(const char *path);
 
-/* 播放服务端的一条：下载在播放任务内部完成，调用方立刻返回。 */
+/* Stream from the server asynchronously, without a Flash download cache. */
 esp_err_t memo_player_play_remote(const char *id);
-
-/* 下载缓存文件路径，退出详情页时清掉。 */
-#define MEMO_PLAYER_CACHE_PATH "/spool/play.memo"
-void memo_player_drop_cache(void);
 
 /* 停止播放并等待任务退出。 */
 esp_err_t memo_player_stop(void);
 
+/* Pause at a frame boundary, retaining decoder, source and playback position.
+ * Resume continues that source. Requests are nonblocking; current I2S output
+ * may finish. A disconnected remote source ends normally rather than replaying. */
+esp_err_t memo_player_pause(void);
+esp_err_t memo_player_resume(void);
+bool memo_player_is_paused(void);
+
+/* Task still owns playback resources, including stop timeout/completion awaiting join. */
+bool memo_player_is_busy(void);
+/* Nonblocking join of a naturally completed worker; application owner only. */
+void memo_player_poll(void);
+
 /* 是否正在播放。 */
 bool memo_player_is_active(void);
 
-/* 已播放的毫秒数（按解码出的采样数计算）。 */
+/* 已播放的毫秒数；结束时保留最后进度，下一次播放请求重置。 */
 uint32_t memo_player_position_ms(void);
 
 /* 当前这条录音的总时长（来自容器头）。 */

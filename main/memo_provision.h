@@ -5,6 +5,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include "memo_network_info.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -26,15 +27,13 @@ typedef enum {
 esp_err_t memo_provision_start(void);
 
 /* 停止并释放 BLE / Wi-Fi 资源（设置页退出时调用）。 */
-void memo_provision_stop(void);
+/* A failed stop retains resources; normal Wi-Fi must not restart yet. */
+esp_err_t memo_provision_stop(void);
 
 memo_provision_state_t memo_provision_state(void);
 
-/* 已连接（或正在连接）的 SSID；没有则返回空串。 */
-const char *memo_provision_ssid(void);
-
-/* 拿到的 IPv4 地址；没有则返回空串。 */
-const char *memo_provision_ip(void);
+/* Caller-owned SSID/IP snapshot; credentials are never exposed. */
+void memo_provision_info(memo_network_info_t *out);
 
 /* 最近一次失败的错误码。 */
 esp_err_t memo_provision_error(void);

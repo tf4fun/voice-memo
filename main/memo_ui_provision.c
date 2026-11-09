@@ -10,41 +10,51 @@
 static lv_obj_t *s_screen;
 static lv_obj_t *s_state;
 static lv_obj_t *s_detail;
+static lv_obj_t *s_ssid;
 static lv_obj_t *s_hint;
 
 void memo_ui_provision_build(void)
 {
+    if (s_screen != NULL) return;
     const int width = lv_display_get_horizontal_resolution(NULL);
-    const int card_w = width - 2 * VM_INSET - VM_SHADOW;
+    const int card_w = width - 48;
 
     s_screen = lv_obj_create(NULL);
-    memo_ui_flat_rect(s_screen, VM_PAPER, 0);
+    memo_ui_flat_rect(s_screen, TERM_BG, 0);
     lv_obj_set_style_radius(s_screen, 0, 0);
 
-    lv_obj_t *title = memo_ui_label(s_screen, memo_font_label(), VM_INK);
-    lv_label_set_text(title, "蓝牙配网");
-    lv_obj_set_pos(title, VM_INSET + 4, VM_INSET + 4);
+    memo_ui_header(s_screen, "> 蓝牙配网");
 
-    lv_obj_t *divider = lv_obj_create(s_screen);
-    memo_ui_flat_rect(divider, VM_INK, 0);
-    lv_obj_set_size(divider, width - 2 * VM_INSET, 2);
-    lv_obj_set_pos(divider, VM_INSET, 34);
+    lv_obj_t *panel = memo_ui_card(s_screen, 24, 60, card_w, 196, NULL);
+    lv_obj_set_style_border_width(panel, 0, 0);
+    lv_obj_set_style_pad_all(panel, 0, 0);
+    memo_ui_rule(panel, 0, 48, card_w);
 
-    lv_obj_t *panel = memo_ui_card(s_screen, VM_INSET, 48, card_w, 176, NULL);
-    lv_obj_set_style_radius(panel, VM_RADIUS_PANEL, 0);
-    lv_obj_set_style_pad_all(panel, 12, 0);
-
-    s_state = memo_ui_label(panel, memo_font_label(), VM_INK);
+    s_state = memo_ui_label(panel, memo_font_body(), TERM_FG);
+    lv_obj_set_size(s_state, card_w, memo_font_body()->line_height);
     lv_obj_align(s_state, LV_ALIGN_TOP_LEFT, 0, 0);
 
-    s_detail = memo_ui_label(panel, memo_font_label(), VM_MUTED);
-    lv_obj_set_width(s_detail, card_w - 48);
-    lv_label_set_long_mode(s_detail, LV_LABEL_LONG_WRAP);
-    lv_obj_align(s_detail, LV_ALIGN_TOP_LEFT, 0, 34);
+    s_ssid = memo_ui_label(panel, memo_font_label(), TERM_DIM);
+    lv_obj_set_size(s_ssid, card_w, memo_font_label()->line_height);
+    lv_label_set_long_mode(s_ssid, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_align(s_ssid, LV_ALIGN_TOP_LEFT, 0, 64);
+    lv_obj_set_hidden(s_ssid, true);
 
-    s_hint = memo_ui_label(s_screen, memo_font_label(), VM_MUTED);
-    lv_label_set_text(s_hint, "手机用微信小程序连接此设备 · 长按 OK 退出");
-    lv_obj_align(s_hint, LV_ALIGN_BOTTOM_LEFT, VM_INSET + 4, -VM_INSET - 2);
+    s_detail = memo_ui_label(panel, memo_font_label(), TERM_DIM);
+    lv_obj_set_width(s_detail, card_w);
+    lv_label_set_long_mode(s_detail, LV_LABEL_LONG_WRAP);
+    lv_obj_align(s_detail, LV_ALIGN_TOP_LEFT, 0, 64);
+
+    s_hint = memo_ui_label(s_screen, memo_font_label(), TERM_DIM);
+    lv_label_set_text(s_hint, "微信小程序配网");
+    lv_obj_set_pos(s_hint, 24, 270);
+    lv_obj_set_width(s_hint, width-48);
+}
+
+void memo_ui_provision_destroy(void)
+{
+    memo_ui_screen_delete(s_screen);
+    s_screen = s_state = s_detail = s_ssid = s_hint = NULL;
 }
 
 static const char *state_text(memo_provision_state_t state)
@@ -67,25 +77,34 @@ void memo_ui_provision_refresh(void)
     const memo_provision_state_t state = memo_provision_state();
     lv_label_set_text(s_state, state_text(state));
 
+    memo_network_info_t info;
+    memo_provision_info(&info);
+    const bool has_ssid = state == MEMO_PROV_WIFI_CONNECTING || state == MEMO_PROV_WIFI_CONNECTED;
+    if (has_ssid) {
+        char ssid[40];
+        snprintf(ssid, sizeof(ssid), "SSID: %s", info.ssid[0] ? info.ssid : "--");
+        memo_font_label_text(s_ssid, ssid, false);
+        lv_obj_set_hidden(s_ssid, false);
+    } else lv_obj_set_hidden(s_ssid, true);
+    lv_obj_set_pos(s_detail, 0, has_ssid ? 104 : 64);
     char detail[160];
     switch (state) {
     case MEMO_PROV_ADVERTISING:
         snprintf(detail, sizeof(detail),
-                 "小程序里选择：\n%s\n\n若列表为空，请确认手机蓝牙已开启。",
+                 "小程序中选择\n%s\n请开启手机蓝牙",
                  MEMO_PROV_DEVICE_NAME);
         break;
     case MEMO_PROV_BLE_CONNECTED:
         snprintf(detail, sizeof(detail), "请在手机里选择 2.4GHz WiFi 并输入密码。");
         break;
     case MEMO_PROV_WIFI_CONNECTING:
-        snprintf(detail, sizeof(detail), "SSID: %s", memo_provision_ssid());
+        detail[0] = '\0';
         break;
     case MEMO_PROV_WIFI_CONNECTED:
-        snprintf(detail, sizeof(detail), "SSID: %s\nIP: %s",
-                 memo_provision_ssid(), memo_provision_ip());
+        snprintf(detail, sizeof(detail), "IP: %s", info.ip);
         break;
     case MEMO_PROV_FAILED:
-        snprintf(detail, sizeof(detail), "%s\n请重试，或长按退出后重新进入。",
+        snprintf(detail, sizeof(detail), "%s",
                  esp_err_to_name(memo_provision_error()));
         break;
     case MEMO_PROV_STARTING:
@@ -95,14 +114,12 @@ void memo_ui_provision_refresh(void)
         detail[0] = '\0';
         break;
     }
-    lv_label_set_text(s_detail, detail);
-    lv_obj_set_style_text_color(s_state,
-                                lv_color_hex(state == MEMO_PROV_FAILED ? VM_CORAL : VM_INK), 0);
-}
-
-void memo_ui_provision_enter(void)
-{
-    memo_ui_provision_refresh();
+    memo_font_label_text(s_detail, detail, false);
+    /* 失败：状态行反白。 */
+    const bool failed = state == MEMO_PROV_FAILED;
+    lv_obj_set_style_text_color(s_state, lv_color_hex(failed ? TERM_BG : TERM_FG), 0);
+    lv_obj_set_style_bg_color(s_state, lv_color_hex(TERM_FG), 0);
+    lv_obj_set_style_bg_opa(s_state, failed ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
 }
 
 lv_obj_t *memo_ui_provision_screen(void)

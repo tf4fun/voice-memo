@@ -2,6 +2,7 @@
 #include "memo_player.h"
 
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -15,11 +16,8 @@
 #include "bsp_audio.h"
 #include "esp_http_client.h"
 
-#include "memo_api.h"
 #include "memo_discovery.h"
-#include "memo_net.h"
 #include "memo_container.h"
-#include "memo_spool.h"
 
 #include "esp_opus_dec.h"
 
@@ -31,12 +29,19 @@ static const char *TAG = "memo_player";
 static void *s_decoder;
 static TaskHandle_t s_task;
 static SemaphoreHandle_t s_done;
-static volatile bool s_active;
+static atomic_bool s_active;
+static atomic_bool s_paused;
 static char s_path[80];
-static char s_remote_id[37]; /* 非空表示要先下载 */
+static char s_remote_id[37]; /* 当前远程流的录音 ID。 */
 static bool s_ready;
-static volatile uint32_t s_position_ms;
-static volatile uint32_t s_duration_ms;
+static atomic_uint_least32_t s_position_ms;
+static atomic_uint_least32_t s_duration_ms;
+
+static bool wait_unpaused(void)
+{
+    while (s_active && s_paused) vTaskDelay(pdMS_TO_TICKS(20));
+    return s_active;
+}
 
 static bool decoder_open(void)
 {
@@ -83,27 +88,16 @@ static void stream_task(void *arg)
     (void)arg;
     stream_from_server(s_remote_id);
     s_remote_id[0] = '\0';
-    s_position_ms = 0;
+    /* Retain the last audible position for the completed detail/scroll view.
+     * The next play request resets it before starting a new worker. */
     s_active = false;
     if (s_done != NULL) xSemaphoreGive(s_done);
-    s_task = NULL;
-    vTaskDelete(NULL);
+    vTaskSuspend(NULL);
 }
 
 static void player_task(void *arg)
 {
     (void)arg;
-
-    if (s_remote_id[0] != '\0') {
-        snprintf(s_path, sizeof(s_path), "%s", MEMO_PLAYER_CACHE_PATH);
-        remove(s_path);
-        if (memo_api_download_audio(s_remote_id, s_path) != ESP_OK) {
-            ESP_LOGE(TAG, "download failed for %s", s_remote_id);
-            s_remote_id[0] = '\0';
-            goto done;
-        }
-        s_remote_id[0] = '\0';
-    }
 
     const char *path = s_path;
 
@@ -152,7 +146,7 @@ static void player_task(void *arg)
     }
 
     uint32_t played = 0;
-    while (s_active) {
+    while (wait_unpaused()) {
         uint8_t length[2];
         if (fread(length, 1, 2, file) != 2) break;
         uint16_t size = (uint16_t)(length[0] | (length[1] << 8));
@@ -167,6 +161,7 @@ static void player_task(void *arg)
             break;
         }
         if (out.decoded_size == 0) continue;
+        if (!wait_unpaused()) break;
         if (bsp_audio_write(pcm, out.decoded_size) != ESP_OK) {
             ESP_LOGE(TAG, "playback write failed");
             break;
@@ -180,23 +175,11 @@ static void player_task(void *arg)
     free(pcm);
     free(packet);
     fclose(file);
-    decoder_close();
-
 done:
-    s_position_ms = 0;
+    decoder_close();
     s_active = false;
     if (s_done != NULL) xSemaphoreGive(s_done);
-    s_task = NULL;
-    vTaskDelete(NULL);
-}
-
-esp_err_t memo_player_play(const char *id)
-{
-    if (id == NULL || strlen(id) != 36) return ESP_ERR_INVALID_ARG;
-
-    char path[80];
-    snprintf(path, sizeof(path), "%s/%s.memo", MEMO_SPOOL_MOUNT_POINT, id);
-    return memo_player_play_file(path);
+    vTaskSuspend(NULL);
 }
 
 esp_err_t memo_player_play_file(const char *path)
@@ -204,9 +187,16 @@ esp_err_t memo_player_play_file(const char *path)
     if (!s_ready) return ESP_ERR_INVALID_STATE;
     if (path == NULL || path[0] == '\0') return ESP_ERR_INVALID_ARG;
     if (s_active) return ESP_ERR_INVALID_STATE;
+    if (s_task != NULL) {
+        if (xSemaphoreTake(s_done, 0) != pdTRUE) return ESP_ERR_INVALID_STATE;
+        vTaskDelete(s_task);
+        s_task = NULL;
+    }
 
     strncpy(s_path, path, sizeof(s_path) - 1);
     s_path[sizeof(s_path) - 1] = '\0';
+    s_paused = false;
+    s_position_ms = s_duration_ms = 0;
     s_active = true;
 
     if (xTaskCreate(player_task, "memo_play", PLAYER_STACK, NULL, 5, &s_task) != pdPASS) {
@@ -220,7 +210,7 @@ esp_err_t memo_player_play_file(const char *path)
 static int http_read_exact(esp_http_client_handle_t client, uint8_t *buf, int n)
 {
     int total = 0;
-    while (total < n) {
+    while (s_active && total < n) {
         const int got = esp_http_client_read(client, (char *)buf + total, n - total);
         if (got <= 0) break;
         total += got;
@@ -232,13 +222,15 @@ static int http_read_exact(esp_http_client_handle_t client, uint8_t *buf, int n)
 static void stream_from_server(const char *id)
 {
     char url[128];
+    memo_endpoint_t endpoint;
+    if (!memo_discovery_endpoint(&endpoint) || !endpoint.confirmed) return;
     snprintf(url, sizeof(url), "http://%s:%u/api/v1/memos/%s/audio",
-             memo_discovery_host(), (unsigned)memo_discovery_port(), id);
+             endpoint.host, (unsigned)endpoint.port, id);
 
     esp_http_client_config_t cfg = {
         .url = url,
         .method = HTTP_METHOD_GET,
-        .timeout_ms = 20000,
+        .timeout_ms = 2000,
         .buffer_size = 2048,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -282,7 +274,7 @@ static void stream_from_server(const char *id)
     if (pcm == NULL) goto done;
 
     uint32_t played = 0;
-    while (s_active) {
+    while (wait_unpaused()) {
         uint8_t length[2];
         if (http_read_exact(client, length, 2) != 2) break;
         const uint16_t size = (uint16_t)(length[0] | (length[1] << 8));
@@ -294,6 +286,7 @@ static void stream_from_server(const char *id)
         esp_audio_dec_info_t info = {0};
         if (esp_opus_dec_decode(s_decoder, &in, &out, &info) != ESP_AUDIO_ERR_OK) break;
         if (out.decoded_size == 0) continue;
+        if (!wait_unpaused()) break;
         if (bsp_audio_write(pcm, out.decoded_size) != ESP_OK) break;
 
         played++;
@@ -314,9 +307,16 @@ esp_err_t memo_player_play_remote(const char *id)
     if (!s_ready) return ESP_ERR_INVALID_STATE;
     if (id == NULL || strlen(id) != 36) return ESP_ERR_INVALID_ARG;
     if (s_active) return ESP_ERR_INVALID_STATE;
+    if (s_task != NULL) {
+        if (xSemaphoreTake(s_done, 0) != pdTRUE) return ESP_ERR_INVALID_STATE;
+        vTaskDelete(s_task);
+        s_task = NULL;
+    }
 
     strncpy(s_remote_id, id, sizeof(s_remote_id) - 1);
     s_remote_id[sizeof(s_remote_id) - 1] = '\0';
+    s_paused = false;
+    s_position_ms = s_duration_ms = 0;
     s_active = true;
 
     if (xTaskCreate(stream_task, "memo_stream", PLAYER_STACK, NULL, 5, &s_task) != pdPASS) {
@@ -327,29 +327,58 @@ esp_err_t memo_player_play_remote(const char *id)
     return ESP_OK;
 }
 
-void memo_player_drop_cache(void)
-{
-    if (s_active) return;
-    remove(MEMO_PLAYER_CACHE_PATH);
-}
-
 esp_err_t memo_player_stop(void)
 {
     if (!s_active && s_task == NULL) return ESP_OK;
 
     s_active = false;
+    s_paused = false;
     if (s_done != NULL) {
         if (xSemaphoreTake(s_done, pdMS_TO_TICKS(3000)) != pdTRUE) {
             ESP_LOGE(TAG, "player did not stop in time");
             return ESP_ERR_TIMEOUT;
         }
     }
+    vTaskDelete(s_task);
+    s_task = NULL;
     return ESP_OK;
+}
+
+bool memo_player_is_busy(void)
+{
+    return s_task != NULL;
+}
+
+void memo_player_poll(void)
+{
+    if (s_task != NULL && !s_active && xSemaphoreTake(s_done, 0) == pdTRUE) {
+        vTaskDelete(s_task);
+        s_task = NULL;
+    }
 }
 
 bool memo_player_is_active(void)
 {
     return s_active;
+}
+
+esp_err_t memo_player_pause(void)
+{
+    if (!s_active) return ESP_ERR_INVALID_STATE;
+    s_paused = true;
+    return ESP_OK;
+}
+
+esp_err_t memo_player_resume(void)
+{
+    if (!s_active || !s_paused) return ESP_ERR_INVALID_STATE;
+    s_paused = false;
+    return ESP_OK;
+}
+
+bool memo_player_is_paused(void)
+{
+    return s_active && s_paused;
 }
 
 uint32_t memo_player_position_ms(void)

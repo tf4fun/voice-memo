@@ -30,6 +30,7 @@ static volatile memo_upload_state_t s_state = MEMO_UPLOAD_IDLE;
 static TaskHandle_t s_task;
 static SemaphoreHandle_t s_done;
 static atomic_bool s_running;
+static atomic_bool s_rediscover_requested;
 static unsigned s_idle_ticks = 30; /* 首次空闲就立刻拉一次列表 */
 static bool s_hot;                 /* 刚上传完：转写结果很快会回来 */
 
@@ -43,13 +44,14 @@ static SemaphoreHandle_t s_review_lock;
 static memo_upload_rejection_t s_review;
 static bool s_review_delete;
 static bool s_capture_busy;
+static bool s_playback_busy;
 static char s_attempt_id[37];
 static memo_upload_policy_t s_policy;
 
 static bool capture_busy(void)
 {
     xSemaphoreTake(s_review_lock, portMAX_DELAY);
-    bool busy = s_capture_busy || memo_spool_recovery_blocked();
+    bool busy = s_capture_busy || s_playback_busy || memo_spool_recovery_blocked();
     xSemaphoreGive(s_review_lock);
     if (!busy) {
         memo_spool_entry_t entries[MEMO_SPOOL_MAX_ENTRIES];
@@ -61,13 +63,20 @@ static bool capture_busy(void)
             }
         }
     }
-    return busy;
+    return busy || memo_spool_recovery_blocked();
 }
 
 void memo_upload_set_capture_busy(bool busy)
 {
     if (s_review_lock != NULL) xSemaphoreTake(s_review_lock, portMAX_DELAY);
     s_capture_busy = busy;
+    if (s_review_lock != NULL) xSemaphoreGive(s_review_lock);
+}
+
+void memo_upload_set_playback_busy(bool busy)
+{
+    if (s_review_lock != NULL) xSemaphoreTake(s_review_lock, portMAX_DELAY);
+    s_playback_busy = busy;
     if (s_review_lock != NULL) xSemaphoreGive(s_review_lock);
 }
 
@@ -197,6 +206,82 @@ static bool pending_entry(memo_spool_entry_t *out)
     return false;
 }
 
+static bool ensure_endpoint(memo_endpoint_t *endpoint)
+{
+    if (!memo_discovery_endpoint(endpoint) || !endpoint->confirmed) {
+        if (memo_api_probe() != ESP_OK || !memo_discovery_endpoint(endpoint) || !endpoint->confirmed) {
+            set_error("no verified server");
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool exceeds_server_limits(const memo_spool_entry_t *entry)
+{
+    const uint32_t server_max = memo_api_max_memo_ms();
+    const uint32_t server_bytes = memo_api_max_bytes();
+    if ((server_max > 0 && entry->duration_ms > server_max) ||
+        (server_bytes > 0 && entry->size > server_bytes)) {
+        ESP_LOGE(TAG, "memo exceeds server limits (duration %u/%u ms, bytes %u/%u)",
+                 (unsigned)entry->duration_ms, (unsigned)server_max,
+                 (unsigned)entry->size, (unsigned)server_bytes);
+        return true;
+    }
+    return false;
+}
+
+static size_t stream_body(esp_http_client_handle_t client, FILE *file, size_t total)
+{
+    /* 直接流式发送文件体：不把整条录音读进 RAM。 */
+    char chunk[1024];
+    size_t sent = 0;
+    while (s_running && sent < total) {
+        const size_t want = (total - sent) < sizeof(chunk) ? (total - sent) : sizeof(chunk);
+        const size_t got = fread(chunk, 1, want, file);
+        if (got == 0) break;
+        if (esp_http_client_write(client, chunk, got) != (int)got) {
+            set_error("write failed");
+            break;
+        }
+        sent += got;
+    }
+    return sent;
+}
+
+static bool upload_accepted(const memo_spool_entry_t *entry, int code)
+{
+    ESP_LOGI(TAG, "uploaded %s (%u bytes), status %d", entry->id,
+             (unsigned)entry->size, code);
+    // A local reader may have opened while POST was in flight. Keep its
+    // source until player join; a later idempotent POST releases the file.
+    if (!capture_busy()) memo_spool_remove(entry->id, MEMO_SPOOL_PENDING);
+    memo_api_refresh(); /* 让列表立刻能看到这条的转写结果 */
+    s_hot = true;       /* 接下来几秒内转写就会完成，密切轮询 */
+    s_state = MEMO_UPLOAD_IDLE;
+    s_backoff_ms = UPLOAD_RETRY_MIN_MS;
+    s_attempt_id[0] = '\0';
+    s_policy = (memo_upload_policy_t){0};
+    return true;
+}
+
+static bool upload_failed_status(const memo_spool_entry_t *entry, memo_endpoint_t *endpoint, int code)
+{
+    if (code >= 400 && code < 500) {
+        /* Three rejected attempts in total, then wait for a user decision. */
+        ESP_LOGE(TAG, "server rejected %s with %d", entry->id, code);
+        snprintf(s_error, sizeof(s_error), "rejected (%d)", code);
+        s_state = MEMO_UPLOAD_FAILED;
+        return reject_entry(entry);
+    }
+
+    if (code <= 0 || code >= 500) memo_discovery_invalidate(endpoint);
+    ESP_LOGW(TAG, "upload failed with status %d, retrying", code);
+    snprintf(s_error, sizeof(s_error), "http %d", code);
+    s_state = MEMO_UPLOAD_FAILED;
+    return false;
+}
+
 /* 返回 true 表示可以接着处理下一条，false 表示需要退避等待。 */
 static bool upload_once(const memo_spool_entry_t *entry)
 {
@@ -206,19 +291,11 @@ static bool upload_once(const memo_spool_entry_t *entry)
         s_backoff_ms = UPLOAD_RETRY_MIN_MS;
     }
     if (s_policy.rejections == MEMO_UPLOAD_REJECTION_ATTEMPTS) return reject_entry(entry);
-    if (memo_discovery_state() != MEMO_DISCOVERY_FOUND) {
-        s_state = MEMO_UPLOAD_DISCOVERING;
-        if (memo_discovery_search(3000) != ESP_OK) {
-            set_error("server not found");
-            return false;
-        }
-    }
+    memo_endpoint_t endpoint;
+    if (!ensure_endpoint(&endpoint)) return false;
 
-    const uint32_t server_max = memo_api_max_memo_ms();
-    if (server_max > 0 && entry->duration_ms > server_max) {
-        ESP_LOGE(TAG, "memo %s is %u ms, server limit is %u ms: rejected",
-                 entry->id, (unsigned)entry->duration_ms, (unsigned)server_max);
-        snprintf(s_error, sizeof(s_error), "longer than server limit");
+    if (exceeds_server_limits(entry)) {
+        snprintf(s_error, sizeof(s_error), "exceeds server limits");
         s_state = MEMO_UPLOAD_FAILED;
         return reject_entry(entry);
     }
@@ -228,7 +305,7 @@ static bool upload_once(const memo_spool_entry_t *entry)
 
     char url[128];
     snprintf(url, sizeof(url), "http://%s:%u/api/v1/memos",
-             memo_discovery_host(), (unsigned)memo_discovery_port());
+             endpoint.host, (unsigned)endpoint.port);
 
     esp_http_client_config_t cfg = {
         .url = url,
@@ -256,27 +333,17 @@ static bool upload_once(const memo_spool_entry_t *entry)
     esp_err_t err = esp_http_client_open(client, entry->size);
     if (err != ESP_OK) {
         set_error(esp_err_to_name(err));
+        memo_discovery_invalidate(&endpoint);
         fclose(file);
         esp_http_client_cleanup(client);
         return false;
     }
 
-    /* 直接流式发送文件体：不把整条录音读进 RAM。 */
-    char chunk[1024];
-    size_t sent = 0;
-    while (s_running && sent < entry->size) {
-        const size_t want = (entry->size - sent) < sizeof(chunk) ? (entry->size - sent) : sizeof(chunk);
-        const size_t got = fread(chunk, 1, want, file);
-        if (got == 0) break;
-        if (esp_http_client_write(client, chunk, got) != (int)got) {
-            set_error("write failed");
-            break;
-        }
-        sent += got;
-    }
+    const size_t sent = stream_body(client, file, entry->size);
     fclose(file);
 
     if (sent != entry->size) {
+        if (s_running) memo_discovery_invalidate(&endpoint);
         esp_http_client_cleanup(client);
         return false;
     }
@@ -288,36 +355,28 @@ static bool upload_once(const memo_spool_entry_t *entry)
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
 
-    if (code == 200 || code == 201) {
-        ESP_LOGI(TAG, "uploaded %s (%u bytes), status %d", entry->id,
-                 (unsigned)entry->size, code);
-        memo_spool_remove(entry->id, MEMO_SPOOL_PENDING);
-        memo_api_refresh(); /* 让列表立刻能看到这条的转写结果 */
-        s_hot = true;       /* 接下来几秒内转写就会完成，密切轮询 */
-        s_state = MEMO_UPLOAD_IDLE;
-        s_backoff_ms = UPLOAD_RETRY_MIN_MS;
-        s_attempt_id[0] = '\0';
-        s_policy = (memo_upload_policy_t){0};
-        return true;
-    }
+    if (code == 200 || code == 201) return upload_accepted(entry, code);
 
-    if (code >= 400 && code < 500) {
-        /* Three rejected attempts in total, then wait for a user decision. */
-        ESP_LOGE(TAG, "server rejected %s with %d", entry->id, code);
-        snprintf(s_error, sizeof(s_error), "rejected (%d)", code);
-        s_state = MEMO_UPLOAD_FAILED;
-        return reject_entry(entry);
-    }
+    return upload_failed_status(entry, &endpoint, code);
+}
 
-    ESP_LOGW(TAG, "upload failed with status %d, retrying", code);
-    snprintf(s_error, sizeof(s_error), "http %d", code);
-    s_state = MEMO_UPLOAD_FAILED;
-    return false;
+void memo_upload_request_discovery(void)
+{
+    atomic_store(&s_rediscover_requested, true);
+}
+
+bool memo_upload_discovery_pending(void)
+{
+    return atomic_load(&s_rediscover_requested);
 }
 
 static void interruptible_delay(uint32_t ms)
 {
+    /* Keep short capture/review waits bounded without spinning on a queued
+     * request. A manual request can interrupt network retry backoff. */
+    const bool can_wake = ms > 200;
     while (s_running && ms > 0) {
+        if (can_wake && memo_net_has_ip() && memo_upload_discovery_pending()) return;
         const uint32_t slice = ms > 100 ? 100 : ms;
         vTaskDelay(pdMS_TO_TICKS(slice));
         ms -= slice;
@@ -336,14 +395,30 @@ static void upload_task(void *arg)
             interruptible_delay(200);
             continue;
         }
+        /* The uploader is the only discovery/API writer. UI requests remain
+         * queued offline and while capture owns the resources. Never clear the
+         * metadata cache when changing endpoints. */
+        if (memo_net_has_ip() && atomic_exchange(&s_rediscover_requested, false)) {
+            memo_endpoint_t endpoint;
+            if (memo_discovery_endpoint(&endpoint)) memo_discovery_invalidate(&endpoint);
+            primed = false;
+        }
         /* 一有网就先拉一次整表：否则缓存是空的，上传完成那一刻列表会"只剩一条"。 */
-        if (!primed && memo_net_has_ip()) {
+        if ((!primed || memo_discovery_state() != MEMO_DISCOVERY_FOUND) && memo_net_has_ip()) {
             /* 先确认这条 mDNS 记录真的可用，再谈上传。 */
             if (memo_api_probe() == ESP_OK) {
                 primed = memo_api_refresh() == ESP_OK;
+            } else {
+                primed = false;
+                interruptible_delay(UPLOAD_POLL_MS);
+                continue;
             }
         }
 
+        if (memo_net_has_ip() && memo_api_take_refresh_request()) {
+            if (memo_api_refresh() != ESP_OK) memo_api_request_refresh();
+        }
+        if (memo_net_has_ip()) memo_api_poll_text();
         memo_spool_entry_t entry;
         if (!pending_entry(&entry)) {
             s_state = MEMO_UPLOAD_IDLE;
@@ -378,7 +453,7 @@ static void upload_task(void *arg)
 
     s_state = MEMO_UPLOAD_IDLE;
     if (s_done != NULL) xSemaphoreGive(s_done);
-    vTaskDelete(NULL);
+    vTaskSuspend(NULL); // Joined/deleted by the owner; no idle-task cleanup delay.
 }
 
 esp_err_t memo_upload_start(void)
@@ -388,6 +463,7 @@ esp_err_t memo_upload_start(void)
         /* A previous timeout may now have completed. Join non-blockingly before
          * allowing a new worker; never discard an unacknowledged handle. */
         if (s_done == NULL || xSemaphoreTake(s_done, 0) != pdTRUE) return ESP_ERR_INVALID_STATE;
+        vTaskDelete(s_task);
         s_task = NULL;
     }
 
@@ -420,6 +496,7 @@ esp_err_t memo_upload_stop(void)
         ESP_LOGW(TAG, "uploader did not stop in time");
         return ESP_ERR_TIMEOUT;
     }
+    vTaskDelete(s_task);
     s_task = NULL;
     return ESP_OK;
 }
@@ -439,7 +516,7 @@ bool memo_upload_pending(void)
             entries[i].state == MEMO_SPOOL_LEGACY_KEPT ||
             entries[i].state == MEMO_SPOOL_RECORDING || entries[i].state == MEMO_SPOOL_DRAFT) return true;
     }
-    return false;
+    return memo_spool_recovery_blocked();
 }
 
 const char *memo_upload_error(void)

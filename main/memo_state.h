@@ -12,14 +12,13 @@ typedef enum {
     MEMO_STATE_ARMING,
     MEMO_STATE_RECORDING,
     MEMO_STATE_CONFIRM,
-    MEMO_STATE_DETAIL_COLLAPSED,
-    MEMO_STATE_DETAIL_EXPANDED,
+    MEMO_STATE_AUTOSAVE,
+    MEMO_STATE_DETAIL,
     MEMO_STATE_PLAYING,
     MEMO_STATE_PAUSED,
     MEMO_STATE_SETTINGS,
     MEMO_STATE_SUB_PAGE,
     MEMO_STATE_PROVISIONING,
-    MEMO_STATE_ERROR,
     MEMO_STATE_UPLOAD_REJECTED,
     MEMO_STATE_COUNT,
 } memo_state_t;
@@ -48,15 +47,12 @@ typedef enum {
     MEMO_ACT_CANCEL_ARMING,
     MEMO_ACT_BEGIN_RECORDING,
     MEMO_ACT_STOP_AND_SAVE,
-    MEMO_ACT_CANCEL_RECORDING,
     MEMO_ACT_CONFIRM_TOGGLE,
     MEMO_ACT_CONFIRM_SAVE,
     MEMO_ACT_CONFIRM_CANCEL,
-    MEMO_ACT_EXPAND,
     MEMO_ACT_PLAY,
     MEMO_ACT_PAUSE,
     MEMO_ACT_RESUME,
-    MEMO_ACT_STOP_PLAYBACK,
     MEMO_ACT_OPEN_SETTINGS,
     MEMO_ACT_SETTINGS_PREV,
     MEMO_ACT_SETTINGS_NEXT,
@@ -66,11 +62,10 @@ typedef enum {
     MEMO_ACT_SUB_PAGE_SAVE,
     MEMO_ACT_SUB_PAGE_CANCEL,
     MEMO_ACT_CANCEL_PROVISIONING,
-    MEMO_ACT_DISMISS_ERROR,
-    MEMO_ACT_NEXT_MEMO,
-    MEMO_ACT_PREV_MEMO,
-    MEMO_ACT_SCROLL_UP,
-    MEMO_ACT_SCROLL_DOWN,
+    MEMO_ACT_VOLUME_UP,
+    MEMO_ACT_VOLUME_DOWN,
+    MEMO_ACT_DETAIL_PREV,
+    MEMO_ACT_DETAIL_NEXT,
     MEMO_ACT_REJECT_TOGGLE,
     MEMO_ACT_REJECT_RETRY,
     MEMO_ACT_REJECT_DELETE,
@@ -79,15 +74,13 @@ typedef enum {
 
 typedef struct {
     memo_state_t state;
-    /* Latches the "expanded once" rule: returning from detail resets it. */
-    bool expanded;
     /* 录音结束后的选择条当前落在"保存"(true)还是"取消"(false)。 */
     bool confirm_save;
     bool reject_delete; /* Destructive choice is never the default. */
 } memo_sm_t;
 
-/* 圆环从"按下"开始填，填满即开始录音；手指仍按着，所以这是一个动作。
-   这个值只算一次：长按判定(500 ms)与它不叠加。 */
+/* Capture starts after at least one second and resource readiness. A short
+   initial interval stays on the list; preparation has an animated screen. */
 #define MEMO_ARMING_MS 1000
 
 /* A single memo is capped here; the UI warns from 4:30 and stops at 5:00. */

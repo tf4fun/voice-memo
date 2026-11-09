@@ -22,10 +22,11 @@ type Config struct {
 	MaxBytes  int64
 	MaxMemoMS int64
 
-	// RetentionDays of 0 keeps memos forever.
+	// RetentionDays must be zero: automatic recording deletion is unsupported.
 	RetentionDays int
 
-	MDNSName string
+	MDNSName      string
+	MDNSInterface string
 
 	ASR ASRConfig
 }
@@ -42,7 +43,7 @@ type ASRConfig struct {
 // DBPath is where the SQLite file lives inside the data directory.
 func (c Config) DBPath() string { return filepath.Join(c.DataDir, "memo.db") }
 
-// AudioDir is where decoded WAV files are stored.
+// AudioDir stores original MEMO containers.
 func (c Config) AudioDir() string { return filepath.Join(c.DataDir, "audio") }
 
 // IncomingDir holds partial uploads.
@@ -52,11 +53,12 @@ func (c Config) IncomingDir() string { return filepath.Join(c.DataDir, "incoming
 // mutate the process environment.
 func Load(getenv func(string) string) (Config, error) {
 	c := Config{
-		Addr:      value(getenv, "MEMO_ADDR", ":8080"),
-		DataDir:   value(getenv, "MEMO_DATA_DIR", "./data"),
-		MDNSName:  value(getenv, "MEMO_MDNS_NAME", ""),
-		MaxBytes:  32 << 20,
-		MaxMemoMS: 5 * 60 * 1000,
+		Addr:          value(getenv, "MEMO_ADDR", ":8080"),
+		DataDir:       value(getenv, "MEMO_DATA_DIR", "./data"),
+		MDNSName:      value(getenv, "MEMO_MDNS_NAME", ""),
+		MDNSInterface: value(getenv, "MEMO_MDNS_INTERFACE", ""),
+		MaxBytes:      32 << 20,
+		MaxMemoMS:     5 * 60 * 1000,
 		ASR: ASRConfig{
 			Provider:    value(getenv, "MEMO_ASR_PROVIDER", "siliconflow"),
 			APIKey:      getenv("MEMO_ASR_API_KEY"),
@@ -79,14 +81,14 @@ func Load(getenv func(string) string) (Config, error) {
 	if c.ASR.Concurrency, err = parseInt(getenv, "MEMO_ASR_CONCURRENCY", 1); err != nil {
 		return Config{}, err
 	}
-	if c.ASR.Concurrency < 1 {
-		return Config{}, fmt.Errorf("MEMO_ASR_CONCURRENCY must be at least 1")
+	if c.ASR.Concurrency < 1 || c.ASR.Concurrency > 4 {
+		return Config{}, fmt.Errorf("MEMO_ASR_CONCURRENCY must be between 1 and 4")
 	}
 	if c.RetentionDays, err = parseInt(getenv, "MEMO_RETENTION_DAYS", 0); err != nil {
 		return Config{}, err
 	}
-	if c.RetentionDays < 0 {
-		return Config{}, fmt.Errorf("MEMO_RETENTION_DAYS must not be negative")
+	if c.RetentionDays != 0 {
+		return Config{}, fmt.Errorf("MEMO_RETENTION_DAYS must be 0; automatic recording deletion is unsupported")
 	}
 	if c.MDNSName == "" {
 		host, err := os.Hostname()

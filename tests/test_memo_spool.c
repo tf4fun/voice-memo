@@ -9,11 +9,23 @@ static char *spool_root;
 #define CONFIG_SPIFFS_OBJ_NAME_LEN 48
 #include "../main/memo_spool.c"
 
+static int mount_failures, formats;
+static bool erased, read_failed;
+const esp_partition_t *esp_partition_find_first(int type, int subtype, const char *label)
+{ (void)type; (void)subtype; assert(strcmp(label, "memo") == 0);
+  static const esp_partition_t partition = {.size = 1031}; return &partition; }
+esp_err_t esp_partition_read(const esp_partition_t *p, size_t off, void *out, size_t len)
+{ assert(off + len <= p->size); memset(out, 0xff, len);
+  if (!erased && off + len == p->size) ((uint8_t *)out)[len - 1] = 0;
+  return read_failed ? ESP_FAIL : ESP_OK; }
+esp_err_t esp_spiffs_format(const char *label)
+{ assert(strcmp(label, "memo") == 0 && erased && !read_failed); formats++; return ESP_OK; }
 esp_err_t esp_vfs_spiffs_register(const esp_vfs_spiffs_conf_t *conf)
 {
     assert(strcmp(conf->base_path, spool_root) == 0);
     assert(strcmp(conf->partition_label, "memo") == 0);
-    return ESP_OK;
+    assert(!conf->format_if_mount_failed);
+    return mount_failures-- > 0 ? ESP_FAIL : ESP_OK;
 }
 esp_err_t esp_spiffs_info(const char *label, size_t *total, size_t *used)
 { (void)label; *total = 1048576; *used = 0; return ESP_OK; }
@@ -22,7 +34,14 @@ int main(void)
 {
     char directory[] = "/tmp/ms.XXXXXX";
     spool_root = mkdtemp(directory);
-    assert(spool_root != NULL && memo_spool_mount() == ESP_OK);
+    assert(spool_root != NULL);
+    mount_failures = 1;
+    assert(memo_spool_mount() == ESP_FAIL && formats == 0 && memo_spool_recovery_blocked());
+    erased = true; read_failed = true; mount_failures = 1;
+    assert(memo_spool_mount() == ESP_FAIL && formats == 0 && memo_spool_recovery_blocked());
+    read_failed = false; mount_failures = 1;
+    assert(memo_spool_mount() == ESP_OK && formats == 1 && !memo_spool_recovery_blocked());
+    assert(memo_spool_mount() == ESP_OK && formats == 1);
     const char *id = "00000000-0000-4000-8000-000000000001";
     memo_container_header_t header = {
         .sample_rate=16000, .channels=1, .frame_ms=60, .recorded_at=1700000000,
@@ -31,6 +50,15 @@ int main(void)
     uint8_t raw[80];
     memo_container_encode(&header, raw);
     void *file;
+    assert(memo_spool_create(id, raw, &file) == ESP_OK);
+    assert(memo_spool_discard(file,id)==ESP_OK && memo_spool_scan(NULL,0)==0);
+    assert(memo_spool_discard(NULL,id)==ESP_OK); // Cancel is idempotent after deletion.
+    char blocked[64];path_for(blocked,sizeof(blocked),id,MEMO_SPOOL_RECORDING);
+    assert(mkdir(blocked,0700)==0);
+    char child[80];snprintf(child,sizeof(child),"%s/child",blocked);
+    FILE *blocker=fopen(child,"wb");assert(blocker);assert(fclose(blocker)==0);
+    assert(memo_spool_discard(NULL,id)==ESP_FAIL); // Never report failed removal as success.
+    assert(remove(child)==0 && rmdir(blocked)==0);
     assert(memo_spool_create(id, raw, &file) == ESP_OK);
     const uint8_t packet[] = {1, 0, 42};
     assert(memo_spool_append(file, packet, sizeof(packet)) == ESP_OK);
@@ -121,6 +149,31 @@ int main(void)
     assert(remove(collision) == 0); /* Explicit fixture cleanup. */
     assert(memo_spool_recover() == 1 && !memo_spool_recovery_blocked());
     assert(memo_spool_remove(id, MEMO_SPOOL_DRAFT) == ESP_OK);
+    // Legacy acknowledged files must not hide the single unresolved recording
+    // beyond a bounded display/worker snapshot.
+    char sent[80];
+    for(unsigned i=0;i<20;i++){
+        snprintf(sent,sizeof(sent),"%s/00000000-0000-4000-8000-%012u.sent",spool_root,i+100);
+        FILE *old=fopen(sent,"wb");assert(old && fputc(0,old)!=EOF && fclose(old)==0);
+    }
+    assert(memo_spool_create(id,raw,&file)==ESP_OK);
+    assert(memo_spool_append(file,packet,sizeof(packet))==ESP_OK);
+    assert(memo_spool_scan(&e,1)==21 && e.state==MEMO_SPOOL_RECORDING);
+    assert(memo_spool_recover()==1 && !memo_spool_recovery_blocked());
+    assert(memo_spool_scan(&e,1)==21 && e.state==MEMO_SPOOL_DRAFT);
+    assert(memo_spool_move(id,MEMO_SPOOL_DRAFT,MEMO_SPOOL_PENDING)==ESP_OK);
+    assert(memo_spool_scan(&e,1)==21 && e.state==MEMO_SPOOL_PENDING);
+    assert(memo_spool_remove(id,MEMO_SPOOL_PENDING)==ESP_OK);
+    for(unsigned i=0;i<20;i++){
+        snprintf(sent,sizeof(sent),"%s/00000000-0000-4000-8000-%012u.sent",spool_root,i+100);
+        assert(remove(sent)==0); // Only this test's fixtures.
+    }
+    char absent[80];snprintf(absent,sizeof(absent),"%s/missing",spool_root);
+    char *valid_root=spool_root;spool_root=absent;
+    assert(memo_spool_scan(&e,1)==0 && memo_spool_recovery_blocked());
+    spool_root=valid_root;
+    assert(memo_spool_create(id,raw,&file)==ESP_ERR_INVALID_STATE);
+    assert(memo_spool_recover()==0 && !memo_spool_recovery_blocked());
     assert(rmdir(spool_root) == 0);
     puts("memo spool retry/legacy/metadata/audio preservation: PASS");
     return 0;

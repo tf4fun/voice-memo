@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/tf4fun/voice-memo/server/internal/config"
+	"github.com/tf4fun/voice-memo/server/internal/events"
 	"github.com/tf4fun/voice-memo/server/internal/store"
 )
 
@@ -231,6 +232,50 @@ func TestListDetailPatchDelete(t *testing.T) {
 	}
 }
 
+func TestDeleteRetriesAudioRemovalFailure(t *testing.T) {
+	env := newEnv(t)
+	ctx := t.Context()
+	id := "12345678-1234-4234-8234-123456789abc"
+	if rec := env.upload(t, id); rec.Code != http.StatusCreated {
+		t.Fatalf("upload: %d", rec.Code)
+	}
+	memo, err := env.store.Memo(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A nonempty directory makes removal fail on every host platform.
+	if err := os.Remove(memo.AudioPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(memo.AudioPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	blocker := filepath.Join(memo.AudioPath, "blocker")
+	if err := os.WriteFile(blocker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if rec := env.do(t, http.MethodDelete, "/api/v1/memos/"+id, nil, nil); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("failed removal status=%d, want 500", rec.Code)
+	}
+	if rec := env.do(t, http.MethodGet, "/api/v1/memos/"+id, nil, nil); rec.Code != http.StatusNotFound {
+		t.Fatalf("deleted metadata visible: %d", rec.Code)
+	}
+	if depth, err := env.store.QueueDepth(ctx); err != nil || depth != 0 {
+		t.Fatalf("deleted job remained: %d %v", depth, err)
+	}
+	if err := os.Remove(blocker); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if rec := env.do(t, http.MethodDelete, "/api/v1/memos/"+id, nil, nil); rec.Code != http.StatusNoContent {
+			t.Fatalf("delete retry %d: %d", i, rec.Code)
+		}
+	}
+	if _, err := os.Stat(memo.AudioPath); !os.IsNotExist(err) {
+		t.Fatalf("audio remains after retry: %v", err)
+	}
+}
+
 func TestPatchRejectsUnknownFields(t *testing.T) {
 	env := newEnv(t)
 	id := "77777777-7777-4777-8777-777777777777"
@@ -445,5 +490,59 @@ func TestUploadChecksDurationAndCount(t *testing.T) {
 				t.Fatalf("queue: %d %v", n, err)
 			}
 		})
+	}
+}
+
+func TestManagementMutationsNotifyIncludingEmptyTextAndDelete(t *testing.T) {
+	env := newEnv(t)
+	hub := events.NewHub()
+	ch, cancel := hub.Subscribe()
+	defer cancel()
+	env.handler = NewWithEvents(env.store, config.Config{DataDir: env.dataDir, MaxBytes: 32 << 20, MaxMemoMS: 300000}, slog.Default(), hub)
+	id := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	if rec := env.upload(t, id); rec.Code != 201 {
+		t.Fatal(rec.Code, rec.Body)
+	}
+	if ev := <-ch; ev.ID != id || ev.Status != "uploaded" {
+		t.Fatal(ev)
+	}
+	if rec := env.do(t, http.MethodPatch, "/api/v1/memos/"+id, []byte(`{"transcript":""}`), nil); rec.Code != 200 {
+		t.Fatal(rec.Code, rec.Body)
+	}
+	if ev := <-ch; ev.ID != id || ev.Status != "ready" || ev.Snippet != "" {
+		t.Fatal(ev)
+	}
+	if rec := env.do(t, http.MethodPost, "/api/v1/memos/"+id+"/transcribe", nil, nil); rec.Code != 202 {
+		t.Fatal(rec.Code, rec.Body)
+	}
+	if ev := <-ch; ev.ID != id || ev.Status != "uploaded" {
+		t.Fatal(ev)
+	}
+	if rec := env.do(t, http.MethodDelete, "/api/v1/memos/"+id, nil, nil); rec.Code != 204 {
+		t.Fatal(rec.Code, rec.Body)
+	}
+	if ev := <-ch; ev.ID != id || ev.Type != "deleted" {
+		t.Fatal(ev)
+	}
+}
+
+func TestReplayOfDeletedIDIsTerminalAndDoesNotRecreateAudio(t *testing.T) {
+	env := newEnv(t)
+	id := "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+	if rec := env.upload(t, id); rec.Code != 201 {
+		t.Fatal(rec.Code, rec.Body)
+	}
+	if rec := env.do(t, http.MethodDelete, "/api/v1/memos/"+id, nil, nil); rec.Code != 204 {
+		t.Fatal(rec.Code, rec.Body)
+	}
+	if rec := env.upload(t, id); rec.Code != http.StatusGone {
+		t.Fatalf("deleted replay: %d %s", rec.Code, rec.Body)
+	}
+	if n, err := env.store.QueueDepth(t.Context()); err != nil || n != 0 {
+		t.Fatal(n, err)
+	}
+	entries, err := os.ReadDir(filepath.Join(env.dataDir, "incoming"))
+	if err != nil || len(entries) != 0 {
+		t.Fatal(entries, err)
 	}
 }

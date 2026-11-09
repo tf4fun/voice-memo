@@ -13,8 +13,7 @@ int main(void)
             assert(layout.x >= 8 && layout.x + layout.width + 3 <= 232);
             assert(layout.title_y + body < layout.message_y);
             assert(layout.message_y + 3 * label < layout.options_y);
-            assert(layout.options_y + body < layout.hint_y);
-            assert(layout.hint_y + label < layout.height - 2);
+            assert(layout.options_y + body < layout.height - 2);
         }
     }
     assert(!memo_rejection_layout(240, 320, 0, 38, &layout));

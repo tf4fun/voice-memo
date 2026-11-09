@@ -13,13 +13,14 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/tf4fun/voice-memo/server/internal/asr"
 	"github.com/tf4fun/voice-memo/server/internal/config"
-	"github.com/tf4fun/voice-memo/server/internal/events"
 	"github.com/tf4fun/voice-memo/server/internal/discovery"
+	"github.com/tf4fun/voice-memo/server/internal/events"
 	"github.com/tf4fun/voice-memo/server/internal/httpapi"
 	"github.com/tf4fun/voice-memo/server/internal/jobs"
 	"github.com/tf4fun/voice-memo/server/internal/store"
@@ -94,13 +95,20 @@ func serve(args []string) error {
 	handler := httpapi.NewWithEvents(st, cfg, logger, hub)
 
 	runCtx, stopWorkers := context.WithCancel(context.Background())
-	defer stopWorkers()
-	go (&jobs.Runner{Store: st, Transcriber: transcriber, Log: logger, Events: hub}).Run(runCtx)
+	workersDone := make(chan struct{})
+	go func() {
+		defer close(workersDone)
+		(&jobs.Runner{Store: st, Transcriber: transcriber, Log: logger, Events: hub}).RunPool(runCtx, cfg.ASR.Concurrency)
+	}()
+	defer func() { stopWorkers(); <-workersDone }()
 
 	port := listenPort(cfg.Addr)
-	publisher, err := discovery.Advertise(cfg.MDNSName, port, logger)
-	if err != nil {
-		logger.Warn("mDNS advertisement unavailable", "error", err)
+	var publisher *discovery.Publisher
+	if shouldAdvertiseLAN(cfg.Addr) {
+		publisher, err = discovery.Advertise(cfg.MDNSName, port, cfg.MDNSInterface, logger)
+		if err != nil {
+			logger.Warn("mDNS advertisement unavailable", "error", err)
+		}
 	}
 	defer publisher.Close()
 
@@ -108,6 +116,7 @@ func serve(args []string) error {
 		Addr:              cfg.Addr,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       120 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 
@@ -141,23 +150,38 @@ func serve(args []string) error {
 
 func gc(args []string) error {
 	fs := flag.NewFlagSet("gc", flag.ContinueOnError)
+	apply := fs.Bool("apply", false, "remove listed stale unreferenced files (default dry run)")
+	age := fs.Duration("older-than", 24*time.Hour, "minimum file age, at least 24h")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-
-	cfg, err := config.Load(os.Getenv)
-	if err != nil {
-		return err
+	if fs.NArg() != 0 {
+		return fmt.Errorf("gc: unexpected positional arguments")
 	}
-	st, err := store.Open(cfg.DataDir)
+	if *age < 24*time.Hour {
+		return fmt.Errorf("gc: older-than must be at least 24h")
+	}
+	dataDir := strings.TrimSpace(os.Getenv("MEMO_DATA_DIR"))
+	if dataDir == "" {
+		dataDir = "./data"
+	}
+	st, err := store.Open(dataDir)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-
-	// Milestone M1 fills this in: stale partial uploads, orphaned files and
-	// expired rows. Until then it only proves the store opens.
-	fmt.Println("gc: nothing to do yet (sweeping arrives in M1)")
+	files, err := st.GarbageCollect(context.Background(), time.Now().Add(-*age), *apply)
+	if err != nil {
+		return err
+	}
+	mode := "dry-run"
+	if *apply {
+		mode = "removed"
+	}
+	for _, path := range files {
+		fmt.Printf("gc %s: %s\n", mode, path)
+	}
+	fmt.Printf("gc %s: %d files; referenced audio and rejected recordings retained\n", mode, len(files))
 	return nil
 }
 
@@ -176,6 +200,23 @@ func newTranscriber(cfg config.Config, log *slog.Logger) (asr.Transcriber, error
 	default:
 		return nil, fmt.Errorf("unknown ASR provider %q", cfg.ASR.Provider)
 	}
+}
+
+// shouldAdvertiseLAN excludes loopback-only development/test listeners. They
+// cannot serve devices, and their advertisements can replace live LAN records.
+func shouldAdvertiseLAN(address string) bool {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSuffix(host, "."), "localhost") {
+		return false
+	}
+	if zone := strings.LastIndex(host, "%"); zone >= 0 {
+		host = host[:zone]
+	}
+	ip := net.ParseIP(host)
+	return ip == nil || !ip.IsLoopback()
 }
 
 // listenPort extracts the port from a host:port listen address.

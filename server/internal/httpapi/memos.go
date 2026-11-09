@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"hash/fnv"
 	"io"
 	"net/http"
@@ -165,6 +166,14 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if deleted, err := s.store.MemoDeleted(ctx, memoID); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "lookup failed")
+		return
+	} else if deleted {
+		writeError(w, http.StatusGone, "deleted", "memo ID was explicitly deleted")
+		return
+	}
+
 	if err := os.MkdirAll(s.cfg.IncomingDir(), 0o755); err != nil {
 		s.log.Error("upload: create incoming dir", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal", "storage unavailable")
@@ -266,11 +275,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dir, dirErr := os.Open(filepath.Dir(audioPath))
-	if dirErr == nil {
-		dirErr = dir.Sync()
-		_ = dir.Close()
-	}
+	dirErr := syncAudioDirectories(filepath.Dir(audioPath), s.cfg.DataDir)
 	if dirErr != nil {
 		_ = os.Remove(audioPath)
 		writeError(w, http.StatusInternalServerError, "internal", "storage sync failed")
@@ -304,6 +309,10 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	if !created {
 		os.Remove(audioPath)
 		existing, err := s.store.Memo(ctx, memoID)
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusGone, "deleted", "memo ID was explicitly deleted")
+			return
+		}
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "internal", "lookup failed")
 			return
@@ -349,11 +358,11 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		limit = parsed
 	}
 
-	memos, next, err := s.store.ListMemos(r.Context(), limit,
-		r.URL.Query().Get("cursor"), r.URL.Query().Get("device"))
+	page, err := s.store.ListMemoPage(r.Context(), limit,
+		r.URL.Query().Get("cursor"), r.URL.Query().Get("device"), r.URL.Query().Get("direction"))
 	if err != nil {
-		if strings.Contains(err.Error(), "invalid cursor") {
-			writeError(w, http.StatusBadRequest, "invalid_json", "invalid cursor")
+		if strings.Contains(err.Error(), "invalid cursor") || strings.Contains(err.Error(), "invalid direction") {
+			writeError(w, http.StatusBadRequest, "invalid_json", "invalid pagination")
 			return
 		}
 		s.log.Error("list: query", "error", err)
@@ -361,11 +370,11 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	items := make([]memoJSON, 0, len(memos))
-	for _, m := range memos {
+	items := make([]memoJSON, 0, len(page.Items))
+	for _, m := range page.Items {
 		items = append(items, listJSON(m))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items, "next_cursor": next})
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "next_cursor": page.Next, "previous_cursor": page.Previous})
 }
 
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
@@ -432,6 +441,8 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal", "query failed")
 		return
 	}
+	s.events.Publish(events.Event{Type: "memo", ID: updated.ID, Status: updated.Status,
+		Snippet: updated.Snippet(40), RecordedAt: updated.RecordedAt, DurationMS: updated.DurationMS})
 	writeJSON(w, http.StatusOK, detailJSON(updated))
 }
 
@@ -450,8 +461,14 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	if path != "" {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			s.log.Warn("delete: audio file", "path", path, "error", err)
+			// Metadata is already hidden. Publish that change, but let the
+			// caller retry DELETE until the file cleanup really succeeds.
+			s.events.Publish(events.Event{Type: "deleted", ID: r.PathValue("id")})
+			writeError(w, http.StatusInternalServerError, "internal", "audio removal failed; retry deletion")
+			return
 		}
 	}
+	s.events.Publish(events.Event{Type: "deleted", ID: r.PathValue("id")})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -498,14 +515,12 @@ func (s *Server) handleTranscribe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.store.SetStatus(ctx, id, domain.StatusUploaded, ""); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "update failed")
+	if err := s.store.RequeueMemo(ctx, id, time.Now().Unix()); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "requeue failed")
 		return
 	}
-	if err := s.store.EnqueueJob(ctx, id, time.Now().Unix()); err != nil {
-		writeError(w, http.StatusInternalServerError, "internal", "enqueue failed")
-		return
-	}
+
+	s.events.Publish(events.Event{Type: "memo", ID: id, Status: domain.StatusUploaded})
 	writeJSON(w, http.StatusAccepted, map[string]any{"id": id, "status": domain.StatusUploaded})
 }
 
@@ -525,4 +540,39 @@ func abs(v int64) int64 {
 		return -v
 	}
 	return v
+}
+
+// New device/month directories need their parent entries synced too, before
+// acknowledging an upload and allowing the device to delete its only copy.
+func syncAudioDirectories(directory, root string) error {
+	directory, err := filepath.Abs(directory)
+	if err != nil {
+		return err
+	}
+	root, err = filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	relative, err := filepath.Rel(root, directory)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+		return fmt.Errorf("audio directory escapes data root")
+	}
+	for {
+		dir, err := os.Open(directory)
+		if err != nil {
+			return err
+		}
+		syncErr := dir.Sync()
+		closeErr := dir.Close()
+		if syncErr != nil {
+			return syncErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if directory == root {
+			return nil
+		}
+		directory = filepath.Dir(directory)
+	}
 }

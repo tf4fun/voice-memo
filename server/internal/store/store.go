@@ -70,7 +70,7 @@ func (s *Store) configure() error {
 
 	for _, pragma := range []string{
 		"PRAGMA journal_mode = WAL",
-		"PRAGMA synchronous = NORMAL",
+		"PRAGMA synchronous = FULL",
 		"PRAGMA foreign_keys = ON",
 		"PRAGMA busy_timeout = 5000",
 	} {

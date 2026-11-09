@@ -12,23 +12,24 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 typedef struct {
-    // armed 跨 main 任务与按键回调的 esp_timer 任务读写,标 volatile 以防被缓存。
-    volatile bool armed;
+    // Publish boot-time deadline before the timer task can observe arming.
+    atomic_bool armed;
     int64_t deadline_us;
 } key_guard_t;
 
 // 按键唤醒启动时武装。timeout_us 只作为按键卡住时的兜底。
 static inline void key_guard_arm(key_guard_t *g, int64_t now_us, int64_t timeout_us) {
-    g->armed = true;
     g->deadline_us = now_us + timeout_us;
+    atomic_store_explicit(&g->armed, true, memory_order_release);
 }
 
 // 每收到一个按键事件调一次。返回 true 表示该事件应被吞掉(不派发给应用),
 // false 表示正常派发。release 事件或到期会就地撤防,但那次事件仍被吞掉。
 static inline bool key_guard_consume(key_guard_t *g, bool is_release, int64_t now_us) {
-    if (!g->armed) return false;
+    if (!atomic_load_explicit(&g->armed, memory_order_acquire)) return false;
     if (is_release || now_us >= g->deadline_us) {
         g->armed = false;
     }

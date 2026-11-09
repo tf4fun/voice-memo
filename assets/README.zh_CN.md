@@ -15,6 +15,35 @@
 - 添加字库前评估 Flash 与内部 RAM 影响；ESP32-C3 无 PSRAM。
 - 不提交许可不允许分发的字库。
 
+### 语音日记字体
+
+应用嵌入 `fonts/memo_font_16.c`（16 px 粗体）和 `fonts/memo_font_20.c`（20 px 常规），
+来自 [Noto Sans SC 2.004](https://github.com/notofonts/noto-cjk/tree/Sans2.004)。
+版权为 2014–2021 Adobe。字体软件使用 SIL OFL 1.1；分发字体资产时保留
+[OFL.txt](fonts/OFL.txt) 和 [NOTICE.txt](fonts/NOTICE.txt)，该许可与应用代码许可独立。
+
+[manifest.json](fonts/manifest.json) 固定官方来源 URL/SHA-256、`lv_font_conv` 1.5.2、
+输出指标和生成 C 有效载荷哈希。[charset.txt](fonts/charset.txt) 保存原始请求的 4013 个码点：
+GB2312 一级汉字 3755 个、ASCII 及标点/全角形式。两套 cmap 实际各含 4012 个码点；
+未分配的 U+FF00 没有源字形，不属于支持的文本集。生成行高为 31/38 px，并非名义字号，
+UI 布局测试使用这些实际指标。
+
+具备 Node/npm 与 Python 后，从仓库根目录执行：
+
+```bash
+npm install --prefix bin/lvfont --no-audit --no-fund lv_font_conv@1.5.2
+python3 tools/generate_memo_fonts.py --fetch --check
+```
+
+源字体缓存在忽略跟踪的 `bin/fonts` 下，下载后校验哈希；已有不匹配文件会保留。
+`--check` 只写临时文件，逐字节重现位图/指标/cmap 有效载荷，不比较含本地路径的开头 CLI 注释。
+`--write` 才明确替换生成 C 文件。两者均使用 4 bpp、无压缩 LVGL 输出；通过
+`main/CMakeLists.txt` 编译维护的位图资产，设备不把 OTF 加载到 RAM。
+
+所有静态 UI 文字同时检查两套 cmap。动态文字使用对应字号及 Montserrat 回退；不支持的 Unicode
+或非法字节序列显示 `?`，保留支持的文字和 UTF-8 边界。服务器原文及字节偏移不变。
+宿主覆盖策略不代表真实设备渲染或峰值 RAM 已验证。
+
 ## 图片（images）
 
 可复用的源图与生成的显示资产放在 `images/`。
@@ -55,3 +84,17 @@ BSP 在 `components/bsp/src/bsp_battery.c` 中嵌入这 80 字节，主机检查
 `fa7365671093ef449c5bdcfb4adb279e3d275f888109f50b6b2f21e9b96220d5`。
 这是电量计参数，不是充电配置，也不能通用于所有 500 mAh 电芯；详见
 [硬件指南](../docs/hardware-design/AI_HARDWARE_DEVELOPMENT_GUIDE.zh_CN.md#9-cw2017-电池计)。
+
+
+## 终端 ASCII 字体
+
+`fonts/memo_font_terminal.c` 提供真实的 8 px 固定字宽和 18 px 行高。它仅将 LVGL Unscii-8 的
+位图行纵向重复，保持横向像素与字距不变。内置 Unscii-16 的字宽实际是 16 px，不能作为
+8 px 列宽字体。覆盖 ASCII U+0020..U+007F，中文继续使用原有 Noto 子集。
+
+固定输入 `fonts/source/lvgl_unscii_8.c` 为项目 LVGL 组件的未修改副本，SHA-256：
+`bd95b245eaea139aa7c4d9efbc130cc8eda4c11dc7a22b42048a7f0d814e29bf`。
+LVGL 源码及派生字体保留 [`fonts/LICENSE.lvgl.txt`](fonts/LICENSE.lvgl.txt) 中的 MIT 声明，
+与 Noto 的 OFL 分开。原路径为 LVGL `src/font/lv_font_unscii_8.c`，组件版本固定在
+`dependencies.lock`。离线重建：`python3 tools/generate_memo_terminal.py`，加 `--check` 验证。
+CMake 只编译派生字体；宽度检查读取实际生成的 advance，主机对象测试不代表实机光栅效果。

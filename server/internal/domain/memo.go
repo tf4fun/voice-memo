@@ -80,15 +80,15 @@ var (
 
 // Header is the parsed container header.
 type Header struct {
-	Version     uint8
-	Codec       uint8
-	SampleRate  uint16
-	Channels    uint8
-	FrameMS     uint8
-	DurationMS  uint32
-	RecordedAt  int64
-	MemoID      string
-	FrameCount  uint32
+	Version    uint8
+	Codec      uint8
+	SampleRate uint16
+	Channels   uint8
+	FrameMS    uint8
+	DurationMS uint32
+	RecordedAt int64
+	MemoID     string
+	FrameCount uint32
 }
 
 // ParseHeader reads and validates the 80-byte header. It does not read frames.

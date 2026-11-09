@@ -2,18 +2,24 @@
 #include "memo_discovery.h"
 
 #include <string.h>
+#include <stdio.h>
+#include <stdatomic.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #include "esp_log.h"
 #include "mdns.h"
 
 static const char *TAG = "memo_disc";
 
-static volatile memo_discovery_state_t s_state = MEMO_DISCOVERY_IDLE;
+static _Atomic memo_discovery_state_t s_state = MEMO_DISCOVERY_IDLE;
 static char s_host[64];
 static uint16_t s_port;
 static bool s_ready;
+static SemaphoreHandle_t s_lock, s_address_lock;
+static uint32_t s_generation;
 
-esp_err_t memo_discovery_init(void)
+static esp_err_t init_locked(void)
 {
     if (s_ready) return ESP_OK;
 
@@ -26,16 +32,20 @@ esp_err_t memo_discovery_init(void)
     return ESP_OK;
 }
 
-esp_err_t memo_discovery_search(uint32_t timeout_ms)
+static esp_err_t search_locked(uint32_t timeout_ms)
 {
     if (!s_ready) {
-        esp_err_t err = memo_discovery_init();
+        esp_err_t err = init_locked();
         if (err != ESP_OK) return err;
     }
 
+    char host[64] = {0};
+    uint16_t port = 0;
+    xSemaphoreTake(s_address_lock, portMAX_DELAY);
+    s_generation++;
     s_state = MEMO_DISCOVERY_SEARCHING;
-    s_host[0] = '\0';
-    s_port = 0;
+    s_host[0] = '\0'; s_port = 0;
+    xSemaphoreGive(s_address_lock);
 
     mdns_result_t *results = NULL;
     esp_err_t err = mdns_query_ptr(MEMO_DISCOVERY_SERVICE, MEMO_DISCOVERY_PROTO,
@@ -58,18 +68,18 @@ esp_err_t memo_discovery_search(uint32_t timeout_ms)
                  r->addr != NULL ? "yes" : "no");
 
         if (r->addr != NULL && r->addr->addr.type == ESP_IPADDR_TYPE_V4) {
-            snprintf(s_host, sizeof(s_host), IPSTR, IP2STR(&r->addr->addr.u_addr.ip4));
-            s_port = r->port;
+            snprintf(host, sizeof(host), IPSTR, IP2STR(&r->addr->addr.u_addr.ip4));
+            port = r->port;
             break;
         }
         /* TXT 里的 ip= 是最后一道保险：某些 mDNS 客户端拿不到 SRV 目标。 */
-        if (s_host[0] == '\0' && r->txt_count > 0) {
+        if (host[0] == '\0' && r->txt_count > 0) {
             for (size_t i = 0; i < r->txt_count; i++) {
                 if (r->txt[i].key != NULL && strcmp(r->txt[i].key, "ip") == 0 &&
                     r->txt[i].value != NULL) {
-                    strncpy(s_host, r->txt[i].value, sizeof(s_host) - 1);
-                    s_port = r->port;
-                    ESP_LOGI(TAG, "address from TXT: %s:%u", s_host, (unsigned)s_port);
+                    strncpy(host, r->txt[i].value, sizeof(host) - 1);
+                    port = r->port;
+                    ESP_LOGI(TAG, "address from TXT: %s:%u", host, (unsigned)port);
                     break;
                 }
             }
@@ -80,53 +90,61 @@ esp_err_t memo_discovery_search(uint32_t timeout_ms)
         if (hostname[0] == '\0' && r->hostname != NULL) {
             strncpy(hostname, r->hostname, sizeof(hostname) - 1);
         }
-        if (s_port == 0 && r->port != 0) s_port = r->port;
+        if (port == 0 && r->port != 0) port = r->port;
     }
     mdns_query_results_free(results);
 
     /* 兜底：用实例名查 SRV 拿主机名与端口，再查 A 记录拿 IPv4。 */
-    if (s_host[0] == '\0' && instance[0] != '\0') {
+    if (host[0] == '\0' && instance[0] != '\0') {
         mdns_result_t *srv = NULL;
         if (mdns_query_srv(instance, MEMO_DISCOVERY_SERVICE, MEMO_DISCOVERY_PROTO, 2000,
                            &srv) == ESP_OK && srv != NULL) {
             if (srv->hostname != NULL) {
                 strncpy(hostname, srv->hostname, sizeof(hostname) - 1);
             }
-            if (srv->port != 0) s_port = srv->port;
+            if (srv->port != 0) port = srv->port;
             mdns_query_results_free(srv);
-            ESP_LOGI(TAG, "srv: host=%s port=%u", hostname, (unsigned)s_port);
+            ESP_LOGI(TAG, "srv: host=%s port=%u", hostname, (unsigned)port);
         }
     }
-    if (s_host[0] == '\0' && hostname[0] != '\0' && s_port != 0) {
+    if (host[0] == '\0' && hostname[0] != '\0' && port != 0) {
         esp_ip4_addr_t addr = {0};
         if (mdns_query_a(hostname, 2000, &addr) == ESP_OK) {
-            snprintf(s_host, sizeof(s_host), IPSTR, IP2STR(&addr));
+            snprintf(host, sizeof(host), IPSTR, IP2STR(&addr));
         } else {
             /* 名字解析不了就退回主机名，LWIP 会再走一次 mDNS 查询。 */
-            strncpy(s_host, hostname, sizeof(s_host) - 1);
+            strncpy(host, hostname, sizeof(host) - 1);
             ESP_LOGW(TAG, "no A record for %s, using hostname", hostname);
         }
     }
 
-    if (s_host[0] == '\0' || s_port == 0) {
+    if (host[0] == '\0' || port == 0) {
         ESP_LOGW(TAG, "service found but no usable address");
         s_state = MEMO_DISCOVERY_FAILED;
         return ESP_ERR_NOT_FOUND;
     }
 
-    s_state = MEMO_DISCOVERY_FOUND;
-    ESP_LOGI(TAG, "server at %s:%u", s_host, (unsigned)s_port);
+    xSemaphoreTake(s_address_lock, portMAX_DELAY);
+    snprintf(s_host, sizeof(s_host), "%s", host); s_port = port;
+    s_state = MEMO_DISCOVERY_CANDIDATE;
+    xSemaphoreGive(s_address_lock);
+    ESP_LOGI(TAG, "server at %s:%u", host, (unsigned)port);
     return ESP_OK;
 }
 
 void memo_discovery_stop(void)
 {
-    if (!s_ready) return;
-    mdns_free();
+    if (s_lock == NULL || s_address_lock == NULL) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (s_ready) mdns_free();
+    xSemaphoreTake(s_address_lock, portMAX_DELAY);
+    s_generation++;
     s_ready = false;
     s_state = MEMO_DISCOVERY_IDLE;
     s_host[0] = '\0';
     s_port = 0;
+    xSemaphoreGive(s_address_lock);
+    xSemaphoreGive(s_lock);
     ESP_LOGI(TAG, "released mDNS memory");
 }
 
@@ -135,12 +153,57 @@ memo_discovery_state_t memo_discovery_state(void)
     return s_state;
 }
 
-const char *memo_discovery_host(void)
+esp_err_t memo_discovery_init(void)
 {
-    return s_host;
+    /* First initialisation is owned by app_main before workers/input start. */
+    if (s_lock == NULL) s_lock = xSemaphoreCreateMutex();
+    if (s_address_lock == NULL) s_address_lock = xSemaphoreCreateMutex();
+    if (s_lock == NULL || s_address_lock == NULL) return ESP_ERR_NO_MEM;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    esp_err_t err = init_locked();
+    xSemaphoreGive(s_lock);
+    return err;
 }
 
-uint16_t memo_discovery_port(void)
+esp_err_t memo_discovery_search(uint32_t timeout_ms)
 {
-    return s_port;
+    if (s_lock == NULL || s_address_lock == NULL) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    esp_err_t err = search_locked(timeout_ms);
+    xSemaphoreGive(s_lock);
+    return err;
+}
+
+bool memo_discovery_endpoint(memo_endpoint_t *out)
+{
+    if (out == NULL || s_address_lock == NULL) return false;
+    xSemaphoreTake(s_address_lock, portMAX_DELAY);
+    bool valid = s_host[0] != '\0' && s_port != 0 &&
+                 (s_state == MEMO_DISCOVERY_CANDIDATE || s_state == MEMO_DISCOVERY_FOUND);
+    if (valid) {
+        snprintf(out->host, sizeof(out->host), "%s", s_host);
+        out->port = s_port; out->generation = s_generation;
+        out->confirmed = s_state == MEMO_DISCOVERY_FOUND;
+    }
+    xSemaphoreGive(s_address_lock);
+    return valid;
+}
+
+void memo_discovery_confirm(const memo_endpoint_t *endpoint)
+{
+    if (endpoint == NULL || s_address_lock == NULL) return;
+    xSemaphoreTake(s_address_lock, portMAX_DELAY);
+    if (endpoint->generation == s_generation && s_state == MEMO_DISCOVERY_CANDIDATE)
+        s_state = MEMO_DISCOVERY_FOUND;
+    xSemaphoreGive(s_address_lock);
+}
+
+void memo_discovery_invalidate(const memo_endpoint_t *endpoint)
+{
+    if (endpoint == NULL || s_address_lock == NULL) return;
+    xSemaphoreTake(s_address_lock, portMAX_DELAY);
+    if (endpoint->generation == s_generation) {
+        s_generation++; s_host[0] = '\0'; s_port = 0; s_state = MEMO_DISCOVERY_FAILED;
+    }
+    xSemaphoreGive(s_address_lock);
 }
