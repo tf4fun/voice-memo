@@ -25,6 +25,7 @@ type Server struct {
 	started time.Time
 	events  *events.Hub
 	uploads [64]sync.Mutex
+	wavSlot chan struct{}
 }
 
 // New builds the handler tree. Later milestones add routes here; the shape stays
@@ -39,9 +40,12 @@ func NewWithEvents(st *store.Store, cfg config.Config, log *slog.Logger, hub *ev
 	if hub == nil {
 		hub = events.NewHub()
 	}
-	s := &Server{store: st, cfg: cfg, log: log, started: time.Now(), events: hub}
+	s := &Server{store: st, cfg: cfg, log: log, started: time.Now(), events: hub, wavSlot: make(chan struct{}, 1)}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", s.handleWebList)
+	mux.HandleFunc("GET /memos/{id}", s.handleWebDetail)
+	mux.HandleFunc("GET /assets/{file}", handleWebAsset)
 	mux.HandleFunc("GET /api/v1/health", s.handleHealth)
 	mux.HandleFunc("GET /api/v1/ping", s.handlePing)
 	mux.HandleFunc("GET /api/v1/server", s.handleServerInfo)
@@ -53,10 +57,11 @@ func NewWithEvents(st *store.Store, cfg config.Config, log *slog.Logger, hub *ev
 	mux.HandleFunc("PATCH /api/v1/memos/{id}", s.handlePatch)
 	mux.HandleFunc("DELETE /api/v1/memos/{id}", s.handleDelete)
 	mux.HandleFunc("GET /api/v1/memos/{id}/audio", s.handleAudio)
+	mux.HandleFunc("GET /api/v1/memos/{id}/audio.wav", s.handleWebAudio)
 	mux.HandleFunc("GET /api/v1/memos/{id}/text", s.handleText)
 	mux.HandleFunc("POST /api/v1/memos/{id}/transcribe", s.handleTranscribe)
 
-	return s.withRecovery(s.withLogging(mux))
+	return s.withRecovery(s.withLogging(http.NewCrossOriginProtection().Handler(mux)))
 }
 
 type healthResponse struct {

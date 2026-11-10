@@ -4,7 +4,7 @@
 
 # 语音日记服务端 — 技术方案
 
-实现快照：2026-11-09。本文描述当前 Go 服务端、存储和 HTTP 协议。
+实现快照：2026-11-10。本文描述当前 Go 服务端、存储和 HTTP 协议。
 固件见[设备端方案](client.zh_CN.md)，工作和验收只在
 [里程碑](../project/milestones.zh_CN.md)中跟踪。
 
@@ -13,7 +13,8 @@
 单个 Go 进程接收录音、保存原始 Opus 容器、后台转写，向局域网客户端提供元数据和音频。
 使用 Go 1.27.3、`net/http`、`modernc.org/sqlite` SQLite、`pion/opus` 解码及
 `grandcat/zeroconf` mDNS。无需外部数据库、消息代理、ffmpeg 或 cgo。
-没有网页 UI、认证或 TLS 监听器。
+内嵌简易网页管理界面，HTTP、HTML 模板与资源嵌入仅使用 Go 标准库，配合原生 CSS/JavaScript，
+无需前端依赖包或资源构建。没有认证或 TLS 监听器。
 
 ## 2. 包结构
 
@@ -25,7 +26,7 @@
 | `internal/domain` | 记录/状态类型、容器头和帧读取器 |
 | `internal/audio` | 结构校验、Opus 解码及 WAV 输出 |
 | `internal/store` | SQLite 表结构、查询及任务持久化 |
-| `internal/httpapi` | HTTP 路由、JSON、上传、音频、SSE |
+| `internal/httpapi` | HTTP 路由、内嵌网页管理、JSON、上传、音频、SSE |
 | `internal/asr` | 转写接口、SiliconFlow 和假实现 |
 | `internal/jobs` | 有界转写任务池与确认退出 |
 | `internal/events` | 内存事件广播中心 |
@@ -106,6 +107,21 @@ TXT 包含 `ver=1`、`path=/api/v1`、`caps=opus`，`ip=` 与 A 记录使用同�
 
 ## 6. HTTP 路由
 
+同一监听端口在 `/` 提供中文管理页，每页二十条录音，支持设备筛选、游标双向翻页和空白/错误
+状态。`/memos/{id}` 展示转录、录音信息和音频播放器。原生 JavaScript 复用现有
+PATCH/DELETE/重新转写接口；破坏性操作先通过页面弹窗确认，编辑失败保留草稿，离开尚未保存
+的文字会触发浏览器提示。页面可见且未编辑时，每四秒更新待处理转写状态，过期轮询回复不能
+覆盖较新的人工修改。列表手动刷新。
+
+模板对录音文字转义，CSS/JavaScript 内嵌在 `/assets/app.css` 与 `/assets/app.js`。
+HTML 响应不缓存，并使用同源内容策略。标准库跨源保护拒绝其它来源的浏览器修改请求，
+没有浏览器来源头的设备请求仍可使用。这是请求保护，不是用户认证。
+
+浏览器播放/下载使用 `/api/v1/memos/{id}/audio.wav`，复用现有 Opus 解码器写入私密临时 WAV，
+请求结束删除，不新增 RAM 或持久化 PCM 缓存。每个进程只允许一条转换及传输并发，
+另一播放请求返回 503 与 `Retry-After: 2`。转换检查取消并按帧推导大小限制 PCM 输出，保留
+容器声明时长的容差。WAV 支持 HEAD/Range 且不缓存；原 `/audio` 仍向设备提供 MEMO 字节。
+
 下表路径统一带 `/api/v1` 前缀。除上传、音频和 SSE 外使用 JSON。
 读取可访问全部设备，列表可选设备过滤。
 
@@ -120,6 +136,7 @@ TXT 包含 `ver=1`、`path=/api/v1`、`caps=opus`，`ip=` 与 A 记录使用同�
 | PATCH | `/memos/{id}` | 修改转写和/或 `lang`，记录编辑时间，设为 `ready` |
 | DELETE | `/memos/{id}` | 事务内隐藏记录/移除任务，再删除音频；204（含已知 ID 重试），未知 ID 404，文件删除失败 500 |
 | GET | `/memos/{id}/audio` | 原始 MEMO 字节，`application/octet-stream`，支持 Range |
+| GET | `/memos/{id}/audio.wav` | 按需生成浏览器 WAV 播放/下载，支持 HEAD/Range |
 | GET | `/memos/{id}/text` | 有界 UTF-8 显示窗口、字节偏移及内容版本 |
 | POST | `/memos/{id}/transcribe` | 设为 `uploaded`、清错误并入队；202 |
 | GET | `/events` | `text/event-stream` 订阅 |
@@ -285,6 +302,11 @@ MEMO_ASR_PROVIDER=fake ../build/memo-server serve
 `cd server && go test ./...` 覆盖配置、头部/帧解析、测试音频解码、SQLite 操作、
 API 流程、提供商请求/错误处理及任务重试。使用临时存储、假转写和本地 HTTP 服务；
 首次运行可能需要下载模块/工具链。
+
+网页处理器测试覆盖 HTML 转义、带设备筛选的分页、修改请求来源检查、WAV 播放/Range、转换
+边界及临时文件清理。仓库根目录执行 `node --test tests/test_memo_web.js`，仅用 Node 内置模块
+验证编辑失败恢复、过期轮询抑制和确认流程；Node 仅用于测试，不是服务端构建或运行依赖。
+实际浏览器布局和播放器控件仍需浏览器验收。
 
 `scripts/e2e-server.sh` 使用真实进程、假 ASR 和临时存储，比较原始 MEMO 音频字节及精确 Range
 响应，覆盖上传/幂等、转写、双向历史、带版本正文、管理、重新转写和安全 GC，不调用真实提供商。

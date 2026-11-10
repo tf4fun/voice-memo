@@ -114,6 +114,34 @@ echo "== patch rejects unknown field (expect 400)"
     || fail "unknown field was accepted"
 
 echo "== history pages and bounded versioned text"
+echo "== embedded web manager and browser WAV playback"
+python3 - "${BASE}" "${MEMO_ID}" <<'PY_WEB'
+import sys, urllib.request, urllib.error
+base, memo_id = sys.argv[1:]
+origin = base.removesuffix('/api/v1')
+def get(url, headers=None):
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers or {}), timeout=10) as response:
+        return response.status, response.headers, response.read()
+status, headers, page = get(origin + '/')
+assert status == 200 and b'text/html' in headers['Content-Type'].encode()
+assert ('/memos/' + memo_id).encode() in page
+_, _, detail = get(origin + '/memos/' + memo_id)
+assert '手动修正的文本'.encode() in detail and b'audio.wav' in detail
+status, headers, wav = get(base + '/memos/' + memo_id + '/audio.wav', {'Range':'bytes=0-43'})
+assert status == 206 and headers['Content-Type'] == 'audio/wav'
+assert len(wav) == 44 and wav[:4] == b'RIFF' and wav[8:12] == b'WAVE'
+for asset in ('app.css', 'app.js'):
+    status, _, data = get(origin + '/assets/' + asset)
+    assert status == 200 and data
+request = urllib.request.Request(base + '/memos/' + memo_id, method='DELETE', headers={'Origin':'https://other.example'})
+try:
+    urllib.request.urlopen(request, timeout=10)
+    raise AssertionError('cross-origin deletion accepted')
+except urllib.error.HTTPError as error:
+    assert error.code == 403
+PY_WEB
+
+echo "== history pages and bounded versioned text"
 python3 - "${BASE}" "${FIXTURE}" "${MEMO_ID}" "${DEVICE_ID}" <<'PY_PAGES'
 import json, sys, urllib.request, urllib.parse, urllib.error
 base, fixture, original_id, device = sys.argv[1:]

@@ -4,7 +4,7 @@
 
 # Voice Memo Server — Technical Design
 
-Implementation snapshot: 2026-11-09. Describes the current Go server, its storage
+Implementation snapshot: 2026-11-10. Describes the current Go server, its storage
 and HTTP contract. The [client design](client.md) covers firmware; work and
 acceptance are tracked only in the [milestones](../project/milestones.md).
 
@@ -14,7 +14,9 @@ One Go process receives recordings, stores the original Opus containers, runs
 background transcription and serves metadata/audio to LAN clients. It uses
 Go 1.27.3, `net/http`, SQLite through `modernc.org/sqlite`, `pion/opus` for decode
 and `grandcat/zeroconf` for mDNS. There is no external database, broker, ffmpeg
-or cgo requirement. There is no web UI, authentication or TLS listener.
+or cgo requirement. A small embedded web manager uses only Go's standard library
+for HTTP, HTML templates and asset embedding, plus plain CSS/JavaScript. No
+frontend packages or asset build are required. There is no authentication or TLS listener.
 
 ## 2. Package layout
 
@@ -26,7 +28,7 @@ or cgo requirement. There is no web UI, authentication or TLS listener.
 | `internal/domain` | Memo/status types, container header and frame reader |
 | `internal/audio` | Structural validation, Opus decode and WAV output |
 | `internal/store` | SQLite schema, queries, job persistence |
-| `internal/httpapi` | HTTP routes, JSON, uploads, audio and SSE |
+| `internal/httpapi` | HTTP routes, embedded web manager, JSON, uploads, audio and SSE |
 | `internal/asr` | Transcriber interface, SiliconFlow and fake implementations |
 | `internal/jobs` | Bounded transcription pool and acknowledged shutdown |
 | `internal/events` | In-memory event broadcast hub |
@@ -126,6 +128,29 @@ LAN access. Firmware has no manual server-address entry.
 
 ## 6. HTTP routes
 
+The same listener serves the Chinese web manager at `/`: twenty recordings per
+cursor page, device filtering, older/newer navigation and an empty/error state.
+`/memos/{id}` shows a recording's transcript, metadata and audio player. Plain
+JavaScript reuses the existing PATCH/DELETE/retranscription APIs; destructive
+actions require an in-page confirmation, failed edits retain their draft, and
+leaving with unsaved text prompts the browser. Pending transcription status polls
+every four seconds while the page is visible and not being edited. Late poll
+responses cannot overwrite a newer edit. List refresh is manual.
+
+Templates escape recording text; CSS/JavaScript are embedded at `/assets/app.css`
+and `/assets/app.js`. HTML responses are not cached and carry a same-origin
+content policy. Standard-library cross-origin protection rejects unsafe browser
+requests from other origins while allowing firmware requests without browser
+origin headers. This is request protection, not user authentication.
+
+Browser playback/download uses `/api/v1/memos/{id}/audio.wav`. The existing Opus
+decoder writes to a private temporary WAV file, deleted when the request ends;
+no PCM cache is added to RAM or persistent storage. Conversion and serving share
+one slot per process; another preview receives 503 with `Retry-After: 2`. Decode
+checks cancellation and caps PCM output at the frame-derived size, retaining the
+container's declared-duration tolerance. WAV responses support HEAD/Range and
+are not cached. The original `/audio` route remains MEMO bytes for the device.
+
 All paths below are prefixed with `/api/v1`. JSON is used except for upload,
 audio and SSE. Reads expose all devices unless the optional list filter is used.
 
@@ -140,6 +165,7 @@ audio and SSE. Reads expose all devices unless the optional list filter is used.
 | PATCH | `/memos/{id}` | Change transcript and/or `lang`, stamp edit time, set `ready` |
 | DELETE | `/memos/{id}` | Atomically hide row/drop job, remove audio; 204 including known-ID retries, unknown ID 404, removal failure 500 |
 | GET | `/memos/{id}/audio` | Original MEMO bytes, `application/octet-stream`, Range supported |
+| GET | `/memos/{id}/audio.wav` | On-demand browser WAV preview/download, HEAD/Range supported |
 | GET | `/memos/{id}/text` | Bounded UTF-8 display window with byte offsets and content revision |
 | POST | `/memos/{id}/transcribe` | Set `uploaded`, clear error and enqueue; 202 |
 | GET | `/events` | `text/event-stream` subscription |
@@ -327,6 +353,13 @@ only `memo.db` while WAL writes continue. Migrations run when opening the store.
 decoding fixtures, SQLite operations, API flows, provider request/error handling
 and job retries. Tests use temporary storage, fake transcription and local HTTP
 servers; a first run may need module/toolchain downloads.
+
+Web handler tests cover HTML escaping, device-filtered pagination, mutation
+origin checks, WAV playback/ranges, conversion bounds and temporary-file cleanup.
+`node --test tests/test_memo_web.js` from the repository root uses only Node's
+built-ins to check edit failure recovery, stale-poll suppression and confirmation
+flows; Node is a test tool, not a server build/runtime dependency. Actual browser
+layout and media controls still require browser acceptance.
 
 `scripts/e2e-server.sh` runs a real process with fake ASR and temporary storage.
 It compares original MEMO audio bytes and exact Range responses, and covers

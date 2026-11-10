@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>{{if .Detail}}录音详情{{else}}录音档案{{end}} · 灵感终端</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/assets/app.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <header class="masthead"><a class="brand" href="/"><span class="brand-mark" aria-hidden="true">M_</span><span>灵感终端<small>VOICE MEMO ARCHIVE</small></span></a><span class="terminal-label"><i></i> 本地录音管理</span></header>
+  <main {{if .Detail}}data-memo-id="{{.Detail.ID}}" data-status="{{.Detail.Status}}"{{end}}>
+  {{if .Error}}
+    <section class="empty panel"><span class="eyebrow">档案读取中断</span><h1>暂时无法打开</h1><p>{{.Error}}</p><a class="button primary" href="/">返回录音档案</a></section>
+  {{else if .Detail}}
+    {{with .Detail}}
+    <a class="back" href="/">← 录音档案</a>
+    <div class="page-heading detail-heading"><div><p class="eyebrow">RECORDING / 录音详情</p><h1><time datetime="{{datetime .RecordedAt}}">{{clock .RecordedAt}}</time></h1></div><span id="memo-status" class="badge {{.Status}}">{{status .Status}}</span></div>
+    <div class="detail-grid">
+      <section class="panel transcript-panel" aria-labelledby="transcript-heading">
+        <div class="section-heading"><h2 id="transcript-heading">转录文字</h2><button id="edit" class="button subtle" type="button">编辑文字</button></div>
+        <div id="transcript" class="transcript" tabindex="0">{{.Transcript}}</div>
+        <p id="transcript-empty" class="muted" {{if .Transcript}}hidden{{end}}>暂无转录文字，可稍后刷新或重新转写。</p>
+        <form id="editor" hidden>
+          <label class="sr-only" for="draft">转录文字</label>
+          <textarea id="draft" rows="12" spellcheck="false">{{.Transcript}}</textarea>
+          <p class="muted">保存后采用你的修改，并停止尚未完成的自动转写。</p>
+          <div class="actions"><button class="button primary" id="save" type="submit">保存修改</button><button class="button" id="cancel-edit" type="button">取消</button></div>
+        </form>
+        <p id="asr-error" class="error-note" {{if not .Error}}hidden{{end}}>转写失败：{{.Error}}</p>
+      </section>
+      <aside class="sidebar">
+        <section class="panel playback" aria-labelledby="audio-heading"><div class="section-heading"><h2 id="audio-heading">原声回放</h2><span class="mono">{{duration .DurationMS}}</span></div>
+          {{if .AudioPath}}<audio id="audio" controls preload="none" src="/api/v1/memos/{{.ID}}/audio.wav">浏览器不支持音频播放，请下载音频。</audio><a class="download" href="/api/v1/memos/{{.ID}}/audio.wav" download="{{.ID}}.wav">↓ 下载音频 · WAV</a>{{else}}<p class="muted">音频不可用</p>{{end}}
+        </section>
+        <section class="panel facts"><h2>录音信息</h2><dl><dt>来源设备</dt><dd>{{.DeviceID}}</dd><dt>录音时长</dt><dd class="mono">{{duration .DurationMS}}</dd><dt>上传时间</dt><dd><time datetime="{{datetime .UploadedAt}}">{{clock .UploadedAt}}</time></dd>{{if .EditedAt}}<dt>文字修改</dt><dd><time datetime="{{datetime .EditedAt}}">{{clock .EditedAt}}</time></dd>{{end}}<dt>录音编号</dt><dd class="memo-id">{{.ID}}</dd></dl></section>
+        <section class="panel manage"><h2>管理录音</h2><button class="button" id="transcribe" type="button" {{if or (eq .Status "uploaded") (eq .Status "transcribing")}}disabled{{end}}>重新转写</button><button class="button danger" id="delete" type="button">删除录音</button></section>
+      </aside>
+    </div>
+    {{end}}
+  {{else}}
+    <div class="page-heading"><div><p class="eyebrow">YOUR IDEAS, ON RECORD</p><h1>录音档案<span class="cursor" aria-hidden="true">_</span></h1><p class="intro">回听原声，整理文字，留住每一次灵感。</p></div><button class="button" type="button" id="refresh">↻ 刷新列表</button></div>
+    <form class="filter-bar" action="/" method="get"><label for="device">来源设备</label><input name="device" id="device" value="{{.Device}}" maxlength="64" placeholder="全部设备" autocomplete="off"><button class="button" type="submit">筛选</button>{{if .Device}}<a class="clear-filter" href="/">清除筛选</a>{{end}}<span class="result-count">本页 {{len .Items}} 条 · 时间倒序</span></form>
+    <section class="memo-list" aria-label="录音列表">
+    {{range $i, $m := .Items}}
+      <a class="memo-card" href="/memos/{{$m.ID}}"><span class="memo-number">{{number $i}}</span><div class="memo-content"><div class="memo-meta"><time datetime="{{datetime $m.RecordedAt}}">{{clock $m.RecordedAt}}</time><span class="badge {{$m.Status}}">{{status $m.Status}}</span></div><p class="memo-snippet">{{if $m.Transcript}}{{snippet $m}}{{else}}等待灵感变成文字…{{end}}</p><div class="memo-foot"><span>{{$m.DeviceID}}</span><span class="mono">{{duration $m.DurationMS}}</span></div></div><span class="memo-arrow" aria-hidden="true">↗</span></a>
+    {{else}}
+      <div class="empty panel"><span class="empty-mark" aria-hidden="true">[ _ ]</span><h2>{{if .Device}}这台设备暂无录音{{else}}还没有录音{{end}}</h2><p>用录音笔保存一段灵感，上传后就会出现在这里。</p>{{if .Device}}<a class="button" href="/">查看全部设备</a>{{end}}</div>
+    {{end}}
+    </section>
+    {{if or .Newer .Older}}<nav class="pagination" aria-label="录音分页">{{if .Newer}}<a class="button" href="{{.Newer}}">← 较新录音</a>{{else}}<span></span>{{end}}<a class="latest" href="/?device={{.Device}}">回到最新</a>{{if .Older}}<a class="button" href="{{.Older}}">较早录音 →</a>{{else}}<span></span>{{end}}</nav>{{end}}
+  {{end}}
+  <p id="notice" class="notice" role="status" hidden></p>
+  <noscript><p class="notice">录音浏览和分页可直接使用；播放音频之外的编辑、删除和重新转写操作需要启用 JavaScript。</p></noscript>
+  </main>
+  <footer><span>VOICE MEMO</span><span>声音留存 / 灵感常在</span></footer>
+  <dialog id="confirmation"><form method="dialog"><p class="eyebrow">确认操作</p><h2 id="confirm-title"></h2><p id="confirm-description"></p><div class="actions"><button class="button" value="cancel" autofocus>取消</button><button class="button primary" id="confirm-action" value="confirm">确认</button></div></form></dialog>
+</body>
+</html>
