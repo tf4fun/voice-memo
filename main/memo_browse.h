@@ -66,7 +66,7 @@ static inline memo_scrollbar_t memo_scrollbar_thumb(int total, int visible, int 
     return bar;
 }
 
-typedef struct { int x, top, width, rows, pitch, row_height, footer_y, footer_height; } memo_rows_layout_t;
+typedef struct { int x, top, width, rows, pitch, row_height; } memo_rows_layout_t;
 typedef struct { int time_x, time_w, text_x, text_w, duration_x, duration_w; } memo_list_columns_t;
 static inline memo_list_columns_t memo_list_columns(int row_width)
 {
@@ -79,15 +79,16 @@ static inline memo_list_columns_t memo_list_columns(int row_width)
 static inline memo_rows_layout_t memo_rows_layout(int width, int height)
 {
     // Keep text inside the rounded panel's 24 px horizontal safe inset.
-    return (memo_rows_layout_t){.x=16,.top=56,.width=width-32,.rows=4,
-        .pitch=56,.row_height=50,.footer_y=height-40,.footer_height=31};
+    const int pitch = (height - 52 - 24 + 6) / 4;
+    return (memo_rows_layout_t){.x=16,.top=52,.width=width-32,.rows=4,
+        .pitch=pitch,.row_height=pitch-6};
 }
 
 static inline memo_rows_layout_t memo_settings_layout(int width, int height)
 {
     memo_rows_layout_t layout = memo_rows_layout(width, height);
-    layout.rows = 5;
-    layout.pitch = 44;
-    layout.row_height = 38;
+    layout.rows = 6;
+    layout.pitch = (height - layout.top - 24 + 2) / layout.rows;
+    layout.row_height = layout.pitch - 2;
     return layout;
 }

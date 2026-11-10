@@ -4,6 +4,7 @@
 #include "memo_font.h"
 #include "memo_progress.h"
 #include <stdio.h>
+#include <string.h>
 
 void memo_ui_flat_rect(lv_obj_t *obj, uint32_t color, int radius)
 {
@@ -125,7 +126,9 @@ void memo_ui_battery_update(int soc)
     s_soc = soc;
     char text[12] = "--";
     if (soc >= 0) snprintf(text, sizeof(text), "%d%%", soc > 100 ? 100 : soc);
-    for (int i = 0; i < s_battery_count; i++) lv_label_set_text(s_batteries[i], text);
+    for (int i = 0; i < s_battery_count; i++) {
+        if (strcmp(lv_label_get_text(s_batteries[i]), text) != 0) lv_label_set_text(s_batteries[i], text);
+    }
 }
 
 lv_obj_t *memo_ui_battery(lv_obj_t *screen)

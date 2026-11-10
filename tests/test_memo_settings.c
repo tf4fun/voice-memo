@@ -2,13 +2,13 @@
 #include <stdio.h>
 #include "../main/memo_settings.c"
 
-static const char *keys[]={"vol","to","sl","ap","tz","as"};
-static int32_t disk[6];
-static bool present[6];
+static const char *keys[]={"vol","to","sl","ap","tz","as","br"};
+static int32_t disk[7];
+static bool present[7];
 static int init_failure, open_failure, fail_write, fail_commit;
 static int writes, commits, audio_calls, audio_volume;
 static int index_of(const char *key)
-{ for(int i=0;i<6;i++)if(!strcmp(keys[i],key))return i;assert(0);return 0; }
+{ for(int i=0;i<7;i++)if(!strcmp(keys[i],key))return i;assert(0);return 0; }
 esp_err_t nvs_flash_init(void) { return init_failure; }
 esp_err_t nvs_open(const char *ns,int mode,nvs_handle_t *out)
 { assert(!strcmp(ns,"memo") && mode==NVS_READWRITE);if(open_failure)return open_failure;*out=1;return ESP_OK; }
@@ -47,6 +47,29 @@ int main(void)
     init_failure=0;open_failure=ESP_FAIL;
     assert(memo_settings_init()==ESP_FAIL && !s_ready);
     defaults();
+    assert(memo_settings_get()->brightness==100 && !present[6] && writes==0);
+    assert(memo_settings_brightness_step(100,1)==100);
+    assert(memo_settings_brightness_step(10,-1)==10);
+    assert(memo_settings_brightness_step(100,-1)==90);
+    assert(memo_settings_brightness_step(10,1)==20);
+    assert(memo_settings_brightness_step(50,0)==50);
+    assert(memo_settings_edit_begin(&edit,MEMO_EDIT_BRIGHTNESS)==ESP_OK);
+    memo_settings_edit_adjust(&edit,-1);
+    assert(edit.value.brightness==90 && writes==0 && audio_calls==0);
+    memo_settings_edit_cancel(&edit);
+    assert(memo_settings_get()->brightness==100 && writes==0);
+    assert(memo_settings_edit_begin(&edit,MEMO_EDIT_BRIGHTNESS)==ESP_OK);
+    memo_settings_edit_adjust(&edit,-1);
+    fail_write=1;
+    assert(memo_settings_edit_save(&edit)==ESP_FAIL && edit.active);
+    assert(memo_settings_get()->brightness==100 && disk[6]==100);
+    fail_commit=1;
+    assert(memo_settings_edit_save(&edit)==ESP_FAIL && edit.active);
+    assert(memo_settings_get()->brightness==100 && disk[6]==100);
+    assert(memo_settings_edit_save(&edit)==ESP_OK && !edit.active);
+    boot();assert(memo_settings_get()->brightness==90 && audio_calls==0);
+    assert(memo_settings_set_brightness(100)==ESP_OK);
+    writes=commits=0;
     assert(memo_settings_edit_begin(&edit,MEMO_EDIT_VOLUME)==ESP_OK);
     assert(memo_settings_edit_begin(&edit,MEMO_EDIT_SLEEP)==ESP_ERR_INVALID_STATE);
     memo_settings_edit_adjust(&edit,1);assert(edit.value.volume==100 && writes==0 && audio_calls==0);
@@ -88,6 +111,9 @@ int main(void)
     const int before=writes;
     assert(memo_settings_set_volume(13)==ESP_ERR_INVALID_ARG);
     assert(memo_settings_set_volume(101)==ESP_ERR_INVALID_ARG);
+    assert(memo_settings_set_brightness(0)==ESP_ERR_INVALID_ARG);
+    assert(memo_settings_set_brightness(15)==ESP_ERR_INVALID_ARG);
+    assert(memo_settings_set_brightness(101)==ESP_ERR_INVALID_ARG);
     assert(memo_settings_set_screen_timeout(31)==ESP_ERR_INVALID_ARG);
     assert(memo_settings_set_sleep(2)==ESP_ERR_INVALID_ARG);
     assert(memo_settings_set_tz(841)==ESP_ERR_INVALID_ARG);
@@ -96,11 +122,11 @@ int main(void)
     assert(memo_settings_set_tz(-720)==ESP_OK);boot();assert(memo_settings_get()->tz_offset_min==-720);
     assert(memo_settings_set_tz(840)==ESP_OK);boot();assert(memo_settings_get()->tz_offset_min==840);
     // Validate signed legacy values before narrowing; never silently rewrite bad keys.
-    const int32_t invalid[][6]={{-176,286,261,2,66016,2},{256,-1,-1,-1,-66016,-1},{13,1,60,256,841,256}};
+    const int32_t invalid[][7]={{-176,286,261,2,66016,2,-156},{256,-1,-1,-1,-66016,-1,256},{13,1,60,256,841,256,15}};
     for(size_t n=0;n<sizeof(invalid)/sizeof(invalid[0]);n++) {
         memcpy(disk,invalid[n],sizeof(disk));memset(present,1,sizeof(present));
         int old=writes;boot();const memo_settings_t *st=memo_settings_get();
-        assert(st->volume==80 && st->screen_timeout_s==30 && st->sleep_min==5 && !st->autoplay && !st->autosave && st->tz_offset_min==480);
+        assert(st->volume==80 && st->brightness==100 && st->screen_timeout_s==30 && st->sleep_min==5 && !st->autoplay && !st->autosave && st->tz_offset_min==480);
         assert(writes==old);
     }
     assert(memo_settings_edit_begin(NULL,MEMO_EDIT_VOLUME)==ESP_ERR_INVALID_ARG);

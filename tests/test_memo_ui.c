@@ -10,7 +10,7 @@
 #include "memo_discovery.h"
 #include "memo_provision.h"
 #include "memo_ui_provision.h"
-static memo_settings_t settings={.volume=80,.screen_timeout_s=30,.sleep_min=5,.tz_offset_min=480};
+static memo_settings_t settings={.volume=80,.brightness=100,.screen_timeout_s=30,.sleep_min=5,.tz_offset_min=480};
 const memo_settings_t *memo_settings_get(void){return &settings;}
 static bool online=true, discovery_pending;
 static const char *network_ssid="网络SSID";
@@ -31,10 +31,12 @@ static void visible_settings(int selected){
  lv_obj_t *root=memo_ui_settings_screen();int visible=0,highlight=0;
  for(int i=0;i<root->child_count;i++){
   lv_obj_t *row=root->children[i];if(row->child_count!=2||row->hidden)continue;
-  visible++;assert(row->x==16 && row->y>=56 && row->y+row->h<=270);
+  visible++;assert(row->x==16 && row->y>=52 && row->y+row->h<=296);
   if(row->color==TERM_FG)highlight++;
  }
- assert(visible==5 && highlight==1);
+ assert(visible==6 && highlight==1);
+ char position[16];snprintf(position,sizeof(position),"%d/9",selected+1);
+ lv_obj_t *counter=find(root,position);assert(counter && counter->y+counter->h<=44);
 }
 int main(void){
  assert(memo_follow_target(0,0,100)==0);
@@ -49,8 +51,8 @@ int main(void){
 
  memo_fonts_init();memo_ui_settings_build();memo_ui_settings_refresh();
  assert(find(memo_ui_settings_screen(),"> 设置")->y+find(memo_ui_settings_screen(),"> 设置")->h<=44);
- for(int i=0;i<8;i++)visible_settings(i);
- for(int i=7;i>=0;i--)visible_settings(i);
+ for(int i=0;i<9;i++)visible_settings(i);
+ for(int i=8;i>=0;i--)visible_settings(i);
  lv_obj_t *netrow=NULL;
  for(int i=0;i<memo_ui_settings_screen()->child_count;i++){
   lv_obj_t *row=memo_ui_settings_screen()->children[i];
@@ -91,7 +93,7 @@ int main(void){
  discovery_pending=true; memo_ui_settings_refresh_values();assert(find(memo_ui_settings_screen(),"查找中"));
  online=false;memo_ui_settings_refresh_values();assert(find(memo_ui_settings_screen(),"等待网络"));
  online=true;discovery_pending=false;
- memo_ui_settings_set_selected(MEMO_SETTING_AUTOSAVE);assert(find(memo_ui_settings_screen(),"07 自动保存"));
+ memo_ui_settings_set_selected(MEMO_SETTING_AUTOSAVE);assert(find(memo_ui_settings_screen(),"08 自动保存"));
  memo_ui_settings_set_selected(MEMO_SETTING_VOLUME);
  memo_settings_t draft=settings;
  memo_ui_settings_enter(&draft);
@@ -108,8 +110,16 @@ int main(void){
  assert(volume_fill->anim_from==140 && volume_fill->anim_to==93);
  draft.volume=100;memo_ui_settings_show_draft(&draft);assert(memo_ui_settings_in_sheet());
  memo_ui_settings_refresh_values();assert(find(memo_ui_settings_screen(),"100%"));
- memo_ui_settings_error();assert(find(memo_ui_settings_screen(),"处理失败"));
+ memo_ui_settings_error();lv_obj_t *error_hint=find(memo_ui_settings_screen(),"处理失败");
+ assert(error_hint && !error_hint->hidden);
  memo_ui_settings_refresh();assert(!volume_fill->animating);assert(!memo_ui_settings_in_sheet()&&find(memo_ui_settings_screen(),"80%"));
+ assert(error_hint->hidden && !error_hint->text[0]);
+ memo_ui_settings_set_selected(MEMO_SETTING_BRIGHTNESS);
+ draft=settings;memo_ui_settings_enter(&draft);
+ assert(find(memo_ui_settings_screen(),"亮度") && !volume_track->hidden && volume_fill->w==156);
+ draft.brightness=40;memo_ui_settings_show_draft(&draft);
+ assert(volume_fill->animating && volume_fill->anim_to==62 && find(memo_ui_settings_screen(),"40%"));
+ memo_ui_settings_refresh();assert(!volume_fill->animating);
  lv_obj_update_layout(memo_ui_settings_screen());
  for(int i=0;i<memo_ui_settings_screen()->child_count;i++){
   lv_obj_t *child=memo_ui_settings_screen()->children[i];

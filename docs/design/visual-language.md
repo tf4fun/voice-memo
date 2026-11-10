@@ -4,7 +4,7 @@
 
 # Voice Memo — Visual Language
 
-Implementation snapshot: 2026-11-09. The application uses a warm phosphor-green
+Implementation snapshot: 2026-11-10. The application uses a warm phosphor-green
 terminal: square geometry, sparse rules, readable Chinese text and inverse
 selection. Interaction follows the [product specification](../product/product-spec.md).
 The redesigned application does not reuse the baseline demo shell.
@@ -30,6 +30,8 @@ input problems and actionable failures remain visible.
 
 `memo_ui_header` creates a Chinese title at x=24/y=8, width 144 and line height
 31, plus the right-aligned battery at x=184/y=16, width 40 and line height 18.
+List/settings titles narrow to 80 px; their position counter occupies x=112/y=8,
+64×31, right-aligned before the battery.
 All six page types share cached SOC updates; only the current page is allocated.
 Switching unregisters its battery label and deletes old widgets/animations before
 building the destination on the fixed empty boot screen. A single 208 px low-brightness
@@ -51,12 +53,15 @@ in [assets](../../assets/README.md#voice-memo-fonts).
 
 ## 3. Reading and navigation
 
-The list shows four borderless terminal entries, each 208×50 at x=16 and
- y=56 + 56×visible index. A summary has its own 184×31 viewport at row x=12/y=0.
-Time and duration occupy separate 40×18 fields at row x=12/156, y=31. Ellipsis
+The list shows four borderless terminal entries, each 208×56 at x=16 and
+ y=52 + 62×visible index. The card's outer margins are both 16 px. A summary
+has its own 184×31 viewport at row x=12/y=0. Time and duration occupy separate
+40×18 fields at row x=12/156, y=31. Time is left-aligned and duration is
+right-aligned, retaining equal 12 px inner insets even for short values. Ellipsis
 never shares a vertical band with metadata. A 2 px status strip becomes 4 px
-for failures; only the selected row is inverse. The scrollbar is x=228/y=56,
-height 218. Counts or temporary feedback use y=280; the empty state is centred
+for failures; only the selected row is inverse. The scrollbar is x=228/y=52,
+height 242. Counts appear in the header; temporary feedback overlays y=272
+only when needed, reserving no footer space. The empty state is centred
 at y=136 without duplicate footer text.
 
 Detail has a Chinese title and a mono metadata line at x=24/y=55. The frameless
@@ -69,17 +74,19 @@ UP/DOWN clicks control volume; direction holds switch adjacent recordings.
 Playback still drives proportional scrolling. The 56×8 track has a 1 px border
 and 1 px inner inset; the 52×4 maximum fill has equal 2 px outer gaps.
 
-Settings use five borderless 208×38 rows on a 44 px pitch from y=56. Each row
+Settings use six borderless 208×39 rows over nine entries on a 41 px pitch from y=52. Each row
 has an indexed 88 px label and an independent 88×31 value viewport, separated
 by 8 px. Only selected values scroll horizontally; unselected values truncate
 on one line. Reconciliation changes long mode only on selection transitions.
 The focused editor hides rows/scrollbar and shows a 192×116 frame at x=24/y=100,
 a centred name, a quiet rule and a larger value. Volume and sleep editors expand
-to 192×148 at x=24/y=92. Volume has a 160×12 track with a centred 156×8 maximum
+to 192×148 at x=24/y=92; brightness uses the same expanded frame and meter.
+Volume and brightness share a 160×12 track with a centred 156×8 maximum
 fill; UP increases and DOWN decreases without wrapping. Its fill animates for
 160 ms from the currently displayed width and repeated refreshes do not restart
-it. Sleep shows that timing starts after blanking, or that always-on prevents
-automatic sleep. Failures use y=280.
+it. Brightness previews immediately in 10% steps within 10–100%; cancel restores
+the saved level and successful save persists it for startup/wake. Sleep shows that timing starts after blanking, or that always-on prevents
+automatic sleep. Failures temporarily overlay y=272 without reserving footer space.
 
 ## 4. Capture and decisions
 

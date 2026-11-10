@@ -23,9 +23,11 @@ int main(void)
     assert(memo_browse_move(&selected,24,-1,false,true)==0 && selected==0);
     assert(memo_browse_move(&selected,24,-1,false,false)==0 && selected==0);
     memo_rows_layout_t l=memo_rows_layout(240,320),st=memo_settings_layout(240,320);
-    assert(l.top+l.pitch*(l.rows-1)+l.row_height<l.footer_y);
-    assert(st.top+st.pitch*(st.rows-1)+st.row_height<st.footer_y);
-    assert(st.footer_y+st.footer_height<=320-8);
+    assert(l.rows==4 && st.rows==6);
+    const int list_bottom=l.top+l.pitch*(l.rows-1)+l.row_height;
+    const int settings_bottom=st.top+st.pitch*(st.rows-1)+st.row_height;
+    assert(list_bottom<=320-24 && 320-list_bottom<=30);
+    assert(settings_bottom<=320-24 && 320-settings_bottom<=30);
     assert(l.x>=12 && l.x+l.width+3<=240-12);
     const memo_list_columns_t columns=memo_list_columns(l.width);
     assert(columns.time_w==5*8 && columns.duration_w==5*8);
@@ -63,5 +65,5 @@ int main(void)
     assert(bar.offset==0);
     bar=memo_scrollbar_thumb(200,5,195,10,8);
     assert(bar.length==8 && bar.offset==2 && bar.offset+bar.length==10);
-    puts("memo browse selection viewport, page boundaries and round-safe row/footer layout: PASS");
+    puts("memo browse selection viewport, page boundaries and round-safe content layout: PASS");
 }

@@ -23,6 +23,7 @@ static const uint8_t kSleepSteps[] = {0, 1, 5, 15};
 
 static const memo_settings_t kDefaults = {
     .volume = 80,
+    .brightness = 100,
     .screen_timeout_s = 30,
     .sleep_min = 5,
     .autoplay = false,
@@ -50,6 +51,14 @@ uint8_t memo_settings_volume_step(uint8_t current, int direction)
 {
     int next = current + (direction > 0 ? 20 : direction < 0 ? -20 : 0);
     if (next < 0) next = 0;
+    if (next > 100) next = 100;
+    return (uint8_t)next;
+}
+
+uint8_t memo_settings_brightness_step(uint8_t current, int direction)
+{
+    int next = current + (direction > 0 ? 10 : direction < 0 ? -10 : 0);
+    if (next < 10) next = 10;
     if (next > 100) next = 100;
     return (uint8_t)next;
 }
@@ -95,6 +104,8 @@ esp_err_t memo_settings_init(void)
     // Validate before narrowing: corrupt/old integer values must not wrap.
     int32_t value = read_i32("vol", kDefaults.volume);
     if (is_option(value, kVolumeSteps, sizeof(kVolumeSteps))) s_settings.volume = (uint8_t)value;
+    value = read_i32("br", kDefaults.brightness);
+    if (value >= 10 && value <= 100 && value % 10 == 0) s_settings.brightness = (uint8_t)value;
     value = read_i32("to", kDefaults.screen_timeout_s);
     if (is_option(value, kTimeoutSteps, sizeof(kTimeoutSteps))) s_settings.screen_timeout_s = (uint8_t)value;
     value = read_i32("sl", kDefaults.sleep_min);
@@ -153,6 +164,14 @@ esp_err_t memo_settings_set_screen_timeout(uint8_t seconds)
     return err;
 }
 
+esp_err_t memo_settings_set_brightness(uint8_t percent)
+{
+    if (percent < 10 || percent > 100 || percent % 10 != 0) return ESP_ERR_INVALID_ARG;
+    esp_err_t err = persist_i32("br", percent, s_settings.brightness);
+    if (err == ESP_OK) s_settings.brightness = percent;
+    return err;
+}
+
 esp_err_t memo_settings_set_sleep(uint8_t minutes)
 {
     if (!is_option(minutes, kSleepSteps, sizeof(kSleepSteps))) return ESP_ERR_INVALID_ARG;
@@ -200,6 +219,9 @@ void memo_settings_edit_adjust(memo_settings_edit_t *edit, int direction)
     case MEMO_EDIT_VOLUME:
         edit->value.volume = memo_settings_volume_step(edit->value.volume, direction);
         break;
+    case MEMO_EDIT_BRIGHTNESS:
+        edit->value.brightness = memo_settings_brightness_step(edit->value.brightness, direction);
+        break;
     case MEMO_EDIT_TIMEOUT:
         edit->value.screen_timeout_s = memo_settings_timeout_step(edit->value.screen_timeout_s, direction);
         break;
@@ -215,6 +237,7 @@ esp_err_t memo_settings_edit_save(memo_settings_edit_t *edit)
     esp_err_t err = ESP_ERR_INVALID_ARG;
     switch (edit->field) {
     case MEMO_EDIT_VOLUME: err = memo_settings_set_volume(edit->value.volume); break;
+    case MEMO_EDIT_BRIGHTNESS: err = memo_settings_set_brightness(edit->value.brightness); break;
     case MEMO_EDIT_TIMEOUT: err = memo_settings_set_screen_timeout(edit->value.screen_timeout_s); break;
     case MEMO_EDIT_SLEEP: err = memo_settings_set_sleep(edit->value.sleep_min); break;
     }

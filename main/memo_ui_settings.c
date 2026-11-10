@@ -1,4 +1,4 @@
-// main/memo_ui_settings.c —— 设置页。八行，见产品方案 §4.5。
+// main/memo_ui_settings.c —— 设置页及编辑浮层。
 #include "memo_ui_settings.h"
 
 #include <stdio.h>
@@ -20,6 +20,7 @@ enum {
     ROW_NETWORK = 0,
     ROW_SERVER,
     ROW_VOLUME,
+    ROW_BRIGHTNESS,
     ROW_TIMEOUT,
     ROW_SLEEP,
     ROW_AUTOPLAY,
@@ -33,7 +34,9 @@ static lv_obj_t *s_rows[ROW_COUNT];
 static lv_obj_t *s_row_shadows[ROW_COUNT];
 static lv_obj_t *s_values[ROW_COUNT];
 static lv_obj_t *s_hint;
+static lv_obj_t *s_position;
 static lv_obj_t *s_scroll;
+static bool s_row_style_selected[ROW_COUNT];
 static int s_selected;
 static int s_top;
 
@@ -44,57 +47,59 @@ static lv_obj_t *s_sheet_title;
 static lv_obj_t *s_sheet_value;
 static bool s_in_sheet;
 static memo_settings_t s_draft;
-static lv_obj_t *s_volume_track;
-static lv_obj_t *s_volume_fill;
-static int s_volume_target = -1;
+static lv_obj_t *s_meter_track;
+static lv_obj_t *s_meter_fill;
+static int s_meter_target = -1;
 static lv_obj_t *s_sheet_note;
 
-static void volume_anim(void *obj, int32_t width)
+static void meter_anim(void *obj, int32_t width)
 {
     lv_obj_set_width(obj, width);
 }
 
 void memo_ui_settings_destroy(void)
 {
-    if (s_volume_fill != NULL) lv_anim_delete(s_volume_fill, volume_anim);
+    if (s_meter_fill != NULL) lv_anim_delete(s_meter_fill, meter_anim);
     memo_ui_screen_delete(s_screen);
-    s_screen = s_hint = s_scroll = s_sheet = s_sheet_shadow = NULL;
-    s_sheet_title = s_sheet_value = s_volume_track = s_volume_fill = s_sheet_note = NULL;
+    s_screen = s_hint = s_position = s_scroll = s_sheet = s_sheet_shadow = NULL;
+    s_sheet_title = s_sheet_value = s_meter_track = s_meter_fill = s_sheet_note = NULL;
     memset(s_rows, 0, sizeof(s_rows));
     memset(s_row_shadows, 0, sizeof(s_row_shadows));
     memset(s_values, 0, sizeof(s_values));
+    memset(s_row_style_selected, 0, sizeof(s_row_style_selected));
     s_in_sheet = false;
-    s_volume_target = -1;
+    s_meter_target = -1;
     s_top = 0;
 }
 
-static void refresh_volume_bar(bool animate)
+static void refresh_meter_bar(bool animate)
 {
-    const bool volume = s_selected == ROW_VOLUME;
+    const bool meter = s_selected == ROW_VOLUME || s_selected == ROW_BRIGHTNESS;
     const bool sleep = s_selected == ROW_SLEEP;
     lv_obj_set_hidden(s_sheet_note, !sleep);
     if (sleep) lv_label_set_text(s_sheet_note, s_draft.screen_timeout_s == 0 ?
                                  "常亮时不休眠" : "熄屏后开始计时");
-    lv_obj_set_hidden(s_volume_track, !volume);
-    if (!volume) {
-        lv_anim_delete(s_volume_fill, volume_anim);
-        s_volume_target = -1;
+    lv_obj_set_hidden(s_meter_track, !meter);
+    if (!meter) {
+        lv_anim_delete(s_meter_fill, meter_anim);
+        s_meter_target = -1;
         return;
     }
-    const int target = memo_progress_width(160, s_draft.volume, 100);
-    if (target == s_volume_target) return; // Heartbeats must not restart motion.
-    s_volume_target = target;
-    lv_anim_delete(s_volume_fill, volume_anim);
+    const int target = memo_progress_width(160,
+        s_selected == ROW_BRIGHTNESS ? s_draft.brightness : s_draft.volume, 100);
+    if (target == s_meter_target) return; // Heartbeats must not restart motion.
+    s_meter_target = target;
+    lv_anim_delete(s_meter_fill, meter_anim);
     if (!animate) {
-        lv_obj_set_width(s_volume_fill, target);
+        lv_obj_set_width(s_meter_fill, target);
         return;
     }
     lv_anim_t animation;
     lv_anim_init(&animation);
-    lv_anim_set_var(&animation, s_volume_fill);
-    lv_anim_set_values(&animation, lv_obj_get_width(s_volume_fill), target);
+    lv_anim_set_var(&animation, s_meter_fill);
+    lv_anim_set_values(&animation, lv_obj_get_width(s_meter_fill), target);
     lv_anim_set_duration(&animation, 160);
-    lv_anim_set_exec_cb(&animation, volume_anim);
+    lv_anim_set_exec_cb(&animation, meter_anim);
     lv_anim_start(&animation);
 }
 
@@ -104,6 +109,7 @@ static const char *row_label(int row)
     case ROW_NETWORK: return "网络";
     case ROW_SERVER: return "服务器";
     case ROW_VOLUME: return "音量";
+    case ROW_BRIGHTNESS: return "亮度";
     case ROW_TIMEOUT: return "自动息屏";
     case ROW_SLEEP: return "深度休眠";
     case ROW_AUTOPLAY: return "自动播放";
@@ -159,6 +165,9 @@ static void format_value(int row, char *buf, size_t cap)
     case ROW_VOLUME:
         snprintf(buf, cap, "%u%%", st->volume);
         break;
+    case ROW_BRIGHTNESS:
+        snprintf(buf, cap, "%u%%", st->brightness);
+        break;
     case ROW_TIMEOUT:
         if (st->screen_timeout_s == 0) {
             snprintf(buf, cap, "常亮");
@@ -189,8 +198,9 @@ static void refresh_rows(void)
     s_top = memo_viewport_top(s_top, s_selected, ROW_COUNT, layout.rows);
     for (int row = 0; row < ROW_COUNT; row++) {
         const bool visible = !s_in_sheet && row >= s_top && row < s_top + layout.rows;
+        const bool selected = visible && row == s_selected;
         memo_ui_card_visible(s_rows[row], s_row_shadows[row], visible);
-        const lv_label_long_mode_t mode = row == s_selected ? LV_LABEL_LONG_SCROLL_CIRCULAR : LV_LABEL_LONG_DOT;
+        const lv_label_long_mode_t mode = selected ? LV_LABEL_LONG_SCROLL_CIRCULAR : LV_LABEL_LONG_DOT;
         // Even setting the same mode deletes LVGL's marquee animation and
         // resets its offset. Preserve it across the normal input heartbeat.
         if (lv_label_get_long_mode(s_values[row]) != mode)
@@ -201,12 +211,17 @@ static void refresh_rows(void)
         format_value(row, value, sizeof(value));
         if (strcmp(lv_label_get_text(s_values[row]), value) != 0) memo_font_label_text(s_values[row], value, false);
         /* 选中行整行反白。 */
-        const bool selected = row == s_selected;
-        memo_ui_inverse(s_rows[row], selected);
-        lv_obj_set_style_text_color(lv_obj_get_child(s_rows[row], 0),
-                                    lv_color_hex(selected ? TERM_BG : TERM_FG), 0);
-        lv_obj_set_style_text_color(s_values[row], lv_color_hex(selected ? TERM_BG : TERM_DIM), 0);
+        if (s_row_style_selected[row] != selected) {
+            s_row_style_selected[row] = selected;
+            memo_ui_inverse(s_rows[row], selected);
+            lv_obj_set_style_text_color(lv_obj_get_child(s_rows[row], 0),
+                                        lv_color_hex(selected ? TERM_BG : TERM_FG), 0);
+            lv_obj_set_style_text_color(s_values[row], lv_color_hex(selected ? TERM_BG : TERM_DIM), 0);
+        }
     }
+    char position[16];
+    snprintf(position, sizeof(position), "%d/%d", s_selected + 1, ROW_COUNT);
+    if (strcmp(lv_label_get_text(s_position), position) != 0) lv_label_set_text(s_position, position);
     memo_ui_scrollbar_update(s_scroll, layout.rows * layout.pitch - (layout.pitch - layout.row_height),
                              ROW_COUNT, layout.rows, s_top);
     if (s_in_sheet) lv_obj_set_hidden(s_scroll, true);
@@ -217,11 +232,12 @@ static void sheet_visible(bool visible)
     memo_ui_card_visible(s_sheet, s_sheet_shadow, visible);
     s_in_sheet = visible;
     if (!visible) {
-        lv_anim_delete(s_volume_fill, volume_anim);
-        s_volume_target = -1;
+        lv_anim_delete(s_meter_fill, meter_anim);
+        s_meter_target = -1;
     }
     lv_obj_set_style_text_color(s_hint, lv_color_hex(TERM_DIM), 0);
     lv_label_set_text(s_hint, "");
+    lv_obj_set_hidden(s_hint, true);
     refresh_rows();
 }
 
@@ -235,7 +251,13 @@ void memo_ui_settings_build(void)
     memo_ui_flat_rect(s_screen, TERM_BG, 0);
     lv_obj_set_style_radius(s_screen, 0, 0);
 
-    memo_ui_header(s_screen, "> 设置");
+    lv_obj_t *title = memo_ui_header(s_screen, "> 设置");
+    lv_obj_set_width(title, 80);
+    s_position = memo_ui_label(s_screen, memo_font_label(), TERM_DIM);
+    lv_obj_set_pos(s_position, 112, 8);
+    lv_obj_set_size(s_position, 64, memo_font_label()->line_height);
+    lv_obj_set_style_text_align(s_position, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_long_mode(s_position, LV_LABEL_LONG_CLIP);
     const memo_rows_layout_t layout = memo_settings_layout(width, lv_display_get_vertical_resolution(NULL));
 
     for (int row = 0; row < ROW_COUNT; row++) {
@@ -263,9 +285,12 @@ void memo_ui_settings_build(void)
                                         layout.rows * layout.pitch - (layout.pitch - layout.row_height));
 
     s_hint = memo_ui_label(s_screen, memo_font_label(), TERM_DIM);
-    lv_obj_set_pos(s_hint, 24, lv_display_get_vertical_resolution(NULL)-40);
-    lv_obj_set_width(s_hint, width-48);
+    lv_obj_set_pos(s_hint, 24, lv_display_get_vertical_resolution(NULL)-48);
+    lv_obj_set_size(s_hint, width-48, memo_font_label()->line_height);
+    lv_obj_set_style_bg_color(s_hint, lv_color_hex(TERM_BG), 0);
+    lv_obj_set_style_bg_opa(s_hint, LV_OPA_COVER, 0);
     lv_label_set_text(s_hint, "");
+    lv_obj_set_hidden(s_hint, true);
 
     /* 子页：一张居中的卡片，显示当前项与值。 */
     s_sheet = memo_ui_card(s_screen, 24, 100, width - 48, 116, &s_sheet_shadow);
@@ -282,10 +307,10 @@ void memo_ui_settings_build(void)
     lv_obj_set_style_text_align(s_sheet_value, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_pos(s_sheet_value, 12, 62);
 
-    s_volume_track = memo_ui_meter_create(s_sheet, 160, 12, &s_volume_fill);
-    lv_obj_set_style_border_color(s_volume_track, lv_color_hex(TERM_DIM), 0);
-    lv_obj_align(s_volume_track, LV_ALIGN_BOTTOM_MID, 0, -16);
-    lv_obj_set_hidden(s_volume_track, true);
+    s_meter_track = memo_ui_meter_create(s_sheet, 160, 12, &s_meter_fill);
+    lv_obj_set_style_border_color(s_meter_track, lv_color_hex(TERM_DIM), 0);
+    lv_obj_align(s_meter_track, LV_ALIGN_BOTTOM_MID, 0, -16);
+    lv_obj_set_hidden(s_meter_track, true);
     s_sheet_note = memo_ui_label(s_sheet, memo_font_label(), TERM_DIM);
     lv_obj_set_size(s_sheet_note, width - 72, memo_font_label()->line_height);
     lv_obj_set_style_text_align(s_sheet_note, LV_TEXT_ALIGN_CENTER, 0);
@@ -314,7 +339,7 @@ void memo_ui_settings_enter(const memo_settings_t *draft)
 {
     if (draft == NULL) return;
     s_draft = *draft;
-    const bool expanded = s_selected == ROW_VOLUME || s_selected == ROW_SLEEP;
+    const bool expanded = s_selected == ROW_VOLUME || s_selected == ROW_BRIGHTNESS || s_selected == ROW_SLEEP;
     lv_obj_set_pos(s_sheet, 24, expanded ? 92 : 100);
     lv_obj_set_height(s_sheet, expanded ? 148 : 116);
     sheet_visible(true);
@@ -322,7 +347,7 @@ void memo_ui_settings_enter(const memo_settings_t *draft)
     char value[24];
     format_value(s_selected, value, sizeof(value));
     lv_label_set_text(s_sheet_value, value);
-    refresh_volume_bar(false);
+    refresh_meter_bar(false);
 }
 
 void memo_ui_settings_show_draft(const memo_settings_t *draft)
@@ -333,13 +358,14 @@ void memo_ui_settings_show_draft(const memo_settings_t *draft)
     char value[24];
     format_value(s_selected, value, sizeof(value));
     lv_label_set_text(s_sheet_value, value);
-    refresh_volume_bar(true);
+    refresh_meter_bar(true);
     refresh_rows();
 }
 
 void memo_ui_settings_error(void)
 {
     lv_label_set_text(s_hint, "处理失败");
+    lv_obj_set_hidden(s_hint, false);
     lv_obj_set_style_text_color(s_hint, lv_color_hex(TERM_FG), 0);
 }
 

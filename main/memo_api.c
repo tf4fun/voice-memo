@@ -249,8 +249,8 @@ esp_err_t memo_api_refresh(void)
     const uint32_t serial = s_page_serial;
     xSemaphoreGive(s_cache_lock);
     char path[192];
-    snprintf(path, sizeof(path), "/api/v1/memos?limit=24&direction=%s&cursor=%s",
-             query.newer ? "newer" : "older", query.cursor);
+    snprintf(path, sizeof(path), "/api/v1/memos?limit=%u&direction=%s&cursor=%s",
+             (unsigned)MEMO_API_MAX_ITEMS, query.newer ? "newer" : "older", query.cursor);
     body_buf_t buf = {0};
     const int code = http_get(path, &buf);
     if (code != 200) {

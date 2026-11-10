@@ -1,6 +1,6 @@
 // HTTP client for server discovery, paginated metadata and transcript windows.
 //
-// 缓存一页元数据（最多 24 条）与一个 2 KiB 正文窗口；音频始终流式读取。
+// 缓存一页元数据（最多 4 条）与一个 2 KiB 正文窗口；音频始终流式读取。
 #pragma once
 
 #include "esp_err.h"
@@ -9,7 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MEMO_API_MAX_ITEMS 24
+#define MEMO_API_MAX_ITEMS 4
 
 typedef struct {
     char id[37];

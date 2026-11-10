@@ -94,6 +94,23 @@ int main(void)
     assert(memo_api_item_copy(0,&copy) && strcmp(copy.id,ID)==0);
     assert(!memo_api_item_copy(1,&copy));
     assert(memo_api_take_updated() && !memo_api_take_updated());
+    assert(MEMO_API_MAX_ITEMS == 4 && strstr(last_url,"limit=4&"));
+    cJSON bounded_rows[5] = {0}, bounded_ids[5] = {0};
+    char bounded_uuid[5][37];
+    for (int i=0; i<5; i++) {
+        snprintf(bounded_uuid[i],sizeof(bounded_uuid[i]),"00000000-0000-4000-8000-%012u",(unsigned)i+1);
+        bounded_ids[i]=(cJSON){.key="id",.type=1,.valuestring=bounded_uuid[i],.next=&time_node};
+        bounded_rows[i].child=&bounded_ids[i];
+        if(i>0 && i<4)bounded_rows[i-1].next=&bounded_rows[i];
+    }
+    items.child=&bounded_rows[0];
+    assert(memo_api_refresh()==ESP_OK && memo_api_count()==4);
+    assert(memo_api_take_updated());
+    bounded_rows[3].next=&bounded_rows[4];
+    assert(memo_api_refresh()==ESP_ERR_INVALID_RESPONSE && memo_api_count()==4);
+    assert(!memo_api_take_updated());
+    items.child=&row;
+    assert(memo_api_refresh()==ESP_OK && memo_api_count()==1 && memo_api_take_updated());
     items.type=0;
     assert(memo_api_refresh() == ESP_ERR_INVALID_RESPONSE && memo_api_count() == 1);
     items.type=3; oversized=true;

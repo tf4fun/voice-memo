@@ -172,7 +172,7 @@ they are preserved and drained one at a time before allowing a new recording.
 
 ### 4.5 Settings
 
-UP and DOWN move through a five-row viewport covering all eight settings;
+UP and DOWN move through a six-row viewport covering all nine settings;
 holding either returns to the list.
 
 | Row | Display | OK click |
@@ -180,6 +180,7 @@ holding either returns to the list.
 | Network | SSID, connecting, unconfigured or disconnected | Enter Bluetooth provisioning |
 | Server | Discovered `host:port`, searching, waiting for network or not found | Queue rediscovery and API verification |
 | Volume | 0 / 20 / 40 / 60 / 80 / 100%, default 80% | Open value overlay |
+| Brightness | 10–100% in 10% steps, default 100% | Open preview/value overlay |
 | Screen timeout | Always on / 30 s / 1 min / 3 min, default 30 s | Open value overlay |
 | Sleep | Never / 1 min / 5 min / 15 min, default 5 min | Open value overlay |
 | Autoplay | On / Off, default off | Toggle immediately |
@@ -192,7 +193,10 @@ endpoints, with a smooth fill that survives unchanged refreshes. OK saves the se
 Write/commit failure keeps the overlay and draft open with a failure hint for
 retry or cancel. Autoplay changes immediately only after a successful save;
 failure leaves its confirmed value. Volume applies on successful save, without a
-preview tone. Editing prevents idle sleep. Timeout and sleep settings control idle
+preview tone. Brightness uses UP/DOWN to increase/decrease by 10%, clamped to
+10–100%, with immediate PWM preview and the same animated meter. Cancel restores
+the saved brightness; successful save persists it for boot and wake. A failed
+save retains the preview/draft for retry or cancel. Editing prevents idle sleep. Timeout and sleep settings control idle
 backlight blanking and deep sleep. A short gesture after blanking only wakes the screen; a deliberate OK hold
 continues into arming. Recording/decisions, playback including pause, provisioning and held
 keys keep it on. Closed pending recordings may sleep; active capture, unconfirmed drafts,

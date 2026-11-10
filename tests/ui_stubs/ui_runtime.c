@@ -28,8 +28,8 @@ void lv_obj_delete(lv_obj_t *o){ACCESS();assert(o && o->alive && o!=active);
 lv_obj_t *lv_label_create(lv_obj_t *p){lv_obj_t *o=lv_obj_create(p);o->label=true;o->h=24;return o;}
 void lv_obj_remove_style_all(lv_obj_t *o){ACCESS();assert(o);}
 int lv_color_hex(uint32_t c){return c;}
-void lv_obj_set_style_bg_color(lv_obj_t *o,int v,int s){(void)s;ACCESS();assert(o);o->color=v;}
-#define IGNORE_STYLE(fn) void fn(lv_obj_t *o,int v,int s){ACCESS();assert(o);(void)v;(void)s;}
+void lv_obj_set_style_bg_color(lv_obj_t *o,int v,int s){(void)s;ACCESS();assert(o);o->color=v;o->style_updates++;}
+#define IGNORE_STYLE(fn) void fn(lv_obj_t *o,int v,int s){ACCESS();assert(o);o->style_updates++;(void)v;(void)s;}
 IGNORE_STYLE(lv_obj_set_style_bg_opa)
 IGNORE_STYLE(lv_obj_set_style_radius)
 IGNORE_STYLE(lv_obj_set_style_border_color)
@@ -50,6 +50,7 @@ void lv_obj_set_pos(lv_obj_t *o,int x,int y){ACCESS();place(o,o->alignment,x,y);
 void lv_obj_set_size(lv_obj_t *o,int w,int h){ACCESS();o->w=w;o->h=h;o->height_fixed=true;}
 void lv_obj_set_width(lv_obj_t *o,int w){ACCESS();o->w=w;}
 int lv_obj_get_width(lv_obj_t *o){ACCESS();return o->w;}
+int32_t lv_obj_get_self_width(const lv_obj_t *o){ACCESS();int width=0;for(const unsigned char *p=(const unsigned char *)o->text;*p;p++){if((*p&0xc0)!=0x80)width+=*p<128?8:16;}return width;}
 void lv_obj_set_height(lv_obj_t *o,int h){ACCESS();o->h=h;o->height_fixed=true;}
 static void place(lv_obj_t *o,int a,int x,int y){
  int w=o->parent?o->parent->w:240,h=o->parent?o->parent->h:320;
@@ -91,6 +92,10 @@ void lv_anim_set_values(lv_anim_t *a,int f,int l){ACCESS();a->first=f;a->last=l;
 void lv_anim_set_duration(lv_anim_t *a,uint32_t d){ACCESS();a->duration=d;}
 void lv_anim_set_repeat_count(lv_anim_t *a,uint32_t c){ACCESS();a->repeat=c;}
 void lv_anim_set_exec_cb(lv_anim_t *a,void (*f)(void *,int32_t)){ACCESS();a->exec=f;}
+void lv_anim_set_completed_cb(lv_anim_t *a,void (*completed)(lv_anim_t *)){ACCESS();a->completed=completed;}
+void lv_obj_set_style_anim(lv_obj_t *o,const lv_anim_t *a,int s){ACCESS();(void)s;o->animation_template=a;o->style_updates++;}
+void lv_obj_set_style_anim_duration(lv_obj_t *o,uint32_t duration,int s){ACCESS();(void)s;o->anim_duration=(int)duration;o->style_updates++;}
+uint16_t lv_font_get_glyph_width(const lv_font_t *f,uint32_t letter,uint32_t next){ACCESS();(void)f;(void)next;return letter<128?8:16;}
 void lv_anim_start(lv_anim_t *a){ACCESS();lv_obj_t *o=a->var;o->animations_started++;o->anim_from=a->first;o->anim_to=a->last;o->anim_duration=a->duration;o->anim_repeat=a->repeat;o->animating=true;if(a->exec)a->exec(a->var,a->first);}
 void lv_anim_delete(void *v,void (*f)(void *,int32_t)){ACCESS();(void)f;if(v)((lv_obj_t *)v)->animating=false;}
 lv_obj_t *lv_arc_create(lv_obj_t *p){return lv_obj_create(p);}

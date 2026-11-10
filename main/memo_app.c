@@ -77,6 +77,7 @@ static bool s_wake_capture;
 static int64_t s_autosave_until;
 static memo_settings_edit_t s_settings_edit;
 static bool s_backlight_on = true;
+static int s_backlight_percent = -1;
 static bool s_local_playback_held;
 static int s_setting_selected;
 static bool s_settings_error;
@@ -315,6 +316,9 @@ static lv_obj_t *s_row_time[LIST_ROWS];
 static lv_obj_t *s_row_text[LIST_ROWS];
 static lv_obj_t *s_row_dur[LIST_ROWS];
 static lv_obj_t *s_row_accent[LIST_ROWS];
+static char s_list_marquee_id[37];
+static bool s_list_rows_dirty = true;
+static uint8_t s_list_status_style = 0xff;
 static lv_obj_t *s_list_scroll;
 static lv_obj_t *s_empty_label;
 
@@ -336,6 +340,20 @@ static memo_api_item_t s_remote_items[MEMO_API_MAX_ITEMS];
 static memo_api_page_t s_page;
 static list_view_t s_detail_entry;
 static memo_api_text_t s_detail_text;
+// List/detail share one bounded input-owner snapshot; only the selected row
+// may request full text. The API worker owns the corresponding HTTP cache.
+static struct {
+    char id[37];
+    uint32_t epoch, generation;
+    int64_t due_us, ready_at_us;
+    bool requested, ready, refresh;
+} s_list_text;
+static uint32_t s_list_display_epoch;
+static atomic_uint_least32_t s_list_completed_epoch;
+static atomic_uint_least32_t s_list_static_epoch;
+static lv_anim_t s_list_once_animation, s_list_loop_animation;
+static bool s_row_text_once[LIST_ROWS];
+static uint32_t s_row_text_duration[LIST_ROWS];
 static uint32_t s_page_generation, s_text_generation;
 static struct { bool pending; int page; uint32_t generation; } s_detail_navigation;
 static int s_list_top, s_local_count;
@@ -348,15 +366,54 @@ static int64_t s_next_text_poll;
 static int s_view_count;
 static int s_selected;
 
+static bool append_list_row(const list_view_t *row)
+{
+    list_view_t *destination = &s_view[s_view_count++];
+    const bool changed = memcmp(destination, row, sizeof(*row)) != 0;
+    memcpy(destination, row, sizeof(*row));
+    return changed;
+}
+
+static void list_text_completed(lv_anim_t *animation)
+{
+    (void)animation;
+    // LVGL task: signal only. HTTP requests stay in the input/worker tasks.
+    if (s_list_display_epoch) atomic_store(&s_list_completed_epoch, s_list_display_epoch);
+}
+
+static void list_text_reset(bool cancel)
+{
+    const bool owned = s_list_text.requested;
+    uint32_t epoch = s_list_text.epoch + 1;
+    if (!epoch) epoch++;
+    memset(&s_list_text, 0, sizeof(s_list_text));
+    s_list_text.epoch = epoch;
+    atomic_store(&s_list_completed_epoch, 0);
+    atomic_store(&s_list_static_epoch, 0);
+    if (owned) {
+        if (cancel) memo_api_cancel_text();
+        memset(&s_detail_text, 0, sizeof(s_detail_text));
+        s_list_rows_dirty = true;
+    }
+}
+
 static void build_list_page(void)
 {
+    s_list_rows_dirty = true;
+    s_list_status_style = 0xff;
     s_list_screen = lv_obj_create(NULL);
     memo_ui_flat_rect(s_list_screen, TERM_BG, 0);
     lv_obj_set_style_radius(s_list_screen, 0, 0);
 
     const int width = lv_display_get_horizontal_resolution(NULL);
+    lv_anim_init(&s_list_once_animation);
+    lv_anim_set_repeat_count(&s_list_once_animation, 0);
+    lv_anim_set_completed_cb(&s_list_once_animation, list_text_completed);
+    lv_anim_init(&s_list_loop_animation);
+    lv_anim_set_repeat_count(&s_list_loop_animation, LV_ANIM_REPEAT_INFINITE);
 
-    memo_ui_header(s_list_screen, "> 备忘");
+    lv_obj_t *title = memo_ui_header(s_list_screen, "> 备忘");
+    lv_obj_set_width(title, 80);
     const memo_rows_layout_t layout = memo_rows_layout(width, lv_display_get_vertical_resolution(NULL));
 
     for (int i = 0; i < LIST_ROWS; i++) {
@@ -381,10 +438,14 @@ static void build_list_page(void)
         s_row_text[i] = memo_ui_label(row, memo_font_label(), TERM_FG);
         lv_obj_set_size(s_row_text[i], columns.text_w, memo_font_label()->line_height);
         lv_label_set_long_mode(s_row_text[i], LV_LABEL_LONG_DOT);
+        lv_obj_set_style_anim(s_row_text[i], &s_list_loop_animation, 0);
+        s_row_text_once[i] = false;
+        s_row_text_duration[i] = 0;
         lv_obj_set_pos(s_row_text[i], columns.text_x, 0);
 
         s_row_dur[i] = memo_ui_label(row, memo_font_mono(), TERM_DIM);
         lv_obj_set_width(s_row_dur[i], columns.duration_w);
+        lv_obj_set_style_text_align(s_row_dur[i], LV_TEXT_ALIGN_RIGHT, 0);
         lv_label_set_long_mode(s_row_dur[i], LV_LABEL_LONG_CLIP);
         lv_obj_set_pos(s_row_dur[i], columns.duration_x, 31);
         lv_obj_set_height(s_row_dur[i], memo_font_mono()->line_height);
@@ -392,16 +453,21 @@ static void build_list_page(void)
 
     s_list_hint = memo_ui_label(s_list_screen, memo_font_label(), TERM_DIM);
     lv_label_set_text(s_list_hint, "");
-    lv_obj_set_pos(s_list_hint, 24, layout.footer_y);
-    lv_obj_set_width(s_list_hint, 120);
+    lv_obj_set_pos(s_list_hint, 24, lv_display_get_vertical_resolution(NULL) - 48);
+    lv_obj_set_size(s_list_hint, width - 48, memo_font_label()->line_height);
+    lv_obj_set_style_bg_color(s_list_hint, lv_color_hex(TERM_BG), 0);
+    lv_obj_set_style_bg_opa(s_list_hint, LV_OPA_COVER, 0);
+    lv_obj_set_hidden(s_list_hint, true);
 
     s_list_status = memo_ui_label(s_list_screen, memo_font_label(), TERM_DIM);
     lv_label_set_text(s_list_status, "");
-    lv_obj_set_pos(s_list_status, width-88, layout.footer_y);
-    lv_obj_set_width(s_list_status, 64);
-    lv_label_set_long_mode(s_list_status, LV_LABEL_LONG_DOT);
+    lv_obj_set_pos(s_list_status, 112, 8);
+    lv_obj_set_size(s_list_status, 64, memo_font_label()->line_height);
+    lv_obj_set_style_text_align(s_list_status, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_long_mode(s_list_status, LV_LABEL_LONG_CLIP);
 
-    s_list_scroll = memo_ui_scrollbar_create(s_list_screen, 228, layout.top, 218);
+    s_list_scroll = memo_ui_scrollbar_create(s_list_screen, 228, layout.top,
+        layout.rows * layout.pitch - (layout.pitch - layout.row_height));
     s_empty_label = memo_ui_label(s_list_screen, memo_font_body(), TERM_DIM);
     lv_obj_set_pos(s_empty_label, 24, 136);
     lv_obj_set_size(s_empty_label, width - 48, memo_font_body()->line_height);
@@ -547,6 +613,8 @@ static void row_highlight(int index, bool selected)
 /* 组装列表视图并重画。本地待上传排在最前，其后是服务端历史。 */
 static void load_list_model(void)
 {
+    const int previous_count = s_view_count;
+    bool changed = false;
     char selected_id[37] = "";
     if (s_selected >= 0 && s_selected < s_view_count) strcpy(selected_id, s_view[s_selected].id);
     memo_api_page_copy(s_remote_items, MEMO_API_MAX_ITEMS, &s_page);
@@ -558,7 +626,8 @@ static void load_list_model(void)
         if (entries[i].state == MEMO_SPOOL_SENT || entries[i].state == MEMO_SPOOL_RECORDING ||
             (entries[i].state == MEMO_SPOOL_DRAFT && s_sm.state != MEMO_STATE_AUTOSAVE)) continue;
         if (s_view_count >= VIEW_CAPACITY) break;
-        list_view_t *row = &s_view[s_view_count++];
+        list_view_t next;
+        list_view_t *row = &next;
         memset(row, 0, sizeof(*row));
         row->local = true;
         row->spool_state = entries[i].state;
@@ -568,6 +637,7 @@ static void load_list_model(void)
         snprintf(row->text, sizeof(row->text), "%s",
                  entries[i].state == MEMO_SPOOL_LEGACY_KEPT ? "待重试" :
                  entries[i].state == MEMO_SPOOL_BAD ? "上传失败" : "待传");
+        changed |= append_list_row(row);
     }
 
     s_local_count = s_view_count;
@@ -581,7 +651,8 @@ static void load_list_model(void)
             if (!strcmp(s_view[j].id, item->id)) { local_copy = true; break; }
         }
         if (local_copy) continue;
-        list_view_t *row = &s_view[s_view_count++];
+        list_view_t next;
+        list_view_t *row = &next;
         memset(row, 0, sizeof(*row));
         row->local = false;
         strcpy(row->status, item->status);
@@ -591,12 +662,16 @@ static void load_list_model(void)
         row->has_snippet = item->snippet[0] != '\0';
         if (item->snippet[0] != '\0') {
             memo_text_prefix(row->text, sizeof(row->text), item->snippet, SIZE_MAX);
+            for (char *p = row->text; *p; p++) {
+                if (*p == '\n' || *p == '\r' || *p == '\t') *p = ' ';
+            }
         } else if (strcmp(item->status, "ready") == 0) {
             snprintf(row->text, sizeof(row->text), "无转写");
         } else {
             snprintf(row->text, sizeof(row->text), "%s", strcmp(item->status, "failed") == 0 ? "转写失败" :
                 strcmp(item->status, "uploaded") == 0 ? "等待转写" : "转写中");
         }
+        changed |= append_list_row(row);
     }
     if (s_page.generation != s_page_generation) {
         s_page_generation = s_page.generation;
@@ -607,17 +682,31 @@ static void load_list_model(void)
 
     if (s_selected >= s_view_count) s_selected = s_view_count > 0 ? s_view_count - 1 : 0;
     if (s_selected < 0) s_selected = 0;
-
+    if (changed || previous_count != s_view_count) s_list_rows_dirty = true;
 }
 
-static void refresh_list(void)
+static bool refresh_list_rows(bool selection_changed)
 {
     const int32_t tz = memo_settings_get()->tz_offset_min;
-    s_list_top = memo_viewport_top(s_list_top, s_selected, s_view_count, LIST_ROWS);
+    bool ready = true;
     for (int i = 0; i < LIST_ROWS; i++) {
         const int index = s_list_top + i;
         const bool used = index < s_view_count && s_sm.state != MEMO_STATE_UPLOAD_REJECTED;
+        const bool selected = used && index == s_selected;
+        const bool full_text = selected && s_list_text.ready &&
+            strcmp(s_view[index].id, s_list_text.id) == 0 && s_detail_text.text[0];
+        const bool once = full_text && (s_detail_text.offset > 0 || s_detail_text.end < s_detail_text.total);
         memo_ui_card_visible(s_rows[i], s_row_shadows[i], used);
+        if (s_row_text_once[i] != once) {
+            lv_obj_set_style_anim(s_row_text[i], once ? &s_list_once_animation : &s_list_loop_animation, 0);
+            s_row_text_once[i] = once;
+        }
+        const lv_label_long_mode_t mode = selected ? LV_LABEL_LONG_SCROLL_CIRCULAR : LV_LABEL_LONG_DOT;
+        // Preserve the animation through heartbeats, but restart when a reused
+        // row represents another memo, even if its preview text is identical.
+        if (lv_label_get_long_mode(s_row_text[i]) != mode || (selected && selection_changed) ||
+            (full_text && s_list_display_epoch != s_list_text.epoch))
+            lv_label_set_long_mode(s_row_text[i], mode);
         if (!used) continue;
 
         char clock[8] = "--:--";
@@ -626,14 +715,29 @@ static void refresh_list(void)
             memo_time_clock(s_view[index].recorded_at, tz, clock, sizeof(clock));
         }
         memo_time_duration((int64_t)s_view[index].duration_ms, duration, sizeof(duration));
-        lv_label_set_text(s_row_time[i], clock);
-        memo_font_label_text(s_row_text[i], s_view[index].text, false);
+        if (strcmp(lv_label_get_text(s_row_time[i]), clock) != 0) lv_label_set_text(s_row_time[i], clock);
+        if (!memo_font_label_text(s_row_text[i], full_text ? s_detail_text.text : s_view[index].text, false)) ready = false;
+        if (selected) {
+            const int32_t text_width = lv_obj_get_self_width(s_row_text[i]);
+            const bool overflow = text_width > lv_obj_get_width(s_row_text[i]);
+            if (overflow) {
+                const uint32_t gap = LV_LABEL_WAIT_CHAR_COUNT * lv_font_get_glyph_width(memo_font_label(), ' ', ' ');
+                // LVGL's speed encoding caps a lap at 10 seconds. Use an
+                // explicit duration so full transcripts remain at 40 px/s.
+                const uint32_t duration = ((uint32_t)text_width + gap) * 1000u / 40u;
+                if (s_row_text_duration[i] != duration) {
+                    lv_obj_set_style_anim_duration(s_row_text[i], duration, 0);
+                    lv_label_set_long_mode(s_row_text[i], LV_LABEL_LONG_SCROLL_CIRCULAR);
+                    s_row_text_duration[i] = duration;
+                }
+            }
+            if (full_text) atomic_store(&s_list_static_epoch, once && !overflow ? s_list_text.epoch : 0);
+        }
         const bool bad_or_legacy = s_view[index].spool_state == MEMO_SPOOL_BAD ||
             s_view[index].spool_state == MEMO_SPOOL_LEGACY_KEPT;
         const memo_row_tone_t tone = memo_row_tone(s_view[index].local, bad_or_legacy,
             s_view[index].status, s_view[index].has_snippet);
         /* 单色终端：选中行整行反白；其余靠亮度与色条宽度区分状态。 */
-        const bool selected = index == s_selected;
         const memo_row_accent_t accent = memo_row_accent(s_view[index].local, bad_or_legacy,
             s_view[index].status, s_view[index].has_snippet);
         const uint32_t text_color = selected ? TERM_BG : tone == MEMO_TONE_MUTED ? TERM_DIM : TERM_FG;
@@ -646,8 +750,25 @@ static void refresh_list(void)
         lv_obj_set_style_text_color(s_row_dur[i], lv_color_hex(side_color), 0);
         lv_obj_set_style_bg_color(s_row_accent[i], lv_color_hex(accent_color), 0);
         lv_obj_set_size(s_row_accent[i], accent == MEMO_ACCENT_CORAL ? 4 : 2, 34);
-        lv_label_set_text(s_row_dur[i], duration);
+        if (strcmp(lv_label_get_text(s_row_dur[i]), duration) != 0) lv_label_set_text(s_row_dur[i], duration);
         row_highlight(i, index == s_selected);
+    }
+    s_list_display_epoch = s_list_text.ready ? s_list_text.epoch : 0;
+    return ready;
+}
+
+static void refresh_list(void)
+{
+    const char *selected_id = s_selected >= 0 && s_selected < s_view_count &&
+        s_sm.state != MEMO_STATE_UPLOAD_REJECTED ? s_view[s_selected].id : "";
+    const bool selection_changed = strcmp(s_list_marquee_id, selected_id) != 0;
+    s_list_top = memo_viewport_top(s_list_top, s_selected, s_view_count, LIST_ROWS);
+    if (s_list_rows_dirty || selection_changed) {
+        s_list_rows_dirty = !refresh_list_rows(selection_changed);
+        strcpy(s_list_marquee_id, selected_id);
+        const memo_rows_layout_t layout = memo_rows_layout(lv_display_get_horizontal_resolution(NULL), lv_display_get_vertical_resolution(NULL));
+        memo_ui_scrollbar_update(s_list_scroll, layout.rows * layout.pitch - (layout.pitch - layout.row_height), s_view_count, LIST_ROWS, s_list_top);
+        if (s_sm.state == MEMO_STATE_UPLOAD_REJECTED) lv_obj_set_hidden(s_list_scroll, true);
     }
 
     char status[32];
@@ -657,26 +778,30 @@ static void refresh_list(void)
     else if (s_page.loading) snprintf(status, sizeof(status), "读取中");
     else if (s_page.error != ESP_OK) snprintf(status, sizeof(status), "读取失败");
     else snprintf(status, sizeof(status), "%d/%d", s_selected+1, s_view_count);
-    lv_label_set_text(s_list_status, status);
-    lv_obj_set_style_text_color(s_list_status, lv_color_hex(s_page.error ? TERM_FG : TERM_DIM), 0);
+    if (strcmp(lv_label_get_text(s_list_status), status) != 0) lv_label_set_text(s_list_status, status);
     const bool undo = s_sm.state == MEMO_STATE_AUTOSAVE;
-    lv_obj_set_width(s_list_hint, undo ? 168 : 120);
-    lv_obj_set_pos(s_list_status, lv_display_get_horizontal_resolution(NULL) - (undo ? 40 : 88), lv_display_get_vertical_resolution(NULL) - 40);
-    lv_obj_set_width(s_list_status, undo ? 16 : 64);
     const char *notice = memo_notice_text(&s_list_notice, esp_timer_get_time());
     const bool blocked = memo_spool_recovery_blocked();
-    lv_label_set_text(s_list_hint, blocked ? "存储错误" : s_sm.state == MEMO_STATE_AUTOSAVE ? "已保存 · 可撤销" : notice ? notice : "");
-    lv_obj_set_style_text_color(s_list_hint, lv_color_hex(blocked || notice ? TERM_FG : TERM_DIM), 0);
-    memo_ui_scrollbar_update(s_list_scroll, 218, s_view_count, LIST_ROWS, s_list_top);
+    const char *hint = blocked ? "存储错误" : undo ? "已保存 · 可撤销" : notice ? notice : "";
+    if (strcmp(lv_label_get_text(s_list_hint), hint) != 0) lv_label_set_text(s_list_hint, hint);
     const bool empty = s_view_count == 0 && s_sm.state != MEMO_STATE_UPLOAD_REJECTED;
-    lv_obj_set_hidden(s_empty_label, !empty);
-    if (empty) {
-        lv_label_set_text(s_empty_label, s_page.loading ? "正在读取" : s_page.error ? "读取失败" : "暂无录音");
+    const bool rejected = s_sm.state == MEMO_STATE_UPLOAD_REJECTED;
+    const bool show_hint = hint[0] && !rejected;
+    const uint8_t status_style = (s_page.error ? 1 : 0) | (undo ? 2 : 0) |
+        (blocked || notice ? 4 : 0) | (empty ? 8 : 0) | (rejected ? 16 : 0) | (show_hint ? 32 : 0);
+    if (s_list_status_style != status_style) {
+        s_list_status_style = status_style;
+        lv_obj_set_style_text_color(s_list_status, lv_color_hex(s_page.error ? TERM_FG : TERM_DIM), 0);
+        lv_obj_set_style_text_color(s_list_hint, lv_color_hex(blocked || notice ? TERM_FG : TERM_DIM), 0);
         lv_obj_set_style_text_color(s_empty_label, lv_color_hex(s_page.error ? TERM_FG : TERM_DIM), 0);
+        lv_obj_set_hidden(s_empty_label, !empty);
+        lv_obj_set_hidden(s_list_hint, !show_hint);
+        lv_obj_set_hidden(s_list_status, rejected);
     }
-    if (s_sm.state == MEMO_STATE_UPLOAD_REJECTED) lv_obj_set_hidden(s_list_scroll, true);
-    lv_obj_set_hidden(s_list_hint, s_sm.state == MEMO_STATE_UPLOAD_REJECTED);
-    lv_obj_set_hidden(s_list_status, s_sm.state == MEMO_STATE_UPLOAD_REJECTED);
+    if (empty) {
+        const char *message = s_page.loading ? "正在读取" : s_page.error ? "读取失败" : "暂无录音";
+        if (strcmp(lv_label_get_text(s_empty_label), message) != 0) lv_label_set_text(s_empty_label, message);
+    }
 }
 
 /* 播放当前选中项：本地文件直接播，服务端条目先下载到 SPIFFS 的临时文件。 */
@@ -718,6 +843,7 @@ static void play_selected(void)
 static void open_selected_detail(void)
 {
     if (s_selected < 0 || s_selected >= s_view_count) return;
+    list_text_reset(false);
     s_detail_navigation.pending = false;
     s_detail_entry = s_view[s_selected];
     s_detail_duration_ms = s_detail_entry.duration_ms;
@@ -860,6 +986,84 @@ static const char *detail_placeholder(void)
     return "无转写文字";
 }
 
+static void request_list_text(uint32_t offset, const char *revision, int64_t now)
+{
+    if (memo_api_request_text(s_list_text.id, offset, false, revision) == ESP_OK) {
+        s_list_text.requested = true;
+        s_list_text.refresh = false;
+        s_detail_text.pending = true;
+    }
+    s_list_text.due_us = now + 2000000;
+}
+
+static void poll_list_text(int64_t now, bool updated)
+{
+    const bool in_list = s_sm.state == MEMO_STATE_LIST || s_sm.state == MEMO_STATE_AUTOSAVE;
+    const list_view_t *row = in_list && s_selected >= 0 && s_selected < s_view_count ? &s_view[s_selected] : NULL;
+    // Short previews already contain the full text. Fetch only when the
+    // metadata buffer may have cut a UTF-8 character boundary or an ellipsis.
+    const bool truncated = row && (strlen(row->text) >= sizeof(row->text) - 4 || strstr(row->text, "…"));
+    if (!row || row->local || !row->has_snippet || !truncated) {
+        if (s_list_text.id[0]) list_text_reset(true);
+        return;
+    }
+    if (strcmp(s_list_text.id, row->id) != 0) {
+        list_text_reset(true);
+        strcpy(s_list_text.id, row->id);
+        s_list_text.due_us = now + 400000; // Coalesce quick UP/DOWN navigation.
+        return;
+    }
+    s_list_text.refresh |= updated;
+    if (!s_list_text.requested) {
+        if (now >= s_list_text.due_us) {
+            memset(&s_detail_text, 0, sizeof(s_detail_text));
+            request_list_text(0, "", now);
+        }
+        return;
+    }
+
+    const bool previously_ready = s_list_text.ready;
+    const uint32_t old_offset = s_detail_text.offset, old_end = s_detail_text.end;
+    char old_revision[65];
+    strcpy(old_revision, s_detail_text.revision);
+    if (s_detail_text.pending || !s_list_text.ready) {
+        if (!memo_api_text_copy(&s_detail_text) || strcmp(s_detail_text.id, s_list_text.id) != 0) return;
+    }
+    if (s_detail_text.pending) return;
+    if (s_detail_text.error != ESP_OK) {
+        if (s_detail_text.error == ESP_ERR_INVALID_STATE) {
+            s_list_text.ready = false;
+            s_list_rows_dirty = true;
+            request_list_text(0, "", now);
+        } else if (s_detail_text.error != ESP_ERR_NOT_FOUND && now >= s_list_text.due_us) {
+            request_list_text(s_detail_text.offset, s_list_text.ready ? s_detail_text.revision : "", now);
+        }
+        return;
+    }
+    if (s_list_text.generation != s_detail_text.generation) {
+        s_list_text.generation = s_detail_text.generation;
+        s_list_text.ready = true;
+        for (char *p = s_detail_text.text; *p; p++) {
+            if (*p == '\n' || *p == '\r' || *p == '\t') *p = ' ';
+        }
+        if (!previously_ready || old_offset != s_detail_text.offset || old_end != s_detail_text.end ||
+            strcmp(old_revision, s_detail_text.revision) != 0) {
+            if (++s_list_text.epoch == 0) s_list_text.epoch++;
+            s_list_text.ready_at_us = now;
+            s_list_rows_dirty = true;
+        }
+    }
+    const uint32_t completed = atomic_exchange(&s_list_completed_epoch, 0);
+    const bool static_complete = atomic_load(&s_list_static_epoch) == s_list_text.epoch &&
+        now - s_list_text.ready_at_us >= 3000000;
+    if ((completed && completed == s_list_text.epoch) || static_complete) {
+        const uint32_t next = s_detail_text.end < s_detail_text.total ? s_detail_text.end : 0;
+        request_list_text(next, s_detail_text.revision, now);
+    } else if (s_list_text.refresh && now >= s_list_text.due_us) {
+        request_list_text(s_detail_text.offset, s_detail_text.revision, now);
+    }
+}
+
 static void poll_browse(void)
 {
     const int64_t now = esp_timer_get_time();
@@ -873,6 +1077,7 @@ static void poll_browse(void)
         s_soc = bsp_battery_soc(); // I2C is deliberately outside the LVGL lock.
         next_battery = now + 5000000;
     }
+    poll_list_text(now, updated);
     poll_detail_navigation();
     if (s_detail_navigation.pending) return;
     if (!detail_state(s_sm.state)) return;
@@ -973,6 +1178,12 @@ static void release_page(void)
     memset(s_row_text, 0, sizeof(s_row_text));
     memset(s_row_dur, 0, sizeof(s_row_dur));
     memset(s_row_accent, 0, sizeof(s_row_accent));
+    s_list_marquee_id[0] = '\0';
+    s_list_rows_dirty = true;
+    s_list_status_style = 0xff;
+    s_list_display_epoch = 0;
+    atomic_store(&s_list_completed_epoch, 0);
+    atomic_store(&s_list_static_epoch, 0);
     s_timer_label = s_record_hint = s_arm_arc = s_rec_dot = s_rec_title = NULL;
     s_capture_caption = s_input_caption = s_input_level = s_wave_baseline = NULL;
     memset(s_level_bars, 0, sizeof(s_level_bars));
@@ -1361,6 +1572,20 @@ static void act_open_settings(void)
     s_settings_error = false;
 }
 
+// The input owner applies PWM outside the LVGL lock. Only brightness editing
+// previews the draft; cancel, save, startup and wake all use the confirmed value.
+static void apply_backlight(bool on)
+{
+    const uint8_t brightness = s_settings_edit.active && s_settings_edit.field == MEMO_EDIT_BRIGHTNESS ?
+        s_settings_edit.value.brightness : memo_settings_get()->brightness;
+    const int percent = on ? brightness : 0;
+    if (percent != s_backlight_percent || on != s_backlight_on) {
+        bsp_display_backlight((uint8_t)percent);
+        s_backlight_percent = percent;
+    }
+    s_backlight_on = on;
+}
+
 static void act_settings_move(memo_action_t action)
 {
     s_setting_selected += action == MEMO_ACT_SETTINGS_NEXT ? 1 : -1;
@@ -1392,6 +1617,7 @@ static void enter_toggle_row(memo_setting_row_t row)
 static void enter_edit_row(memo_setting_row_t row)
 {
     const memo_settings_field_t field = row == MEMO_SETTING_VOLUME ? MEMO_EDIT_VOLUME :
+        row == MEMO_SETTING_BRIGHTNESS ? MEMO_EDIT_BRIGHTNESS :
         row == MEMO_SETTING_TIMEOUT ? MEMO_EDIT_TIMEOUT : MEMO_EDIT_SLEEP;
     s_settings_error = false;
     if (memo_settings_edit_begin(&s_settings_edit, field) != ESP_OK) {
@@ -1428,8 +1654,9 @@ static void act_sub_page_adjust(memo_action_t action)
 {
     s_settings_error = false;
     int direction = action == MEMO_ACT_SUB_PAGE_NEXT ? 1 : -1;
-    if (s_settings_edit.field == MEMO_EDIT_VOLUME) direction = -direction;
+    if (s_settings_edit.field == MEMO_EDIT_VOLUME || s_settings_edit.field == MEMO_EDIT_BRIGHTNESS) direction = -direction;
     memo_settings_edit_adjust(&s_settings_edit, direction);
+    if (s_settings_edit.field == MEMO_EDIT_BRIGHTNESS) apply_backlight(s_backlight_on);
 }
 
 static void act_sub_page_save(void)
@@ -1437,12 +1664,14 @@ static void act_sub_page_save(void)
     const esp_err_t err = memo_settings_edit_save(&s_settings_edit);
     s_settings_error = err != ESP_OK;
     if (err != ESP_OK) s_sm.state = MEMO_STATE_SUB_PAGE;
+    apply_backlight(s_backlight_on);
 }
 
 static void act_sub_page_cancel(void)
 {
     s_settings_error = false;
     memo_settings_edit_cancel(&s_settings_edit);
+    apply_backlight(s_backlight_on);
 }
 
 static void act_cancel_provisioning(void)
@@ -1821,10 +2050,7 @@ static void power_poll(int64_t now_ms)
         settings->screen_timeout_s, settings->sleep_min, keep_on,
         memo_spool_recovery_blocked() || memo_player_is_busy() || s_network_resume_needed);
     const bool on = action == MEMO_POWER_ON;
-    if (on != s_backlight_on) {
-        bsp_display_backlight(on ? 100 : 0);
-        s_backlight_on = on;
-    }
+    apply_backlight(on);
     if (action == MEMO_POWER_SLEEP) {
         s_sleep_files_checked = false;
         memo_power_shutdown(&s_power_ops);
@@ -1884,8 +2110,7 @@ static void input_task(void *arg)
                 consumed = false;
             }
             if (!s_backlight_on) {
-                bsp_display_backlight(100);
-                s_backlight_on = true;
+                apply_backlight(true);
             }
         }
         if (received && !consumed) {
@@ -1992,7 +2217,7 @@ static bool init_display(void)
         ESP_LOGE(TAG, "display/LVGL init failed; check SPI pins");
         return false;
     }
-    bsp_display_backlight(100);
+    apply_backlight(true);
     return true;
 }
 

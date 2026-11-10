@@ -35,7 +35,7 @@ static bool recovery_blocked, capture_hold, playback_hold, discovery_requested, 
 static int player_polls;
 static int loop_budget, starts, stops, plays, pauses, resumes, text_requests, text_cancels, page_requests;
 static int writes, commits, volume_calls, moves, removes, choices, discovery_requests, refresh_requests;
-static int upload_stops, events_stops, network_stops, prov_starts, prov_stops, backlight;
+static int upload_stops, events_stops, network_stops, prov_starts, prov_stops, backlight, backlight_calls;
 static esp_err_t rec_start_error, rec_stop_error, player_stop_error, play_error, file_error, commit_error;
 static esp_err_t provision_stop_error, upload_stop_error;
 static uint32_t rec_elapsed, player_position;
@@ -93,7 +93,7 @@ esp_err_t bsp_display_init(void){return ESP_OK;}
 void *bsp_lvgl_init(void){return (void *)3;}
 bool bsp_lvgl_lock(int t){(void)t;assert(!locked);if(deny_locks)return false;locked=true;return true;}
 void bsp_lvgl_unlock(void){assert(locked);locked=false;}
-void bsp_display_backlight(uint8_t p){unlocked();backlight=p;}
+void bsp_display_backlight(uint8_t p){unlocked();backlight=p;backlight_calls++;}
 esp_err_t bsp_display_prepare_deep_sleep(void){return ESP_OK;}
 esp_err_t nvs_flash_init(void){unlocked();return ESP_OK;}
 esp_err_t nvs_open(const char *name,int mode,nvs_handle_t *out){unlocked();(void)name;(void)mode;*out=1;return ESP_OK;}
@@ -182,6 +182,7 @@ static void hold(bsp_btn_t btn){key(btn,BSP_BTN_PRESS);key(btn,BSP_BTN_LONG);key
 static lv_obj_t *find(lv_obj_t *root,const char *text){if(!root)return NULL;if(!strcmp(root->text,text))return root;for(int i=0;i<root->child_count;i++){lv_obj_t *o=find(root->children[i],text);if(o)return o;}return NULL;}
 static void remote_rows(int count)
 {
+    assert(count >= 0 && count <= MEMO_API_MAX_ITEMS);
     remote_page=(memo_api_page_t){.count=count};
     for(int i=0;i<count;i++){
         remote_items[i]=(memo_api_item_t){.recorded_at=1700000000,.duration_ms=3000,.status="ready",.snippet="test"};
@@ -207,6 +208,136 @@ static void heartbeat_cadence(void)
     // One uninterrupted task run: 50 ms receives must schedule 200 ms heartbeat.
     int before=player_polls;run(10);assert(player_polls==before+3);
 }
+static void test_selected_list_marquee(void)
+{
+    const char *summary = "A long transcript\nthat exceeds the memo row width and keeps scrolling.";
+    for (int i = 0; i < remote_page.count; i++)
+        snprintf(remote_items[i].snippet, sizeof(remote_items[i].snippet), "%s", summary);
+    updated = true;
+    run(4);
+    for (int i = 0; i < LIST_ROWS; i++) {
+        assert(s_row_text[i]->long_mode == (i == 0 ? LV_LABEL_LONG_SCROLL_CIRCULAR : LV_LABEL_LONG_DOT));
+        assert(s_row_text[i]->height_fixed && s_row_text[i]->h == memo_font_label()->line_height);
+        assert(strchr(s_row_text[i]->text, '\n') == NULL);
+    }
+    lv_obj_t *label = s_row_text[0];
+    int mode_updates = label->long_mode_updates;
+    int text_updates = label->text_updates;
+    int row_updates[LIST_ROWS];
+    int row_styles[LIST_ROWS];
+    for (int i = 0; i < LIST_ROWS; i++)
+        row_updates[i] = s_row_time[i]->text_updates + s_row_dur[i]->text_updates + s_row_text[i]->text_updates;
+    for (int i = 0; i < LIST_ROWS; i++)
+        row_styles[i] = s_rows[i]->style_updates + s_row_text[i]->style_updates;
+    label->marquee_offset = 24;
+    run(40); // Includes two periodic model snapshots, not just UI heartbeats.
+    for (int i = 0; i < LIST_ROWS; i++)
+        assert(row_updates[i] == s_row_time[i]->text_updates + s_row_dur[i]->text_updates + s_row_text[i]->text_updates);
+    for (int i = 0; i < LIST_ROWS; i++)
+        assert(row_styles[i] == s_rows[i]->style_updates + s_row_text[i]->style_updates);
+    updated = true;
+    run(4);
+    assert(label->marquee_offset == 24 && label->long_mode_updates == mode_updates);
+    assert(label->text_updates == text_updates);
+
+    click(BSP_BTN_DOWN);
+    assert(label->long_mode == LV_LABEL_LONG_DOT && label->marquee_offset == 0);
+    assert(s_row_text[1]->long_mode == LV_LABEL_LONG_SCROLL_CIRCULAR);
+    files[0]=(memo_spool_entry_t){.recorded_at=1700000000,.duration_ms=3000,.state=MEMO_SPOOL_PENDING};
+    strcpy(files[0].id,"00000000-0000-4000-8000-000000000999");
+    file_count=1;updated=true;run(4);
+    list_select(LIST_ROWS - 1);
+    label = s_row_text[LIST_ROWS - 1];
+    label->marquee_offset = 24;
+    mode_updates = label->long_mode_updates;
+    text_updates = label->text_updates;
+    click(BSP_BTN_DOWN); // Same physical label and identical text, different UUID.
+    assert(label == s_row_text[s_selected - s_list_top]);
+    assert(label->long_mode == LV_LABEL_LONG_SCROLL_CIRCULAR && label->marquee_offset == 0);
+    assert(label->long_mode_updates > mode_updates && label->text_updates == text_updates);
+    for (int i = 0; i < LIST_ROWS - 1; i++)
+        assert(s_row_text[i]->long_mode == LV_LABEL_LONG_DOT);
+
+    file_count = 0;
+    remote_page.count = 0;
+    updated = true;
+    run(4);
+    for (int i = 0; i < LIST_ROWS; i++) {
+        assert(s_rows[i]->hidden && s_row_text[i]->long_mode == LV_LABEL_LONG_DOT);
+    }
+    remote_rows(MEMO_API_MAX_ITEMS);
+    run(4);
+    list_select(0);
+}
+static void list_window_reply(uint32_t offset, uint32_t end, uint32_t total, unsigned generation, char fill)
+{
+    remote_text = (memo_api_text_t){.offset=offset,.end=end,.total=total,.generation=generation,.status="ready"};
+    strcpy(remote_text.id, s_list_text.id);
+    memset(remote_text.revision, 'a', 64);
+    memset(remote_text.text, fill, end-offset);
+    run(4);
+}
+static void finish_list_lap(void)
+{
+    assert(bsp_lvgl_lock(1));
+    const lv_anim_t *animation = s_row_text[s_selected-s_list_top]->animation_template;
+    assert(animation && animation->completed);
+    lv_anim_t completed = *animation;
+    animation->completed(&completed);
+    bsp_lvgl_unlock();
+    run(4);
+}
+static void test_full_list_transcripts(void)
+{
+    memset(remote_items[0].snippet, 'a', sizeof(remote_items[0].snippet)-1);
+    updated = true;
+    run(1);
+    int before = text_requests;
+    run(2);
+    assert(text_requests == before); // A quick selection does not fetch a body.
+    run(16);
+    assert(text_requests == before+1 && requested_offset == 0);
+    assert(!strcmp(requested_id, remote_items[0].id));
+    list_window_reply(0,2048,4100,100,'A');
+    lv_obj_t *label = s_row_text[0];
+    assert(strlen(label->text) == 2048 && label->text[2047] == 'A');
+    assert(label->anim_duration > 10000); // Long text must not speed up to fit a 10s lap.
+    for (int i = 1; i < LIST_ROWS; i++) assert(!strcmp(s_row_text[i]->text,"test"));
+    finish_list_lap();
+    assert(requested_offset == 2048 && requested_revision[0] == 'a');
+    list_window_reply(2048,4096,4100,101,'B');
+    assert(label->text[0] == 'B' && label->text[2047] == 'B');
+    finish_list_lap();
+    assert(requested_offset == 4096);
+    list_window_reply(4096,4100,4100,102,'Z');
+    assert(!strcmp(label->text,"ZZZZ"));
+    run(64); // A final short segment has no animation, so dwell then restart.
+    assert(requested_offset == 0 && remote_text.pending);
+    remote_text.pending = false;
+    remote_text.error = ESP_ERR_INVALID_STATE;
+    run(4);
+    assert(requested_offset == 0 && requested_revision[0] == '\0');
+
+    // A stale old-memo reply must never be painted on the new selection.
+    char previous_id[37];
+    strcpy(previous_id, requested_id);
+    click(BSP_BTN_DOWN);
+    remote_text = (memo_api_text_t){.generation=103,.status="ready",.text="stale previous transcript"};
+    strcpy(remote_text.id, previous_id);
+    run(8);
+    assert(!strcmp(s_row_text[s_selected-s_list_top]->text,"test"));
+    list_select(0);
+    run(16);
+    assert(remote_text.pending && !strcmp(requested_id,remote_items[0].id));
+    click(BSP_BTN_OK); // Detail takes ownership before the list cleanup runs.
+    before = text_requests;
+    run(12);
+    assert(detail_state(s_sm.state) && remote_text.pending && text_requests == before);
+    hold(BSP_BTN_OK);
+    remote_rows(MEMO_API_MAX_ITEMS);
+    run(4);
+    list_select(0);
+}
 static void test_settings_actions_survive_render_timeout(void)
 {
     deny_locks=true;hold(BSP_BTN_UP);
@@ -215,6 +346,13 @@ static void test_settings_actions_survive_render_timeout(void)
     assert(s_sm.state==MEMO_STATE_SETTINGS && discovery_requests==1);
     deny_locks=false;run(1);
     assert(find(memo_ui_settings_screen(),"查找中"));
+    lv_obj_t *position=find(memo_ui_settings_screen(),"2/9");
+    assert(position && position->y < 44);
+    for(int i=0;i<9;i++){
+        const char *names[]={"01 网络","02 服务器","03 音量","04 亮度","05 自动息屏","06 深度休眠","07 自动播放","08 自动保存","09 关于"};
+        lv_obj_t *label=find(memo_ui_settings_screen(),names[i]);
+        assert(label && label->parent->hidden==(i>=6));
+    }
     discovery_requested=false;run(1);
     lv_obj_t *server_value=find(memo_ui_settings_screen(),"127.0.0.1:8080");
     assert(server_value);
@@ -243,8 +381,46 @@ static void test_settings_actions_survive_render_timeout(void)
     deny_locks=false;run(2);assert(writes==before);click(BSP_BTN_OK);assert(!memo_settings_get()->autoplay);
     heartbeat_cadence();
     settings_select(MEMO_SETTING_ABOUT);click(BSP_BTN_OK);assert(s_sm.state==MEMO_STATE_SETTINGS);
+    assert(find(memo_ui_settings_screen(),"9/9"));
+    assert(find(memo_ui_settings_screen(),"01 网络")->parent->hidden);
+    assert(!find(memo_ui_settings_screen(),"09 关于")->parent->hidden);
     hold(BSP_BTN_UP);assert(s_sm.state==MEMO_STATE_LIST);
 }
+static void test_brightness_preview_save_cancel_and_wake(void)
+{
+    hold(BSP_BTN_UP);settings_select(MEMO_SETTING_BRIGHTNESS);
+    int before=writes, audio_before=volume_calls;
+    deny_locks=true;click(BSP_BTN_OK);click(BSP_BTN_DOWN);
+    assert(s_settings_edit.active && s_settings_edit.value.brightness==90 && backlight==90);
+    assert(memo_settings_get()->brightness==100 && writes==before && volume_calls==audio_before);
+    int applied=backlight_calls;run(12);
+    assert(backlight_calls==applied && backlight==90);
+    hold(BSP_BTN_OK);
+    assert(!s_settings_edit.active && backlight==100 && writes==before);
+    deny_locks=false;run(1);click(BSP_BTN_OK);
+    for(int i=0;i<12;i++)click(BSP_BTN_DOWN);
+    assert(backlight==10 && s_settings_edit.value.brightness==10 && writes==before);
+    click(BSP_BTN_UP);assert(backlight==20);
+    commit_error=ESP_FAIL;click(BSP_BTN_OK);
+    assert(s_sm.state==MEMO_STATE_SUB_PAGE && s_settings_edit.active && backlight==20);
+    assert(memo_settings_get()->brightness==100 && find(memo_ui_settings_screen(),"处理失败"));
+    int failed_writes=writes;run(12);assert(writes==failed_writes);
+    commit_error=0;hold(BSP_BTN_OK);assert(backlight==100);
+    click(BSP_BTN_OK);click(BSP_BTN_DOWN);click(BSP_BTN_DOWN);click(BSP_BTN_DOWN);click(BSP_BTN_OK);
+    assert(memo_settings_get()->brightness==70 && backlight==70 && !s_settings_edit.active);
+    // Display startup and physical wake both restore the saved level.
+    s_backlight_percent=-1;backlight=0;assert(init_display() && backlight==70);
+    hold(BSP_BTN_UP);assert(s_sm.state==MEMO_STATE_LIST);
+    s_power.activity_ms=clock_us/1000-((int64_t)memo_settings_get()->screen_timeout_s+1)*1000;
+    power_poll(clock_us/1000);assert(s_power.blank && backlight==0);
+    const int selected=s_selected;click(BSP_BTN_DOWN);
+    assert(s_backlight_on && backlight==70 && s_selected==selected);
+    // Leave the default for the subsequent, independent power/gesture cases.
+    hold(BSP_BTN_UP);settings_select(MEMO_SETTING_BRIGHTNESS);click(BSP_BTN_OK);
+    click(BSP_BTN_UP);click(BSP_BTN_UP);click(BSP_BTN_UP);click(BSP_BTN_OK);hold(BSP_BTN_UP);
+    assert(memo_settings_get()->brightness==100 && backlight==100 && volume_calls==audio_before);
+}
+
 static void page_complete(int count,int direction)
 {
     remote_page.count=count;remote_page.loading=false;remote_page.error=ESP_OK;
@@ -252,19 +428,19 @@ static void page_complete(int count,int direction)
 }
 static void test_list_and_detail_page_actions(void)
 {
-    list_select(11);strcpy(remote_page.next_cursor,"older");updated=true;run(1);
+    list_select(MEMO_API_MAX_ITEMS-1);strcpy(remote_page.next_cursor,"older");updated=true;run(1);
     int before=page_requests;click(BSP_BTN_DOWN);
     assert(page_requests==before+1 && requested_page==1 && s_page.loading);
     page_complete(3,1);assert(s_selected==0 && s_view_count==3);
     strcpy(remote_page.previous_cursor,"newer");remote_page.next_cursor[0]=0;updated=true;run(1);
-    click(BSP_BTN_UP);assert(requested_page==-1);strcpy(remote_page.next_cursor,"older");page_complete(12,-1);
-    assert(s_selected==11);
+    click(BSP_BTN_UP);assert(requested_page==-1);strcpy(remote_page.next_cursor,"older");page_complete(MEMO_API_MAX_ITEMS,-1);
+    assert(s_selected==MEMO_API_MAX_ITEMS-1);
     // A failed page request preserves rows/selection and exposes the error.
     before=page_requests;click(BSP_BTN_DOWN);assert(page_requests==before+1);remote_page.loading=false;remote_page.error=ESP_FAIL;updated=true;run(1);
-    assert(s_selected==11 && s_view_count==12 && find(s_list_screen,"读取失败"));
+    assert(s_selected==MEMO_API_MAX_ITEMS-1 && s_view_count==MEMO_API_MAX_ITEMS && find(s_list_screen,"读取失败"));
     remote_page.error=0;updated=true;run(1);
     // Background reorder follows the UUID, not the old row index.
-    memo_api_item_t swap=remote_items[11];remote_items[11]=remote_items[1];remote_items[1]=swap;
+    memo_api_item_t swap=remote_items[MEMO_API_MAX_ITEMS-1];remote_items[MEMO_API_MAX_ITEMS-1]=remote_items[1];remote_items[1]=swap;
     updated=true;run(1);assert(s_selected==1);
     deny_locks=true;click(BSP_BTN_OK);
     assert(s_sm.state==MEMO_STATE_DETAIL && !strcmp(requested_id,swap.id));
@@ -278,7 +454,7 @@ static void test_list_and_detail_page_actions(void)
     hold(BSP_BTN_OK);assert(s_sm.state==MEMO_STATE_LIST);
     remote_page=(memo_api_page_t){0};updated=true;run(1);click(BSP_BTN_OK);
     assert(s_sm.state==MEMO_STATE_LIST && s_view_count==0);
-    remote_rows(12);updated=true;run(1);list_select(0);
+    remote_rows(MEMO_API_MAX_ITEMS);updated=true;run(1);list_select(0);
 }
 static void window_complete(uint32_t offset,unsigned generation,char revision)
 {
@@ -385,7 +561,7 @@ static void test_detail_adjacent_navigation(void)
     hold(BSP_BTN_OK);assert(s_sm.state==MEMO_STATE_LIST && !s_detail_navigation.pending);
     detail_page_complete(7,3,1,true,false);assert(s_sm.state==MEMO_STATE_LIST);
     assert(memo_settings_get()->volume==volume);
-    detail_page_complete(1,12,2,false,true);
+    detail_page_complete(1,MEMO_API_MAX_ITEMS,2,false,true);
 }
 static void test_detail_local_navigation_ownership(void)
 {
@@ -402,13 +578,13 @@ static void test_detail_local_navigation_ownership(void)
     hold(BSP_BTN_DOWN);assert(s_detail_navigation.pending && requested_page==0);
     detail_page_complete(1,3,2,false,true);detail_is(1);assert(!s_detail_entry.local);
     hold(BSP_BTN_OK);file_count=0;
-    detail_page_complete(1,12,2,false,true);
+    detail_page_complete(1,MEMO_API_MAX_ITEMS,2,false,true);
 }
 
 static void test_failed_list_page_does_not_poison_detail(void)
 {
     player_position=2000; // Previous completed recording must not leak into a new detail.
-    list_select(11);strcpy(remote_page.next_cursor,"older");updated=true;run(1);
+    list_select(MEMO_API_MAX_ITEMS-1);strcpy(remote_page.next_cursor,"older");updated=true;run(1);
     click(BSP_BTN_DOWN);remote_page.loading=false;remote_page.error=ESP_FAIL;updated=true;run(1);
     click(BSP_BTN_OK);
     remote_text=(memo_api_text_t){.generation=1,.text="test",.revision="r",.end=4,.total=4,.status="ready"};
@@ -418,7 +594,7 @@ static void test_failed_list_page_does_not_poison_detail(void)
     char retained_id[37];strcpy(retained_id,s_detail_entry.id);
     int before=page_requests;click(BSP_BTN_DOWN);
     assert(!strcmp(s_detail_entry.id,retained_id) && page_requests==before);
-    hold(BSP_BTN_OK);remote_rows(12);remote_page.error=0;updated=true;run(1);list_select(0);
+    hold(BSP_BTN_OK);remote_rows(MEMO_API_MAX_ITEMS);remote_page.error=0;updated=true;run(1);list_select(0);
 }
 static void begin_capture(void)
 {
@@ -787,9 +963,9 @@ int main(int argc,char **argv)
         puts("memo actual deep-wake boot guard and first fresh gesture: PASS");
         return 0;
     }
-    remote_rows(12);
+    remote_rows(MEMO_API_MAX_ITEMS);
     deny_locks=true;app_main();deny_locks=false;run(1);
-    assert(s_sm.state==MEMO_STATE_LIST && s_view_count==12);
+    assert(s_sm.state==MEMO_STATE_LIST && s_view_count==MEMO_API_MAX_ITEMS);
     assert(bsp_lvgl_lock(1));assert(lv_screen_active()==s_list_screen);bsp_lvgl_unlock();
     assert(find(s_list_screen,"> 备忘"));
     assert(s_list_hint->text[0]==0);
@@ -803,9 +979,12 @@ int main(int argc,char **argv)
         assert(s_row_time[i]->y+s_row_time[i]->h<=s_rows[i]->h);
     }
     heartbeat_cadence();
-    for(int i=0;i<8;i++)click(BSP_BTN_DOWN);
-    assert(s_selected==8 && s_list_top==8-LIST_ROWS+1);
+    test_selected_list_marquee();
+    test_full_list_transcripts();
+    for(int i=1;i<MEMO_API_MAX_ITEMS;i++)click(BSP_BTN_DOWN);
+    assert(s_selected==MEMO_API_MAX_ITEMS-1 && s_list_top==0);
     test_settings_actions_survive_render_timeout();
+    test_brightness_preview_save_cancel_and_wake();
     test_list_and_detail_page_actions();
     test_text_and_player_actions();
     test_detail_adjacent_navigation();

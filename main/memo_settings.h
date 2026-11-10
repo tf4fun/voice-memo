@@ -1,7 +1,7 @@
 // main/memo_settings.h —— 设备设置的持久化（NVS）。
 //
 // 目前真正被使用的：音量（播放立刻生效）、时区（列表/详情时间显示）、
-// 自动播放（进详情页即播）、息屏与空闲休眠。
+// 亮度（可预览）、自动播放（进详情页即播）、息屏与空闲休眠。
 #pragma once
 
 #include "esp_err.h"
@@ -11,6 +11,7 @@
 
 typedef struct {
     uint8_t volume;           /* 0..100，步进 20 */
+    uint8_t brightness;       /* 10..100，步进 10；0 由熄屏逻辑使用 */
     uint8_t screen_timeout_s; /* 0 = 常亮 */
     uint8_t sleep_min;        /* 息屏后计时，0 = 不自动休眠 */
     bool autoplay;
@@ -28,6 +29,7 @@ const memo_settings_t *memo_settings_get(void);
  * runtime values/applying volume. Return NVS errors; no automatic erase.
  * A failed flash operation cannot promise that no bytes reached persistent storage. */
 esp_err_t memo_settings_set_volume(uint8_t percent);
+esp_err_t memo_settings_set_brightness(uint8_t percent);
 esp_err_t memo_settings_set_screen_timeout(uint8_t seconds);
 esp_err_t memo_settings_set_sleep(uint8_t minutes);
 esp_err_t memo_settings_set_autoplay(bool enabled);
@@ -36,10 +38,11 @@ esp_err_t memo_settings_set_tz(int16_t offset_min);
 
 /* Positive direction increases volume (clamped); timing options cycle. */
 uint8_t memo_settings_volume_step(uint8_t current, int direction);
+uint8_t memo_settings_brightness_step(uint8_t current, int direction);
 uint8_t memo_settings_timeout_step(uint8_t current, int direction);
 uint8_t memo_settings_sleep_step(uint8_t current, int direction);
 
-typedef enum { MEMO_EDIT_VOLUME, MEMO_EDIT_TIMEOUT, MEMO_EDIT_SLEEP } memo_settings_field_t;
+typedef enum { MEMO_EDIT_VOLUME, MEMO_EDIT_BRIGHTNESS, MEMO_EDIT_TIMEOUT, MEMO_EDIT_SLEEP } memo_settings_field_t;
 typedef struct {
     memo_settings_t value;
     memo_settings_field_t field;

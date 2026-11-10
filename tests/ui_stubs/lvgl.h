@@ -11,7 +11,8 @@ typedef struct lv_obj {
     char text[4096];
     const lv_font_t *font;
     struct lv_obj *parent,*children[64];
-    int child_count, text_updates, long_mode_updates, marquee_offset;
+    int child_count, text_updates, long_mode_updates, marquee_offset, style_updates;
+    const void *animation_template;
     int animations_started, anim_from, anim_to, anim_duration, rotation;
     uint32_t anim_repeat;
     bool animating;
@@ -78,6 +79,7 @@ void lv_obj_set_pos(lv_obj_t *o,int x,int y);
 void lv_obj_set_size(lv_obj_t *o,int w,int h);
 void lv_obj_set_width(lv_obj_t *o,int w);
 int lv_obj_get_width(lv_obj_t *o);
+int32_t lv_obj_get_self_width(const lv_obj_t *o);
 void lv_obj_set_height(lv_obj_t *o,int h);
 void lv_obj_align(lv_obj_t *o,int align,int x,int y);
 void lv_obj_set_scroll_dir(lv_obj_t *o,int dir);
@@ -103,14 +105,19 @@ LV_FONT_DECLARE(lv_font_montserrat_40);
 #define LV_TEXT_DECOR_UNDERLINE 1
 #define LV_OBJ_FLAG_CLICKABLE 4
 #define LV_ALIGN_BOTTOM_MID 8
-typedef struct { void *var; void (*exec)(void *,int32_t); int first,last; uint32_t duration,repeat; } lv_anim_t;
+typedef struct lv_anim { void *var; void (*exec)(void *,int32_t); int first,last; uint32_t duration,repeat; void (*completed)(struct lv_anim *); } lv_anim_t;
 #define LV_ANIM_REPEAT_INFINITE UINT32_MAX
+#define LV_LABEL_WAIT_CHAR_COUNT 3
+uint16_t lv_font_get_glyph_width(const lv_font_t *font,uint32_t letter,uint32_t next);
+void lv_obj_set_style_anim_duration(lv_obj_t *obj,uint32_t duration,int selector);
 void lv_anim_init(lv_anim_t *anim);
 void lv_anim_set_var(lv_anim_t *anim,void *var);
 void lv_anim_set_values(lv_anim_t *anim,int first,int last);
 void lv_anim_set_duration(lv_anim_t *anim,uint32_t duration);
 void lv_anim_set_repeat_count(lv_anim_t *anim,uint32_t count);
 void lv_anim_set_exec_cb(lv_anim_t *anim,void (*exec)(void *,int32_t));
+void lv_anim_set_completed_cb(lv_anim_t *anim,void (*completed)(lv_anim_t *));
+void lv_obj_set_style_anim(lv_obj_t *obj,const lv_anim_t *anim,int selector);
 void lv_anim_start(lv_anim_t *anim);
 void lv_anim_delete(void *var,void (*exec)(void *,int32_t));
 lv_obj_t *lv_arc_create(lv_obj_t *parent);

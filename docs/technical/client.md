@@ -327,7 +327,11 @@ continues to refresh visible metadata after a successful retry.
 
 ### 10.3 List cache and SSE
 
-`memo_api` retains one 24-entry RAM page. `memo_api_request_page()` queues older,
+`memo_api` requests and retains one page of at most four records in RAM. The API
+cache, input snapshot and list model each limit server metadata to four records; an oversized
+response is rejected without replacing the current page. Detail navigation loads
+the adjacent four-record page only at its boundary. Local spool recovery entries
+remain separate from this server-page bound. `memo_api_request_page()` queues older,
 newer or latest requests for the uploader, using URL-safe next/previous cursors.
 Rows and cursor metadata can be copied under one lock. A serial invalidates old
 in-flight responses; failed moves retain the displayed page/query and report an
@@ -379,8 +383,8 @@ Recorder discard propagates spool cleanup failure after releasing its audio reso
 
 ## 11. Settings and power
 
-NVS namespace `memo` stores keys `vol`, `to`, `sl`, `ap` and `tz`. Defaults are
-volume 80%, timeout 30 s, sleep 5 min, autoplay off and timezone UTC+8.
+NVS namespace `memo` stores keys `vol`, `br`, `to`, `sl`, `ap`, `as` and `tz`. Defaults are
+volume 80%, brightness 100%, timeout 30 s, sleep 5 min, autoplay/autosave off and timezone UTC+8.
 Volume options are 0/20/40/60/80/100%; timeout 0/30/60/180 s; sleep 0/1/5/15 min.
 Integer values are validated before narrowing; unsupported options use defaults
 without rewriting legacy keys. Timezone is bounded to UTC-12 through UTC+14.
@@ -396,7 +400,15 @@ task performs saves and autoplay toggles outside the LVGL lock, then renders the
 result. A failure hint keeps the value overlay open. Volume applies on save;
 there is no preview tone. Active editing keeps the display on and blocks sleep.
 
-Backlight starts at 100%. The input heartbeat first applies the idle screen
+Brightness ranges from 10% to 100% in clamped 10% steps; UP increases and DOWN
+decreases. Its editor shares the animated volume meter. The input owner applies
+draft PWM immediately outside the LVGL lock without writing NVS or changing the
+confirmed setting. Cancel restores the saved level; failed saves retain the
+preview/draft for retry or cancel. Missing/invalid legacy `br` values use 100%
+without rewriting storage. No new PWM driver, task or timer is added.
+
+Startup and wake apply the confirmed brightness; 0% remains reserved for blanking.
+Unchanged heartbeats do not rewrite PWM. The input heartbeat first applies the idle screen
 timeout, then starts the deep-sleep delay at the actual blank transition.
 `blank_since_ms` is independent of the last activity timestamp. A delayed first
 poll cannot skip the display-off interval. Always-on display disables automatic
@@ -449,8 +461,8 @@ tests. `test_memo_recorder` exercises worker failures, stop timeout, wall time a
 ownership; `test_memo_spool` covers real-file recovery and draft commit/cancel.
 `test_memo_events` checks acknowledged stop, idle reads and connection cleanup.
 `test_memo_browse` checks selected-row visibility through 80 records, page-edge
-decisions and row/footer bounds. `test_memo_ui` executes actual common/font/
-settings/detail/provisioning modules against a host object/scroll model, covering all eight
+decisions and content-row bounds. `test_memo_ui` executes actual common/font/
+settings/detail/provisioning modules against a host object/scroll model, covering all nine
 settings, draft display, full detail/play/pause modes, long text scrolling,
 unsupported/malformed glyph input, network/discovery values and shared battery. It is not a raster test or
 an execution of the complete application input task. `test_memo_network_info`
@@ -541,8 +553,8 @@ bitmap with an 8 px fixed advance and 18 px line height. The bundled Unscii-16
 actually advances 16 px; the earlier 8 px assumption caused overlapping list
 timestamps and status text on hardware despite object-model checks. Each 208 px
 row now reserves a 184×31 summary at x=12/y=0, then independent 40×18 time and
-duration fields at x=12/156, y=31. Numeric fields clip; long text uses ellipsis
-in its own vertical band. The
+duration fields at x=12/156, y=31. Numeric fields clip; unselected long text uses
+ellipsis in its own vertical band. The
 shared font also restores the intended widths of battery and playback labels.
 The static gate regenerates the font from pinned local source, checks actual
 advances and fixture metrics, and asserts production column bounds.
@@ -562,6 +574,48 @@ text is already retained. Hidden outgoing rows also switch to ellipsis, so a
 new selection starts normally while heartbeat renders do not restart scrolling.
 Host fixtures model setter resets and assert continuity across repeated values
 refreshes and actual input-loop heartbeats; pixel speed remains a device check.
+
+The memo list uses the same single-line circular marquee only on the selected
+row; unselected or hidden rows use ellipsis and stop their animation. Preview
+line breaks and tabs become spaces. A 37-byte selected UUID cache restarts the
+marquee when a row is rebound to a different memo, even if its text is identical.
+Heartbeat and unchanged server refreshes preserve the current animation. The
+page displays at most four recording cards, each with one transcript line. Unselected rows keep their
+bounded previews. A selected potentially truncated preview, after a 400 ms dwell,
+requests the full transcript through the existing text worker. List and detail
+share the input owner's 2 KiB text snapshot rather than caching every transcript.
+Long text advances through revisioned UTF-8 windows after each marquee pass; a
+short final window dwells for three seconds before returning to the beginning.
+The LVGL completion callback only signals an epoch; network work stays outside
+the LVGL lock. Changing selection cancels old requests, entering detail explicitly
+hands over ownership, and late replies cannot replace the new selection.
+Page teardown clears display epochs and deletes the label animations with their
+widgets. No new task or independent timer is added.
+
+The selected label uses an explicit duration derived from its actual text width
+and the font's circular-scroll gap at 40 px/s. This avoids LVGL's encoded-speed
+10-second maximum lap duration, which would otherwise accelerate long windows.
+
+List rows are reapplied after changed metadata, selected-text windows, selection
+changes or page rebuilds, rather than on each 200 ms input heartbeat or unchanged
+one-second model snapshot. Unchanged time/duration/status text
+and battery labels are not rewritten, and status styles are updated
+only when their state flags change. Failed text allocation leaves the rows dirty
+for a later retry. This reduces allocation and partial-render work while the
+selected label animates; the input/network heartbeat and display refresh period
+remain unchanged. Synthetic LVGL workload measurements do not establish the
+device's frame rate or perceived smoothness.
+
+The list and settings pages use the area previously reserved for key legends.
+List cards have equal 16 px outer margins and 12 px inner text insets. The
+duration is right-aligned within its 40 px field, so a short value such as
+`0:12` does not leave an extra character's blank space on the right.
+Record position appears in the header beside the battery. Four list cards span
+y=52..294; settings shows six of its nine entries across y=52..296, scrolling
+the viewport to keep the selection visible. These bounds retain the rounded
+panel's safe insets. Save/error notices temporarily overlay the bottom content;
+an empty notice stays hidden and reserves no footer space. Settings also shows
+its selected position in the header and stops background marquees while editing.
 
 
 ### Capture gesture and live input presentation
@@ -623,7 +677,7 @@ The application now shares one Chinese header, right-aligned cached battery and
 segmented rule. Palette and page geometry are authoritative in the
 [visual language](../design/visual-language.md). Menu rows are borderless, detail
 separates metadata/reading/status/transport, settings editing hides background
-rows, and rejection decisions hide list content and footer. Existing input,
+rows, and rejection decisions hide list content and status indicators. Existing input,
 storage, worker and server protocols are unchanged.
 
 Real LVGL rendering exposed retained bottom alignment on the capture feedback

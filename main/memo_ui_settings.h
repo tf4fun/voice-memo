@@ -22,6 +22,7 @@ typedef enum {
     MEMO_SETTING_NETWORK = 0,
     MEMO_SETTING_SERVER,
     MEMO_SETTING_VOLUME,
+    MEMO_SETTING_BRIGHTNESS,
     MEMO_SETTING_TIMEOUT,
     MEMO_SETTING_SLEEP,
     MEMO_SETTING_AUTOPLAY,
@@ -36,7 +37,7 @@ void memo_ui_settings_enter(const memo_settings_t *draft);
 void memo_ui_settings_show_draft(const memo_settings_t *draft);
 void memo_ui_settings_error(void);
 
-/* 当前是否停在子页（音量/息屏/休眠）。自动播放是就地切换，不算子页。 */
+/* 当前是否停在子页（音量/亮度/息屏/休眠）。自动播放是就地切换，不算子页。 */
 bool memo_ui_settings_in_sheet(void);
 
 lv_obj_t *memo_ui_settings_screen(void);
